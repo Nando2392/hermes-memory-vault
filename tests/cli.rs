@@ -37,6 +37,24 @@ fn cli_help_exits_successfully() {
 }
 
 #[test]
+fn cli_version_exits_successfully() {
+    let output = Command::new(env!("CARGO_BIN_EXE_hermes-memory"))
+        .arg("--version")
+        .output()
+        .expect("run version");
+
+    assert!(
+        output.status.success(),
+        "version failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        concat!("hermes-memory ", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
 fn cli_ingest_and_search_exchange_json() {
     let temp = tempdir().expect("temp dir");
     let root = temp.path().to_string_lossy().to_string();

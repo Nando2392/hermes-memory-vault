@@ -866,7 +866,7 @@ fn capability_atomic_replace(
 
 #[cfg(not(windows))]
 fn sync_directory(directory: &Dir) -> Result<(), MemoryError> {
-    directory.try_clone()?.into_std_file().sync_all()?;
+    directory.open(".")?.into_std().sync_all()?;
     Ok(())
 }
 
@@ -1211,6 +1211,21 @@ fn truncate_utf8(text: &str, max_bytes: usize) -> String {
         boundary -= 1;
     }
     text[..boundary].to_owned()
+}
+
+#[cfg(all(test, unix))]
+mod unix_directory_sync_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn sync_directory_uses_fsync_capable_descriptor() {
+        let temp = tempdir().expect("temp dir");
+        let directory = Dir::open_ambient_dir(temp.path(), ambient_authority())
+            .expect("open capability directory");
+
+        sync_directory(&directory).expect("sync directory");
+    }
 }
 
 #[cfg(all(test, windows))]

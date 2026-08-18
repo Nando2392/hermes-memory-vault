@@ -10,7 +10,7 @@ use std::path::PathBuf;
 const MAX_STDIN_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Parser)]
-#[command(name = "hermes-memory")]
+#[command(name = "hermes-memory", version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
