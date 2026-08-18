@@ -36,14 +36,12 @@ def test_standalone_provider_name_avoids_bundled_vault_shadowing(
 
     from plugins.memory import load_memory_provider
 
-    bundled = load_memory_provider("vault")
     standalone = load_memory_provider("vault-standalone")
 
-    assert bundled is not None
-    assert bundled.name == "vault"
     assert standalone is not None
     assert standalone.name == "vault-standalone"
-    assert type(standalone).__module__ != type(bundled).__module__
+    assert type(standalone).__module__.startswith("_hermes_user_memory.")
+    assert standalone.on_pre_compress.__func__.__module__ != "agent.memory_provider"
 
 
 @pytest.fixture(autouse=True)
