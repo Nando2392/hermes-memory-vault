@@ -14,7 +14,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -191,14 +191,17 @@ impl MemoryStore {
         let root_guard = capability_root_guard(&root_dir)?;
         let stable_root = stable_root_path(&root_guard, &root)?;
         let initialization_lock = capability_lock_file(&root_dir, "memory.init.lock")?;
-        initialization_lock.lock_exclusive()?;
+        initialization_lock.lock_shared()?;
         let database_guard = capability_data_file(&root_dir, "memory.db")?;
         let wal_guard = capability_data_file(&root_dir, "memory.db-wal")?;
         let shm_guard = capability_data_file(&root_dir, "memory.db-shm")?;
-        sync_directory(&root_dir)?;
         let connection = Connection::open(stable_root.join("memory.db"))?;
         connection.busy_timeout(Duration::from_secs(5))?;
-        connection.execute_batch(
+        if connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? < 1 {
+            FileExt::unlock(&initialization_lock)?;
+            initialization_lock.lock_exclusive()?;
+            if connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? < 1 {
+                connection.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=FULL;
              PRAGMA foreign_keys=ON;
@@ -245,9 +248,34 @@ impl MemoryStore {
                INSERT INTO records_fts(records_fts, rowid, content)
                VALUES ('delete', old.rowid, old.content);
                INSERT INTO records_fts(rowid, content) VALUES (new.rowid, new.content);
-             END;",
-        )?;
-        sync_directory(&root_dir)?;
+             END;
+             CREATE TABLE IF NOT EXISTS projection_state (
+               singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+               current_generation INTEGER NOT NULL,
+               projected_generation INTEGER NOT NULL,
+               projected_sha256 TEXT NOT NULL,
+               projected_bytes INTEGER NOT NULL
+             );
+             INSERT OR IGNORE INTO projection_state
+               (singleton, current_generation, projected_generation, projected_sha256, projected_bytes)
+               SELECT 1, COUNT(*), -1, '', -1 FROM records;
+             CREATE TRIGGER IF NOT EXISTS projection_records_ai AFTER INSERT ON records BEGIN
+               UPDATE projection_state
+               SET current_generation = current_generation + 1 WHERE singleton = 1;
+             END;
+             CREATE TRIGGER IF NOT EXISTS projection_records_ad AFTER DELETE ON records BEGIN
+               UPDATE projection_state
+               SET current_generation = current_generation + 1 WHERE singleton = 1;
+             END;
+             CREATE TRIGGER IF NOT EXISTS projection_records_au AFTER UPDATE ON records BEGIN
+               UPDATE projection_state
+               SET current_generation = current_generation + 1 WHERE singleton = 1;
+             END;
+             PRAGMA user_version=1;",
+                )?;
+                sync_directory(&root_dir)?;
+            }
+        }
         let store = Self {
             root_dir,
             _root_guard: root_guard,
@@ -256,6 +284,7 @@ impl MemoryStore {
             _shm_guard: shm_guard,
             connection: Mutex::new(connection),
         };
+        drop(initialization_lock);
         if !store.projection_is_current()? {
             store.project_jsonl()?;
         }
@@ -583,54 +612,65 @@ impl MemoryStore {
             .connection
             .lock()
             .map_err(|_| MemoryError::LockPoisoned)?;
-        let mut statement = connection.prepare(
-            "SELECT id, session_id, workspace, kind, content, timestamp, metadata_json
-             FROM records ORDER BY timestamp, rowid",
-        )?;
-        let expected = statement
-            .query_map([], |row| {
-                Ok(MemoryRecord {
-                    id: row.get(0)?,
-                    session_id: row.get(1)?,
-                    workspace: row.get(2)?,
-                    kind: row.get(3)?,
-                    content: row.get(4)?,
-                    timestamp: row.get(5)?,
-                    metadata: serde_json::from_str::<Value>(&row.get::<_, String>(6)?)
-                        .unwrap_or(Value::Null),
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        let file = match capability_existing_file(&self.root_dir, "events.jsonl") {
+        let (current_generation, projected_generation, expected_hash, expected_bytes) = connection
+            .query_row(
+                "SELECT current_generation, projected_generation, projected_sha256, projected_bytes
+                 FROM projection_state WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )?;
+        drop(connection);
+        if current_generation != projected_generation
+            || expected_hash.len() != 64
+            || expected_bytes < 0
+        {
+            return Ok(false);
+        }
+        let mut file = match capability_existing_file(&self.root_dir, "events.jsonl") {
             Ok(file) => file,
             Err(MemoryError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(false);
             }
             Err(error) => return Err(error),
         };
-        let mut actual = Vec::new();
-        for line in BufReader::new(file).lines() {
-            let line = match line {
-                Ok(line) => line,
-                Err(_) => return Ok(false),
-            };
-            let record: MemoryRecord = match serde_json::from_str(&line) {
-                Ok(record) => record,
-                Err(_) => return Ok(false),
-            };
-            actual.push(record);
+        let mut digest = Sha256::new();
+        let mut actual_bytes = 0i64;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            actual_bytes = actual_bytes.saturating_add(count as i64);
+            digest.update(&buffer[..count]);
         }
-        Ok(actual == expected)
+        Ok(actual_bytes == expected_bytes && format!("{:x}", digest.finalize()) == expected_hash)
     }
 
     fn project_jsonl(&self) -> Result<(), MemoryError> {
         let lock_file = capability_lock_file(&self.root_dir, "events.jsonl.lock")?;
         lock_file.lock_exclusive()?;
-        let connection = self
+        if self.projection_is_current()? {
+            return Ok(());
+        }
+        let mut connection = self
             .connection
             .lock()
             .map_err(|_| MemoryError::LockPoisoned)?;
-        let mut statement = connection.prepare(
+        let transaction = connection.transaction()?;
+        let generation = transaction.query_row(
+            "SELECT current_generation FROM projection_state WHERE singleton = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let mut statement = transaction.prepare(
             "SELECT id, session_id, workspace, kind, content, timestamp, metadata_json
              FROM records ORDER BY timestamp, rowid",
         )?;
@@ -646,13 +686,31 @@ impl MemoryStore {
                     .unwrap_or(Value::Null),
             })
         })?;
+        let mut projected_hash = Sha256::new();
+        let mut projected_bytes = 0i64;
         capability_atomic_replace(&self.root_dir, "events.jsonl", |file| {
             for row in rows {
-                serde_json::to_writer(&mut *file, &row?)?;
-                file.write_all(b"\n")?;
+                let mut line = serde_json::to_vec(&row?)?;
+                line.push(b'\n');
+                projected_hash.update(&line);
+                projected_bytes = projected_bytes.saturating_add(line.len() as i64);
+                file.write_all(&line)?;
             }
             Ok(())
-        })
+        })?;
+        drop(statement);
+        transaction.commit()?;
+        connection.execute(
+            "UPDATE projection_state
+             SET projected_generation = ?1, projected_sha256 = ?2, projected_bytes = ?3
+             WHERE singleton = 1",
+            params![
+                generation,
+                format!("{:x}", projected_hash.finalize()),
+                projected_bytes
+            ],
+        )?;
+        Ok(())
     }
 }
 
@@ -1245,6 +1303,67 @@ mod windows_file_guard_tests {
             temp.path().join("renamed.lock")
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod projection_state_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn record() -> MemoryRecord {
+        MemoryRecord {
+            id: "projection-state-record".to_owned(),
+            session_id: "projection-state-session".to_owned(),
+            workspace: "projection-state-workspace".to_owned(),
+            kind: "user".to_owned(),
+            content: "projection state sentinel".to_owned(),
+            timestamp: 1.0,
+            metadata: Value::Null,
+        }
+    }
+
+    #[test]
+    fn projection_state_is_persisted_and_byte_tampering_is_repaired() {
+        let temp = tempdir().expect("temp dir");
+        let store = MemoryStore::open(temp.path()).expect("open store");
+        store.ingest(&record()).expect("ingest record");
+        let canonical =
+            std::fs::read(temp.path().join("events.jsonl")).expect("read canonical projection");
+        {
+            let connection = store.connection.lock().expect("connection lock");
+            let state = connection
+                .query_row(
+                    "SELECT current_generation, projected_generation, projected_sha256, projected_bytes
+                     FROM projection_state WHERE singleton = 1",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .expect("projection state row");
+            assert_eq!(state.0, state.1);
+            assert_eq!(state.2.len(), 64);
+            assert_eq!(state.3 as usize, canonical.len());
+        }
+        drop(store);
+
+        let mut byte_distinct = b"  ".to_vec();
+        byte_distinct.extend_from_slice(&canonical);
+        std::fs::write(temp.path().join("events.jsonl"), byte_distinct)
+            .expect("tamper projection bytes");
+
+        let repaired = MemoryStore::open(temp.path()).expect("reopen and repair");
+        drop(repaired);
+        assert_eq!(
+            std::fs::read(temp.path().join("events.jsonl")).expect("read repaired projection"),
+            canonical
+        );
     }
 }
 

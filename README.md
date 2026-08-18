@@ -6,10 +6,12 @@ The Rust data plane stores complete turn snapshots in SQLite/FTS5. A thin Python
 
 ## Status
 
-Version `0.2.1` adds a durable pre-compaction checkpoint through Hermes'
-public `on_pre_compress` memory-provider hook. The standalone transactional
-installer carries the Rust binary and user plugin; it does not patch or modify
-a Hermes Agent checkout.
+Version `0.2.2` adds a durable pre-compaction checkpoint through Hermes'
+public `on_pre_compress` memory-provider hook and removes lock contention from
+the projection hot path. The standalone transactional installer carries the
+Rust binary and user plugin; it does not patch or modify a Hermes Agent
+checkout. Version `0.2.1` was never published because release verification
+exposed the contention defect.
 
 Verified properties:
 
@@ -81,9 +83,9 @@ the archive and provenance manifest before staging any profile writes:
 ```bash
 python install-memory-vault.py install \
   --home C:/path/to/active/hermes-home \
-  --bundle C:/path/to/hermes-memory-vault-v0.2.1-windows-x86_64.zip \
+  --bundle C:/path/to/hermes-memory-vault-v0.2.2-windows-x86_64.zip \
   --sha256 <64-hex-release-checksum> \
-  --release-manifest C:/path/to/release-manifest-v0.2.1-windows-x86_64.json \
+  --release-manifest C:/path/to/release-manifest-v0.2.2-windows-x86_64.json \
   --activate
 ```
 
@@ -93,7 +95,7 @@ release origin:
 ```bash
 python install-memory-vault.py install \
   --home C:/path/to/active/hermes-home \
-  --tag v0.2.1 \
+  --tag v0.2.2 \
   --activate
 ```
 
