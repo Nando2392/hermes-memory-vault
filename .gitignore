@@ -1,0 +1,10 @@
+# Build output
+/target/
+
+# Python test cache
+__pycache__/
+.pytest_cache/
+
+# Local integration checkout and release staging
+/.hermes-agent/
+/dist/
