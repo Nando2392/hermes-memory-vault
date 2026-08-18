@@ -524,7 +524,6 @@ def _installation_matches(
     home: Path,
     current: dict[str, Any] | None,
     release: dict[str, Any],
-    archive_sha256: str,
 ) -> bool:
     if current is None:
         return False
@@ -533,17 +532,32 @@ def _installation_matches(
         current.get("schema_version") != 1
         or current.get("version") != release["release"]
         or current.get("platform") != PLATFORM
-        or current.get("git_commit") != release["git_commit"]
-        or current.get("archive_sha256") != archive_sha256
         or not isinstance(managed, dict)
         or set(managed) != set(MANAGED_PATHS)
     ):
         return False
     for relative in MANAGED_PATHS:
         target = _safe_target(home, relative)
-        if not target.exists() or managed[relative] != sha256_file(target):
+        if not target.exists() or release["files"][relative] != sha256_file(target):
             return False
     return True
+
+
+def _install_manifest_value(
+    manifest: dict[str, Any], bundle: Path, archive_sha256: str
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "version": manifest["release"],
+        "platform": PLATFORM,
+        "git_commit": manifest["git_commit"],
+        "archive": bundle.name,
+        "archive_sha256": archive_sha256,
+        "managed_files": {
+            relative: manifest["files"][relative] for relative in MANAGED_PATHS
+        },
+        "source": "local-bundle",
+    }
 
 
 def _semver(value: Any) -> tuple[int, int, int]:
@@ -611,7 +625,7 @@ def install_bundle(
         archive_sha256=archive_sha256,
     )
     current = _read_installed_manifest(home)
-    if _installation_matches(home, current, manifest, archive_sha256):
+    if _installation_matches(home, current, manifest):
         unchanged = {
             "action": "unchanged",
             "version": manifest["release"],
@@ -622,6 +636,10 @@ def install_bundle(
             return {**unchanged, "dry_run": True}
         if activate:
             _activate_provider(home)
+        _atomic_write_json(
+            home / INSTALL_MANIFEST,
+            _install_manifest_value(manifest, bundle, archive_sha256),
+        )
         return {**unchanged, "activated": activate}
     if (
         current is not None
@@ -676,18 +694,9 @@ def install_bundle(
                 _atomic_copy(source, target)
                 if sha256_file(target) != staged_hashes[relative]:
                     raise InstallError("post-install integrity check failed")
-            install_manifest = {
-                "schema_version": 1,
-                "version": manifest["release"],
-                "platform": PLATFORM,
-                "git_commit": manifest["git_commit"],
-                "archive": bundle.name,
-                "archive_sha256": archive_sha256,
-                "managed_files": {
-                    relative: staged_hashes[relative] for relative in MANAGED_PATHS
-                },
-                "source": "local-bundle",
-            }
+            install_manifest = _install_manifest_value(
+                manifest, bundle, archive_sha256
+            )
             _atomic_write_json(home / INSTALL_MANIFEST, install_manifest)
             if activate:
                 _activate_provider(home)

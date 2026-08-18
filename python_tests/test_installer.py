@@ -53,6 +53,7 @@ def make_bundle(
     *,
     version: str = "v0.2.0",
     managed_content: dict[str, bytes] | None = None,
+    git_commit: str = "a" * 40,
 ) -> tuple[Path, Path, str]:
     content_map = managed_content or MANAGED_CONTENT
     bundle = root / f"hermes-memory-vault-{version}-{PLATFORM}.zip"
@@ -72,7 +73,7 @@ def make_bundle(
                 "schema_version": 1,
                 "release": version,
                 "platform": PLATFORM,
-                "git_commit": "a" * 40,
+                "git_commit": git_commit,
                 "git_tree": "b" * 40,
                 "reviewed_staged_diff_sha256": "c" * 64,
                 "archive": {"name": bundle.name, "sha256": bundle_sha},
@@ -487,6 +488,64 @@ def test_activate_is_applied_when_installation_is_already_current(
 
     assert result["action"] == "unchanged"
     assert result["activated"] is True
+    assert calls == [["hermes", "config", "set", "memory.provider", "vault"]]
+
+
+def test_same_version_rebuild_with_identical_managed_files_is_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_source = tmp_path / "first-source"
+    first_source.mkdir()
+    second_source = tmp_path / "second-source"
+    second_source.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    first_bundle, first_manifest, first_sha = make_bundle(first_source)
+    install_bundle(
+        bundle=first_bundle,
+        expected_sha256=first_sha,
+        release_manifest=first_manifest,
+        home=home,
+        activate=False,
+    )
+    binary = home / BINARY_PATH
+    before_mtime = binary.stat().st_mtime_ns
+    backups = home / "memory-vault" / "installer" / "backups"
+    before_backups = sorted(path.name for path in backups.iterdir())
+    rebuilt_content = {**MANAGED_CONTENT, "README.md": b"# rebuilt release\n"}
+    second_bundle, second_manifest, second_sha = make_bundle(
+        second_source,
+        managed_content=rebuilt_content,
+        git_commit="d" * 40,
+    )
+    calls: list[list[str]] = []
+
+    def capture_run(command: list[str], **_kwargs) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", capture_run)
+
+    result = install_bundle(
+        bundle=second_bundle,
+        expected_sha256=second_sha,
+        release_manifest=second_manifest,
+        home=home,
+        activate=True,
+    )
+
+    assert result["action"] == "unchanged"
+    assert result["archive_sha256"] == second_sha
+    assert result["activated"] is True
+    assert binary.stat().st_mtime_ns == before_mtime
+    assert sorted(path.name for path in backups.iterdir()) == before_backups
+    installed = json.loads(
+        (home / "memory-vault" / "installer" / "install-manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert installed["git_commit"] == "d" * 40
+    assert installed["archive_sha256"] == second_sha
     assert calls == [["hermes", "config", "set", "memory.provider", "vault"]]
 
 
