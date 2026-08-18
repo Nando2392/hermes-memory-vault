@@ -52,8 +52,8 @@ def build_release(
     binary_name = "hermes-memory.exe" if platform == "windows-x86_64" else "hermes-memory"
     source_paths = {
         f"bin/{binary_name}": repo / "target" / "release" / binary_name,
-        "plugins/vault/__init__.py": repo / "plugin" / "vault" / "__init__.py",
-        "plugins/vault/plugin.yaml": repo / "plugin" / "vault" / "plugin.yaml",
+        "plugins/vault-standalone/__init__.py": repo / "plugin" / "vault" / "__init__.py",
+        "plugins/vault-standalone/plugin.yaml": repo / "plugin" / "vault" / "plugin.yaml",
         "README.md": repo / "README.md",
         "LICENSE": repo / "LICENSE",
         "install-memory-vault.py": repo / "install-memory-vault.py",
@@ -80,10 +80,11 @@ def build_release(
             archive.writestr(info, sums if name == "SHA256SUMS" else payload[name])
     archive_sha = _sha256(archive_path.read_bytes())
     checksum_path = dist / f"{archive_name}.sha256"
-    checksum_path.write_text(f"{archive_sha} *{archive_name}\n", encoding="ascii")
+    checksum_path.write_bytes(f"{archive_sha} *{archive_name}\n".encode("ascii"))
     manifest_path = dist / f"release-manifest-{version}-{platform}.json"
-    manifest_path.write_text(
-        json.dumps(
+    manifest_path.write_bytes(
+        (
+            json.dumps(
             {
                 "schema_version": 1,
                 "release": version,
@@ -97,13 +98,12 @@ def build_release(
             indent=2,
             sort_keys=True,
         )
-        + "\n",
-        encoding="utf-8",
+            + "\n"
+        ).encode("utf-8")
     )
     manifest_checksum_path = dist / f"{manifest_path.name}.sha256"
-    manifest_checksum_path.write_text(
-        f"{_sha256(manifest_path.read_bytes())} *{manifest_path.name}\n",
-        encoding="ascii",
+    manifest_checksum_path.write_bytes(
+        f"{_sha256(manifest_path.read_bytes())} *{manifest_path.name}\n".encode("ascii")
     )
     return ReleaseAssets(
         archive_path,
@@ -129,6 +129,36 @@ def _git(repo: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
+def build_verified_binary(repo: Path, platform: str, version: str) -> None:
+    build = subprocess.run(
+        ["cargo", "build", "--release", "--locked"],
+        cwd=repo,
+        text=True,
+        encoding="utf-8",
+        errors="strict",
+        capture_output=True,
+        check=False,
+        timeout=600,
+    )
+    if build.returncode != 0:
+        raise RuntimeError("cargo release build failed")
+    binary_name = "hermes-memory.exe" if platform == "windows-x86_64" else "hermes-memory"
+    binary = repo / "target" / "release" / binary_name
+    probe = subprocess.run(
+        [str(binary), "--version"],
+        cwd=repo,
+        text=True,
+        encoding="utf-8",
+        errors="strict",
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    expected = f"hermes-memory {version.removeprefix('v')}"
+    if probe.returncode != 0 or probe.stdout.strip() != expected:
+        raise RuntimeError("release binary version mismatch")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Build deterministic Memory Vault release assets")
     parser.add_argument("--repo", type=Path, default=Path.cwd())
@@ -138,6 +168,7 @@ def main() -> int:
     parser.add_argument("--reviewed-digest", required=True)
     args = parser.parse_args()
     repo = args.repo.resolve(strict=True)
+    build_verified_binary(repo, args.platform, args.version)
     assets = build_release(
         repo=repo,
         dist=args.dist.resolve(),

@@ -49,7 +49,7 @@ class VaultMemoryProvider(MemoryProvider):
 
     @property
     def name(self) -> str:
-        return "vault"
+        return "vault-standalone"
 
     @staticmethod
     def _binary_candidates(hermes_home: str | Path | None = None) -> List[Path]:

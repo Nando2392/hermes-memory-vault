@@ -1,4 +1,4 @@
-name: vault
+name: vault-standalone
 version: 0.2.2
 description: "Local-first Rust memory vault with complete turn capture, SQLite/FTS5 recall, and Markdown export."
 hooks:

@@ -26,6 +26,13 @@ jobs:
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked --all-targets --all-features
       - run: cargo build --release --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermes-memory-${{ matrix.os }}
+          path: |
+            target/release/hermes-memory
+            target/release/hermes-memory.exe
+          if-no-files-found: error
 
   python:
     name: Python plugin and installer (${{ matrix.os }})

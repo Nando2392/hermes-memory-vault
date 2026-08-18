@@ -2,6 +2,7 @@ import json
 import importlib.util
 import os
 from pathlib import Path
+import shutil
 import subprocess
 
 import pytest
@@ -20,6 +21,29 @@ RUST_BIN = (
     / "debug"
     / ("hermes-memory.exe" if os.name == "nt" else "hermes-memory")
 )
+
+
+def test_standalone_provider_name_avoids_bundled_vault_shadowing(
+    tmp_path, monkeypatch
+):
+    user_plugins = tmp_path / "plugins"
+    installed = user_plugins / "vault-standalone"
+    installed.mkdir(parents=True)
+    shutil.copy2(PLUGIN_INIT, installed / "__init__.py")
+    shutil.copy2(PLUGIN_INIT.with_name("plugin.yaml"), installed / "plugin.yaml")
+    monkeypatch.setenv("HERMES_MEMORY_BIN", str(RUST_BIN))
+    monkeypatch.setattr("plugins.memory._get_user_plugins_dir", lambda: user_plugins)
+
+    from plugins.memory import load_memory_provider
+
+    bundled = load_memory_provider("vault")
+    standalone = load_memory_provider("vault-standalone")
+
+    assert bundled is not None
+    assert bundled.name == "vault"
+    assert standalone is not None
+    assert standalone.name == "vault-standalone"
+    assert type(standalone).__module__ != type(bundled).__module__
 
 
 @pytest.fixture(autouse=True)

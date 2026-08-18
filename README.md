@@ -59,8 +59,8 @@ standalone installer:
 
 ```text
 bin/hermes-memory.exe
-plugins/vault/__init__.py
-plugins/vault/plugin.yaml
+plugins/vault-standalone/__init__.py
+plugins/vault-standalone/plugin.yaml
 LICENSE
 README.md
 SHA256SUMS
@@ -69,7 +69,7 @@ installer/__init__.py
 installer/hermes_memory_vault_installer.py
 ```
 
-Only `bin/hermes-memory[.exe]` and `plugins/vault/*` are installed into the
+Only `bin/hermes-memory[.exe]` and `plugins/vault-standalone/*` are installed into the
 active profile. Memory databases, WAL/SHM files, JSONL, Markdown exports,
 configuration, credentials and unrelated files are never managed by the
 installer.
@@ -107,7 +107,9 @@ binary will be active. Managed writes are fenced against concurrent
 symlink/junction parent swaps: POSIX uses descriptor-relative no-follow writes,
 and Windows holds non-delete-sharing directory handles through atomic replace.
 
-Activation uses only `hermes config set memory.provider vault`. Restart the
+Activation uses only `hermes config set memory.provider vault-standalone`. The
+unique provider name avoids collision with Hermes' bundled `vault` provider,
+which intentionally has precedence over same-named user plugins. Restart the
 active Hermes surface after installation so new sessions load the provider.
 
 ## Manual installation (fallback)

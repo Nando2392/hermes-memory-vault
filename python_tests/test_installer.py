@@ -23,8 +23,8 @@ from installer.hermes_memory_vault_installer import (
 BINARY_PATH = f"bin/{BINARY_NAME}"
 MANAGED_CONTENT = {
     BINARY_PATH: b"vault-binary-v0.2.0",
-    "plugins/vault/__init__.py": b"def register(ctx):\n    pass\n",
-    "plugins/vault/plugin.yaml": b"name: vault\nversion: 0.2.0\n",
+    "plugins/vault-standalone/__init__.py": b"def register(ctx):\n    pass\n",
+    "plugins/vault-standalone/plugin.yaml": b"name: vault-standalone\nversion: 0.2.0\n",
     "README.md": b"# test bundle\n",
     "LICENSE": b"MIT\n",
     "install-memory-vault.py": b"# standalone wrapper\n",
@@ -143,9 +143,9 @@ def test_clean_install_from_verified_local_bundle(tmp_path: Path) -> None:
     assert (home / "bin" / BINARY_NAME).read_bytes() == MANAGED_CONTENT[
         BINARY_PATH
     ]
-    assert (home / "plugins" / "vault" / "__init__.py").read_bytes() == MANAGED_CONTENT[
-        "plugins/vault/__init__.py"
-    ]
+    assert (
+        home / "plugins" / "vault-standalone" / "__init__.py"
+    ).read_bytes() == MANAGED_CONTENT["plugins/vault-standalone/__init__.py"]
     install_manifest = json.loads(
         (home / "memory-vault" / "installer" / "install-manifest.json").read_text(
             encoding="utf-8"
@@ -155,8 +155,8 @@ def test_clean_install_from_verified_local_bundle(tmp_path: Path) -> None:
     assert install_manifest["archive_sha256"] == bundle_sha
     assert set(install_manifest["managed_files"]) == {
         BINARY_PATH,
-        "plugins/vault/__init__.py",
-        "plugins/vault/plugin.yaml",
+        "plugins/vault-standalone/__init__.py",
+        "plugins/vault-standalone/plugin.yaml",
     }
 
 
@@ -205,7 +205,7 @@ def test_update_replaces_only_managed_files_and_preserves_user_data(tmp_path: Pa
     old_content = {
         **MANAGED_CONTENT,
         BINARY_PATH: b"vault-binary-v0.1.1",
-        "plugins/vault/plugin.yaml": b"name: vault\nversion: 0.1.1\n",
+        "plugins/vault-standalone/plugin.yaml": b"name: vault-standalone\nversion: 0.1.1\n",
     }
     old_bundle, old_manifest, old_sha = make_bundle(
         source, version="v0.1.1", managed_content=old_content
@@ -266,7 +266,7 @@ def test_downgrade_requires_explicit_flag_before_any_write(tmp_path: Path) -> No
     old_content = {
         **MANAGED_CONTENT,
         BINARY_PATH: b"older-binary",
-        "plugins/vault/plugin.yaml": b"name: vault\nversion: 0.1.1\n",
+        "plugins/vault-standalone/plugin.yaml": b"name: vault-standalone\nversion: 0.1.1\n",
     }
     old_bundle, old_manifest, old_sha = make_bundle(
         source, version="v0.1.1", managed_content=old_content
@@ -295,8 +295,8 @@ def test_failure_during_second_swap_rolls_back_all_managed_files(
     old_content = {
         **MANAGED_CONTENT,
         BINARY_PATH: b"old-binary",
-        "plugins/vault/__init__.py": b"old-plugin-init\n",
-        "plugins/vault/plugin.yaml": b"name: vault\nversion: 0.1.1\n",
+        "plugins/vault-standalone/__init__.py": b"old-plugin-init\n",
+        "plugins/vault-standalone/plugin.yaml": b"name: vault-standalone\nversion: 0.1.1\n",
     }
     old_bundle, old_manifest, old_sha = make_bundle(
         source, version="v0.1.1", managed_content=old_content
@@ -312,8 +312,8 @@ def test_failure_during_second_swap_rolls_back_all_managed_files(
         relative: (home / relative).read_bytes()
         for relative in (
             BINARY_PATH,
-            "plugins/vault/__init__.py",
-            "plugins/vault/plugin.yaml",
+            "plugins/vault-standalone/__init__.py",
+            "plugins/vault-standalone/plugin.yaml",
             "memory-vault/installer/install-manifest.json",
         )
     }
@@ -327,7 +327,7 @@ def test_failure_during_second_swap_rolls_back_all_managed_files(
         nonlocal failed
         if (
             not failed
-            and copy_target == home / "plugins" / "vault" / "__init__.py"
+            and copy_target == home / "plugins" / "vault-standalone" / "__init__.py"
             and "staging-" in str(copy_source)
         ):
             failed = True
@@ -449,7 +449,7 @@ def test_activate_uses_public_hermes_config_cli(
 
     assert result["activated"] is True
     assert [command for command, _env in calls] == [
-        ["hermes", "config", "set", "memory.provider", "vault"]
+        ["hermes", "config", "set", "memory.provider", "vault-standalone"]
     ]
     assert calls[0][1]["HERMES_HOME"] == str(home)
     assert not (home / "config.yaml").exists()
@@ -488,7 +488,9 @@ def test_activate_is_applied_when_installation_is_already_current(
 
     assert result["action"] == "unchanged"
     assert result["activated"] is True
-    assert calls == [["hermes", "config", "set", "memory.provider", "vault"]]
+    assert calls == [
+        ["hermes", "config", "set", "memory.provider", "vault-standalone"]
+    ]
 
 
 def test_same_version_rebuild_with_identical_managed_files_is_unchanged(
@@ -546,7 +548,9 @@ def test_same_version_rebuild_with_identical_managed_files_is_unchanged(
     )
     assert installed["git_commit"] == "d" * 40
     assert installed["archive_sha256"] == second_sha
-    assert calls == [["hermes", "config", "set", "memory.provider", "vault"]]
+    assert calls == [
+        ["hermes", "config", "set", "memory.provider", "vault-standalone"]
+    ]
 
 
 def test_hardlinked_managed_target_is_rejected_before_staging(
@@ -759,7 +763,7 @@ def test_standalone_cli_installs_local_bundle_and_outputs_json(tmp_path: Path) -
     payload = json.loads(result.stdout)
     assert payload["success"] is True
     assert payload["action"] == "install"
-    assert (home / "plugins" / "vault" / "plugin.yaml").is_file()
+    assert (home / "plugins" / "vault-standalone" / "plugin.yaml").is_file()
 
 
 def test_bad_external_checksum_is_rejected_before_writes(tmp_path: Path) -> None:
@@ -786,7 +790,7 @@ def test_bad_external_checksum_is_rejected_before_writes(tmp_path: Path) -> None
     [
         "../escape.txt",
         "/absolute.txt",
-        "plugins/vault/plugin.yaml:stream",
+        "plugins/vault-standalone/plugin.yaml:stream",
         "README.MD",
     ],
 )

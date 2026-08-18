@@ -25,8 +25,8 @@ PLATFORM = "windows-x86_64" if os.name == "nt" else "linux-x86_64"
 BINARY_NAME = "hermes-memory.exe" if os.name == "nt" else "hermes-memory"
 MANAGED_PATHS = (
     f"bin/{BINARY_NAME}",
-    "plugins/vault/__init__.py",
-    "plugins/vault/plugin.yaml",
+    "plugins/vault-standalone/__init__.py",
+    "plugins/vault-standalone/plugin.yaml",
 )
 DOCUMENT_PATHS = (
     "README.md",
@@ -574,7 +574,7 @@ def _activate_provider(home: Path) -> None:
     environment["HERMES_HOME"] = str(home)
     try:
         result = subprocess.run(
-            ["hermes", "config", "set", "memory.provider", "vault"],
+            ["hermes", "config", "set", "memory.provider", "vault-standalone"],
             env=environment,
             text=True,
             encoding="utf-8",
