@@ -6,7 +6,9 @@ The Rust data plane stores complete turn snapshots in SQLite/FTS5. A thin Python
 
 ## Status
 
-Version `0.1.0` is an initial Windows release.
+Version `0.2.0` adds a standalone, transactional installer/updater. The release
+archive carries the installer itself, the Rust binary and the user plugin; it
+does not patch or modify a Hermes Agent checkout.
 
 Verified properties:
 
@@ -31,7 +33,8 @@ The upstream hardening change is tracked in [NousResearch/hermes-agent#89283](ht
 
 ## Release layout
 
-The Windows release archive is rooted at the Hermes home layout:
+The release archive contains the managed Hermes-home payload plus the verified
+standalone installer:
 
 ```text
 bin/hermes-memory.exe
@@ -40,9 +43,53 @@ plugins/vault/plugin.yaml
 LICENSE
 README.md
 SHA256SUMS
+install-memory-vault.py
+installer/__init__.py
+installer/hermes_memory_vault_installer.py
 ```
 
-## Manual installation
+Only `bin/hermes-memory[.exe]` and `plugins/vault/*` are installed into the
+active profile. Memory databases, WAL/SHM files, JSONL, Markdown exports,
+configuration, credentials and unrelated files are never managed by the
+installer.
+
+## Transactional installation and update
+
+Download the ZIP, its `.sha256`, the release manifest, and the manifest's
+`.json.sha256` sidecar into the same directory. The installer authenticates both
+the archive and provenance manifest before staging any profile writes:
+
+```bash
+python install-memory-vault.py install \
+  --home C:/path/to/active/hermes-home \
+  --bundle C:/path/to/hermes-memory-vault-v0.2.0-windows-x86_64.zip \
+  --sha256 <64-hex-release-checksum> \
+  --release-manifest C:/path/to/release-manifest-v0.2.0.json \
+  --activate
+```
+
+An explicit release tag can be fetched directly from the allowlisted GitHub
+release origin:
+
+```bash
+python install-memory-vault.py install \
+  --home C:/path/to/active/hermes-home \
+  --tag v0.2.0 \
+  --activate
+```
+
+Use `--dry-run` for full validation without profile writes. Reinstalling the
+same verified version is idempotent. Downgrades require
+`--allow-downgrade`. `HERMES_MEMORY_BIN` remains authoritative; an override
+outside the target profile blocks installation rather than pretending the new
+binary will be active. Managed writes are fenced against concurrent
+symlink/junction parent swaps: POSIX uses descriptor-relative no-follow writes,
+and Windows holds non-delete-sharing directory handles through atomic replace.
+
+Activation uses only `hermes config set memory.provider vault`. Restart the
+active Hermes surface after installation so new sessions load the provider.
+
+## Manual installation (fallback)
 
 1. Download the Windows ZIP from the GitHub release.
 2. Verify its SHA-256 against the release checksum.
@@ -130,9 +177,9 @@ Please report security issues privately as described in [SECURITY.md](SECURITY.m
 
 ## Current limitations
 
-- Release binaries are Windows-only in `0.1.0`; source supports the Rust targets covered by CI.
+- Published binary platforms are listed per release; source and installer paths are covered on Windows and Linux by CI.
 - Capture uses Hermes' current `sync_turn` lifecycle. Fine-grained per-tool event capture requires a compatible future host hook and is not claimed by this standalone release.
-- Administrative doctor/verify/restore commands, durable deletion, retention, backfill, Desktop UI and hybrid recall are not part of `0.1.0`.
+- Administrative doctor/verify/restore commands, durable deletion, retention, backfill, Desktop UI and hybrid recall are not part of `0.2.0`.
 
 ## License
 

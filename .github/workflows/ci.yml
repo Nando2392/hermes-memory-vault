@@ -27,9 +27,13 @@ jobs:
       - run: cargo test --locked --all-targets --all-features
       - run: cargo build --release --locked
 
-  python-plugin:
-    name: Python plugin contract
-    runs-on: windows-latest
+  python:
+    name: Python plugin and installer (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -42,6 +46,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: python -m pip install pytest pyyaml
       - run: cargo build --locked
-      - run: python -m pytest python_tests/test_vault_provider.py -q
+      - run: python -m pytest python_tests -q
         env:
           PYTHONPATH: ${{ github.workspace }}/.hermes-agent
