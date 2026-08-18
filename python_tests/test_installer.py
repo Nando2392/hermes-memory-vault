@@ -37,6 +37,17 @@ def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def test_atomic_copy_preserves_binary_payload_byte_for_byte(tmp_path: Path) -> None:
+    source = tmp_path / "source.exe"
+    target = tmp_path / "target.exe"
+    payload = b"MZ\r\n" + bytes(range(256)) + b"\x1a" + b"\x00\xff" * 8192
+    source.write_bytes(payload)
+
+    installer_module._atomic_copy(source, target)
+
+    assert target.read_bytes() == payload
+
+
 def make_bundle(
     root: Path,
     *,

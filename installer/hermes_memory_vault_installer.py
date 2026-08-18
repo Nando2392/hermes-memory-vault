@@ -286,7 +286,11 @@ def _atomic_write_payload(target: Path, payload: bytes, mode: int = 0o600) -> No
 
 def _atomic_copy(source: Path, target: Path) -> None:
     _require_safe_existing_file(source, "atomic copy source")
-    source_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    source_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
     descriptor = os.open(source, source_flags)
     try:
         source_stat = os.fstat(descriptor)
