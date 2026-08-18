@@ -11,12 +11,18 @@ fn run_with_stdin(args: &[&str], input: &str) -> std::process::Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn hermes-memory");
-    child
+    let write_result = child
         .stdin
         .as_mut()
         .expect("stdin")
-        .write_all(input.as_bytes())
-        .expect("write stdin");
+        .write_all(input.as_bytes());
+    if let Err(error) = write_result {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::BrokenPipe,
+            "write stdin: {error}"
+        );
+    }
     child.wait_with_output().expect("wait for hermes-memory")
 }
 
