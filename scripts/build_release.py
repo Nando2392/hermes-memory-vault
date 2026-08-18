@@ -81,7 +81,7 @@ def build_release(
     archive_sha = _sha256(archive_path.read_bytes())
     checksum_path = dist / f"{archive_name}.sha256"
     checksum_path.write_text(f"{archive_sha} *{archive_name}\n", encoding="ascii")
-    manifest_path = dist / f"release-manifest-{version}.json"
+    manifest_path = dist / f"release-manifest-{version}-{platform}.json"
     manifest_path.write_text(
         json.dumps(
             {

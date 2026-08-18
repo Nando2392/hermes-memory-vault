@@ -115,7 +115,7 @@ def download_release(
         raise InstallError("download destination must be absolute")
     asset_name = f"hermes-memory-vault-{tag}-{PLATFORM}.zip"
     checksum_name = f"{asset_name}.sha256"
-    manifest_name = f"release-manifest-{tag}.json"
+    manifest_name = f"release-manifest-{tag}-{PLATFORM}.json"
     manifest_checksum_name = f"{manifest_name}.sha256"
     base = f"{RELEASE_BASE_URL}/{tag}"
     bundle = destination / asset_name

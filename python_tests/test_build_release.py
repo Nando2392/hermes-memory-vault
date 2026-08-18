@@ -37,6 +37,7 @@ def test_build_release_emits_verified_standalone_assets(tmp_path: Path) -> None:
     )
 
     assert result.archive.is_file()
+    assert result.manifest.name == "release-manifest-v0.2.0-windows-x86_64.json"
     assert result.checksum.read_text(encoding="ascii").strip() == (
         f"{hashlib.sha256(result.archive.read_bytes()).hexdigest()} *{result.archive.name}"
     )

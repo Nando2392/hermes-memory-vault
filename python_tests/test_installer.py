@@ -601,9 +601,9 @@ def test_download_explicit_release_fetches_only_expected_https_assets(
     payloads = {
         asset_name: bundle_bytes,
         f"{asset_name}.sha256": f"{bundle_sha} *{asset_name}\n".encode("ascii"),
-        "release-manifest-v0.2.0.json": manifest_bytes,
-        "release-manifest-v0.2.0.json.sha256": (
-            f"{hashlib.sha256(manifest_bytes).hexdigest()} *release-manifest-v0.2.0.json\n"
+        f"release-manifest-v0.2.0-{PLATFORM}.json": manifest_bytes,
+        f"release-manifest-v0.2.0-{PLATFORM}.json.sha256": (
+            f"{hashlib.sha256(manifest_bytes).hexdigest()} *release-manifest-v0.2.0-{PLATFORM}.json\n"
         ).encode("ascii"),
     }
     requested: list[str] = []
@@ -644,12 +644,12 @@ def test_download_explicit_release_fetches_only_expected_https_assets(
     assert requested == [
         f"https://github.com/Nando2392/hermes-memory-vault/releases/download/v0.2.0/{asset_name}",
         f"https://github.com/Nando2392/hermes-memory-vault/releases/download/v0.2.0/{asset_name}.sha256",
-        "https://github.com/Nando2392/hermes-memory-vault/releases/download/v0.2.0/release-manifest-v0.2.0.json",
-        "https://github.com/Nando2392/hermes-memory-vault/releases/download/v0.2.0/release-manifest-v0.2.0.json.sha256",
+        f"https://github.com/Nando2392/hermes-memory-vault/releases/download/v0.2.0/release-manifest-v0.2.0-{PLATFORM}.json",
+        f"https://github.com/Nando2392/hermes-memory-vault/releases/download/v0.2.0/release-manifest-v0.2.0-{PLATFORM}.json.sha256",
     ]
 
-    payloads["release-manifest-v0.2.0.json.sha256"] = (
-        f"{'0' * 64} *release-manifest-v0.2.0.json\n"
+    payloads[f"release-manifest-v0.2.0-{PLATFORM}.json.sha256"] = (
+        f"{'0' * 64} *release-manifest-v0.2.0-{PLATFORM}.json\n"
     ).encode("ascii")
     with pytest.raises(InstallError, match="manifest checksum"):
         download_release("v0.2.0", tmp_path / "tampered", opener=fake_open)

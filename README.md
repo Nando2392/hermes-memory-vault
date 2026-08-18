@@ -64,7 +64,7 @@ python install-memory-vault.py install \
   --home C:/path/to/active/hermes-home \
   --bundle C:/path/to/hermes-memory-vault-v0.2.0-windows-x86_64.zip \
   --sha256 <64-hex-release-checksum> \
-  --release-manifest C:/path/to/release-manifest-v0.2.0.json \
+  --release-manifest C:/path/to/release-manifest-v0.2.0-windows-x86_64.json \
   --activate
 ```
 
