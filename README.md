@@ -6,9 +6,10 @@ The Rust data plane stores complete turn snapshots in SQLite/FTS5. A thin Python
 
 ## Status
 
-Version `0.2.0` adds a standalone, transactional installer/updater. The release
-archive carries the installer itself, the Rust binary and the user plugin; it
-does not patch or modify a Hermes Agent checkout.
+Version `0.2.1` adds a durable pre-compaction checkpoint through Hermes'
+public `on_pre_compress` memory-provider hook. The standalone transactional
+installer carries the Rust binary and user plugin; it does not patch or modify
+a Hermes Agent checkout.
 
 Verified properties:
 
@@ -21,13 +22,31 @@ Verified properties:
 - reconstructible `events.jsonl` and Markdown export;
 - no `shell=True` subprocesses;
 - fail-open capture lifecycle if the Rust binary is unavailable;
-- fail-closed automatic recall on Hermes hosts that do not mark provider recall as untrusted.
+- fail-closed automatic recall on Hermes hosts that do not mark provider recall as untrusted;
+- durable full-transcript checkpoint before automatic context compression.
 
 ## Compatibility and trust boundary
 
 Hermes Memory Vault treats every recalled item as **untrusted historical data**, never as instructions.
 
 Automatic prefetch is enabled only when the installed Hermes host wraps external provider recall as non-authoritative. On older Hermes versions, capture and the explicit `vault_search` tool remain available, but automatic prefetch returns no content. This is intentional fail-closed behavior.
+
+Before Hermes compacts a primary session, the provider snapshots the complete
+intact transcript and then writes an idempotent `checkpoint:pre_compress`
+record. Only after both writes succeed does it return bounded continuity
+context to the compressor. Instruction-shaped historical excerpts are kept on
+disk but blocked from the compressor context. This guarantees recoverability
+of the original transcript; it does not claim that an LLM summary is a
+lossless semantic representation.
+
+To compact at 35% on every supported route, including Codex models whose host
+default may auto-raise to 85%, configure Hermes through its public CLI:
+
+```bash
+hermes config set compression.threshold 0.35
+hermes config set compression.codex_gpt55_autoraise false
+hermes config set compression.in_place true
+```
 
 The upstream hardening change is tracked in [NousResearch/hermes-agent#89283](https://github.com/NousResearch/hermes-agent/pull/89283).
 
@@ -62,9 +81,9 @@ the archive and provenance manifest before staging any profile writes:
 ```bash
 python install-memory-vault.py install \
   --home C:/path/to/active/hermes-home \
-  --bundle C:/path/to/hermes-memory-vault-v0.2.0-windows-x86_64.zip \
+  --bundle C:/path/to/hermes-memory-vault-v0.2.1-windows-x86_64.zip \
   --sha256 <64-hex-release-checksum> \
-  --release-manifest C:/path/to/release-manifest-v0.2.0-windows-x86_64.json \
+  --release-manifest C:/path/to/release-manifest-v0.2.1-windows-x86_64.json \
   --activate
 ```
 
@@ -74,7 +93,7 @@ release origin:
 ```bash
 python install-memory-vault.py install \
   --home C:/path/to/active/hermes-home \
-  --tag v0.2.0 \
+  --tag v0.2.1 \
   --activate
 ```
 

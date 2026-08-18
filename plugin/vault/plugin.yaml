@@ -1,7 +1,8 @@
 name: vault
-version: 0.2.0
+version: 0.2.1
 description: "Local-first Rust memory vault with complete turn capture, SQLite/FTS5 recall, and Markdown export."
 hooks:
   - sync_turn
   - prefetch
+  - on_pre_compress
   - backup_paths
