@@ -285,9 +285,7 @@ impl MemoryStore {
             connection: Mutex::new(connection),
         };
         drop(initialization_lock);
-        if !store.projection_is_current()? {
-            store.project_jsonl()?;
-        }
+        store.project_jsonl()?;
         Ok(store)
     }
 
@@ -657,6 +655,7 @@ impl MemoryStore {
     fn project_jsonl(&self) -> Result<(), MemoryError> {
         let lock_file = capability_lock_file(&self.root_dir, "events.jsonl.lock")?;
         lock_file.lock_exclusive()?;
+        remove_orphaned_projection_temps(&self.root_dir, "events.jsonl")?;
         if self.projection_is_current()? {
             return Ok(());
         }
@@ -871,6 +870,39 @@ fn capability_atomic_write(
         file.write_all(payload)?;
         Ok(())
     })
+}
+
+fn remove_orphaned_projection_temps(directory: &Dir, target: &str) -> Result<(), MemoryError> {
+    let prefix = format!(".{target}.");
+    for entry in directory.entries()? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(identity) = name
+            .strip_prefix(&prefix)
+            .and_then(|value| value.strip_suffix(".tmp"))
+        else {
+            continue;
+        };
+        let mut components = identity.split('.');
+        let matches_projection_temp = components.next().is_some_and(|value| {
+            !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+        }) && components.next().is_some_and(|value| {
+            !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+        }) && components.next().is_none();
+        if matches_projection_temp {
+            match directory.remove_file(name) {
+                Ok(()) => {}
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::PermissionDenied
+                        || error.raw_os_error() == Some(32) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(())
 }
 
 fn capability_atomic_replace(
@@ -1303,6 +1335,62 @@ mod windows_file_guard_tests {
             temp.path().join("renamed.lock")
         )
         .is_err());
+    }
+
+    #[test]
+    fn atomic_replace_cleans_temp_when_destination_is_locked() {
+        let temp = tempdir().expect("temp dir");
+        let directory =
+            Dir::open_ambient_dir(temp.path(), ambient_authority()).expect("open temp dir");
+        std::fs::write(temp.path().join("events.jsonl"), b"canonical").expect("write target");
+        let _guard = capability_data_file(&directory, "events.jsonl").expect("guard target");
+
+        assert!(capability_atomic_write(&directory, "events.jsonl", b"replacement").is_err());
+        assert_eq!(
+            std::fs::read(temp.path().join("events.jsonl")).expect("read target"),
+            b"canonical"
+        );
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .expect("read temp dir")
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+                .count(),
+            0
+        );
+    }
+}
+
+#[cfg(test)]
+mod atomic_replace_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn atomic_replace_cleans_partial_write_and_preserves_destination() {
+        let temp = tempdir().expect("temp dir");
+        let directory =
+            Dir::open_ambient_dir(temp.path(), ambient_authority()).expect("open temp dir");
+        std::fs::write(temp.path().join("events.jsonl"), b"canonical").expect("write target");
+
+        let result = capability_atomic_replace(&directory, "events.jsonl", |file| {
+            file.write_all(b"partial")?;
+            Err(MemoryError::Io(std::io::Error::other("injected failure")))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(temp.path().join("events.jsonl")).expect("read target"),
+            b"canonical"
+        );
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .expect("read temp dir")
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+                .count(),
+            0
+        );
     }
 }
 
