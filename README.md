@@ -6,12 +6,13 @@ The Rust data plane stores complete turn snapshots in SQLite/FTS5. A thin Python
 
 ## Status
 
-Version `0.2.2` adds a durable pre-compaction checkpoint through Hermes'
-public `on_pre_compress` memory-provider hook and removes lock contention from
-the projection hot path. The standalone transactional installer carries the
-Rust binary and user plugin; it does not patch or modify a Hermes Agent
-checkout. Version `0.2.1` was never published because release verification
-exposed the contention defect.
+Version `0.2.3` bounds projection-temporary growth after an interrupted
+`events.jsonl` replacement. Store opening now recovers exact
+`.events.jsonl.<pid>.<sequence>.tmp` artifacts while holding the projection
+lock, preserves unrelated temporary files, and defers Windows files that are
+still open. SQLite remains canonical. The standalone transactional installer
+carries the Rust binary and user plugin; it does not patch or modify a Hermes
+Agent checkout.
 
 Verified properties:
 
@@ -22,6 +23,7 @@ Verified properties:
 - UTF-8 and byte-bounded subprocess exchange;
 - redaction of common secret formats before searchable projection;
 - reconstructible `events.jsonl` and Markdown export;
+- bounded recovery of interrupted `events.jsonl` projection temporaries;
 - no `shell=True` subprocesses;
 - fail-open capture lifecycle if the Rust binary is unavailable;
 - fail-closed automatic recall on Hermes hosts that do not mark provider recall as untrusted;
@@ -83,9 +85,9 @@ the archive and provenance manifest before staging any profile writes:
 ```bash
 python install-memory-vault.py install \
   --home C:/path/to/active/hermes-home \
-  --bundle C:/path/to/hermes-memory-vault-v0.2.2-windows-x86_64.zip \
+  --bundle C:/path/to/hermes-memory-vault-v0.2.3-windows-x86_64.zip \
   --sha256 <64-hex-release-checksum> \
-  --release-manifest C:/path/to/release-manifest-v0.2.2-windows-x86_64.json \
+  --release-manifest C:/path/to/release-manifest-v0.2.3-windows-x86_64.json \
   --activate
 ```
 
@@ -95,7 +97,7 @@ release origin:
 ```bash
 python install-memory-vault.py install \
   --home C:/path/to/active/hermes-home \
-  --tag v0.2.2 \
+  --tag v0.2.3 \
   --activate
 ```
 
@@ -120,7 +122,7 @@ active Hermes surface after installation so new sessions load the provider.
 4. Activate the provider:
 
 ```bash
-hermes config set memory.provider vault
+hermes config set memory.provider vault-standalone
 ```
 
 5. Restart the active Hermes gateway or start a new Hermes session.
@@ -202,7 +204,7 @@ Please report security issues privately as described in [SECURITY.md](SECURITY.m
 
 - Published binary platforms are listed per release; source and installer paths are covered on Windows and Linux by CI.
 - Capture uses Hermes' current `sync_turn` lifecycle. Fine-grained per-tool event capture requires a compatible future host hook and is not claimed by this standalone release.
-- Administrative doctor/verify/restore commands, durable deletion, retention, backfill, Desktop UI and hybrid recall are not part of `0.2.0`.
+- Administrative doctor/verify/restore commands, durable deletion, retention, backfill, Desktop UI and hybrid recall are not part of this release.
 
 ## License
 

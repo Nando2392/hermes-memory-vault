@@ -21,12 +21,12 @@ def test_build_verified_binary_compiles_locked_release_and_checks_version(
         if command[0] == "cargo":
             return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
         return subprocess.CompletedProcess(
-            command, 0, stdout="hermes-memory 0.2.2\n", stderr=""
+            command, 0, stdout="hermes-memory 0.2.3\n", stderr=""
         )
 
     monkeypatch.setattr(subprocess, "run", run)
 
-    build_verified_binary(tmp_path, "windows-x86_64", "v0.2.2")
+    build_verified_binary(tmp_path, "windows-x86_64", "v0.2.3")
 
     assert calls == [
         ["cargo", "build", "--release", "--locked"],
@@ -44,7 +44,7 @@ def test_build_verified_binary_rejects_stale_version(
     monkeypatch.setattr(subprocess, "run", run)
 
     with pytest.raises(RuntimeError, match="version mismatch"):
-        build_verified_binary(tmp_path, "windows-x86_64", "v0.2.2")
+        build_verified_binary(tmp_path, "windows-x86_64", "v0.2.3")
 
 
 def test_build_release_emits_verified_standalone_assets(tmp_path: Path) -> None:

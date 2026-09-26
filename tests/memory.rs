@@ -610,6 +610,73 @@ fn concurrent_ingest_projects_complete_parseable_jsonl() {
 }
 
 #[test]
+fn store_open_recovers_only_orphaned_jsonl_projection_temps() {
+    let temp = tempdir().expect("temp dir");
+    let root = temp.path().join("store");
+    let store = MemoryStore::open(&root).expect("open store");
+    store
+        .ingest(&record("one", "repo-a", "first"))
+        .expect("ingest");
+    drop(store);
+
+    let canonical = std::fs::read(root.join("events.jsonl")).expect("read canonical projection");
+    let unrelated = root.join("unrelated.tmp");
+    for sequence in 0..32 {
+        std::fs::write(
+            root.join(format!(".events.jsonl.424242.{sequence}.tmp")),
+            b"partial derived projection",
+        )
+        .expect("write orphan");
+    }
+    std::fs::write(&unrelated, b"must be preserved").expect("write unrelated temp");
+
+    drop(MemoryStore::open(&root).expect("reopen store"));
+
+    assert_eq!(
+        std::fs::read(root.join("events.jsonl")).expect("read recovered projection"),
+        canonical,
+        "orphan recovery changed the canonical projection"
+    );
+    assert_eq!(
+        std::fs::read_dir(&root)
+            .expect("read store")
+            .filter_map(Result::ok)
+            .filter(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".events.jsonl."))
+            .count(),
+        0,
+        "projection orphan growth was not bounded"
+    );
+    assert!(unrelated.exists(), "unrelated temporary was removed");
+}
+
+#[cfg(windows)]
+#[test]
+fn store_open_skips_locked_projection_temp_until_a_later_recovery() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let temp = tempdir().expect("temp dir");
+    let root = temp.path().join("store");
+    drop(MemoryStore::open(&root).expect("create store"));
+    let orphan = root.join(".events.jsonl.424242.8.tmp");
+    std::fs::write(&orphan, b"partial derived projection").expect("write orphan");
+    let guard = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x00000001 | 0x00000002)
+        .open(&orphan)
+        .expect("lock orphan against delete");
+
+    drop(MemoryStore::open(&root).expect("locked orphan must not block the store"));
+    assert!(orphan.exists(), "locked orphan was unexpectedly removed");
+
+    drop(guard);
+    drop(MemoryStore::open(&root).expect("recover unlocked orphan"));
+    assert!(!orphan.exists(), "unlocked orphan was not recovered");
+}
+
+#[test]
 fn open_rebuilds_missing_corrupt_or_stale_jsonl_from_sqlite() {
     let temp = tempdir().expect("temp dir");
     let root = temp.path().join("store");
