@@ -51,7 +51,7 @@ jobs:
         with:
           python-version: "3.11"
       - uses: dtolnay/rust-toolchain@stable
-      - run: python -m pip install pytest pyyaml
+      - run: python -m pip install pytest pyyaml ruamel.yaml==0.18.17
       - run: cargo build --locked
       - run: python -m pytest python_tests -q
         env:
