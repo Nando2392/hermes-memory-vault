@@ -124,6 +124,25 @@ def test_vault_provider_is_fail_open_when_binary_is_missing(tmp_path, monkeypatc
     assert "HERMES_MEMORY_BIN" in provider.unavailable_reason()
 
 
+def test_vault_provider_uses_recovery_timeout_for_every_store_open(tmp_path, monkeypatch):
+    provider = VaultMemoryProvider()
+    provider._binary = tmp_path / "hermes-memory"
+    provider._root = tmp_path / "memory-vault"
+    timeouts = []
+
+    def fake_run(_command, **kwargs):
+        timeouts.append(kwargs["timeout"])
+        return subprocess.CompletedProcess([], 0, stdout="null", stderr="")
+
+    monkeypatch.setattr(PLUGIN_MODULE.subprocess, "run", fake_run)
+
+    provider._run(["search", "sentinel"])
+    provider._run(["ingest"], input_text="[]")
+    provider._run(["snapshot"], input_text="{}")
+
+    assert timeouts == [120, 120, 120]
+
+
 def test_vault_provider_discovers_profile_binary_before_initialize(tmp_path, monkeypatch):
     executable = "hermes-memory.exe" if os.name == "nt" else "hermes-memory"
     binary = tmp_path / "bin" / executable

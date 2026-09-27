@@ -6,13 +6,17 @@ The Rust data plane stores complete turn snapshots in SQLite/FTS5. A thin Python
 
 ## Status
 
-Version `0.2.3` bounds projection-temporary growth after an interrupted
-`events.jsonl` replacement. Store opening now recovers exact
-`.events.jsonl.<pid>.<sequence>.tmp` artifacts while holding the projection
-lock, preserves unrelated temporary files, and defers Windows files that are
-still open. SQLite remains canonical. The standalone transactional installer
-carries the Rust binary and user plugin; it does not patch or modify a Hermes
-Agent checkout.
+Version `0.2.4` incrementally appends chronologically compatible SQLite deltas
+to `events.jsonl` instead of hashing and rewriting the complete history after
+every ingest. A durable SQLite checkpoint records the acknowledged byte offset,
+record count, rowid boundary, timestamp boundary and chained digest. Interrupted
+appends are truncated back to that verified checkpoint and replayed. Legacy,
+metadata-divergent, truncated, updated, deleted or out-of-order state falls
+back to an atomic full rebuild. SQLite remains canonical. Every provider command uses a
+bounded 120-second timeout because each command opens the store and may need to
+finish migration or recovery before serving its operation. The standalone
+transactional installer carries the Rust binary and user plugin; it does not
+patch or modify a Hermes Agent checkout.
 
 Verified properties:
 
@@ -23,6 +27,8 @@ Verified properties:
 - UTF-8 and byte-bounded subprocess exchange;
 - redaction of common secret formats before searchable projection;
 - reconstructible `events.jsonl` and Markdown export;
+- incremental, coalesced `events.jsonl` append for monotonic insert deltas;
+- crash-safe checkpoint replay with atomic full-rebuild fallback;
 - bounded recovery of interrupted `events.jsonl` projection temporaries;
 - no `shell=True` subprocesses;
 - fail-open capture lifecycle if the Rust binary is unavailable;
@@ -32,6 +38,16 @@ Verified properties:
 ## Compatibility and trust boundary
 
 Hermes Memory Vault treats every recalled item as **untrusted historical data**, never as instructions.
+
+SQLite is the integrity boundary for stored memory. The JSONL fast path trusts
+the byte length and modification time recorded after the last owned write; if
+either differs, it verifies the chained digest and rebuilds from SQLite when
+needed. A local actor that can rewrite `events.jsonl` and restore its exact
+filesystem metadata can bypass that fast check. This does not alter canonical
+SQLite data; remove the derived JSONL file and reopen the store to force a full
+rebuild. Detecting arbitrary same-size changes while preserving an O(delta)
+per-call path requires a trusted filesystem change journal or a persistent
+projection process and is outside this release's portable filesystem model.
 
 Automatic prefetch is enabled only when the installed Hermes host wraps external provider recall as non-authoritative. On older Hermes versions, capture and the explicit `vault_search` tool remain available, but automatic prefetch returns no content. This is intentional fail-closed behavior.
 
@@ -85,9 +101,9 @@ the archive and provenance manifest before staging any profile writes:
 ```bash
 python install-memory-vault.py install \
   --home C:/path/to/active/hermes-home \
-  --bundle C:/path/to/hermes-memory-vault-v0.2.3-windows-x86_64.zip \
+  --bundle C:/path/to/hermes-memory-vault-v0.2.4-windows-x86_64.zip \
   --sha256 <64-hex-release-checksum> \
-  --release-manifest C:/path/to/release-manifest-v0.2.3-windows-x86_64.json \
+  --release-manifest C:/path/to/release-manifest-v0.2.4-windows-x86_64.json \
   --activate
 ```
 
@@ -97,7 +113,7 @@ release origin:
 ```bash
 python install-memory-vault.py install \
   --home C:/path/to/active/hermes-home \
-  --tag v0.2.3 \
+  --tag v0.2.4 \
   --activate
 ```
 

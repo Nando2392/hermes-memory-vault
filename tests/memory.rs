@@ -1,5 +1,6 @@
 use hermes_memory::{MemoryRecord, MemoryStore, SearchRequest, SnapshotItem, SnapshotRequest};
 use serde_json::json;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Barrier};
 use tempfile::tempdir;
 
@@ -37,6 +38,14 @@ fn record(id: &str, workspace: &str, content: &str) -> MemoryRecord {
         timestamp: 1_787_000_000.0,
         metadata: json!({"provider": "local"}),
     }
+}
+
+fn read_projection(root: &std::path::Path) -> Vec<MemoryRecord> {
+    std::fs::read_to_string(root.join("events.jsonl"))
+        .expect("read event projection")
+        .lines()
+        .map(|line| serde_json::from_str::<MemoryRecord>(line).expect("valid JSONL record"))
+        .collect()
 }
 
 #[test]
@@ -607,6 +616,216 @@ fn concurrent_ingest_projects_complete_parseable_jsonl() {
     assert_eq!(records.len(), 2);
     assert!(records.iter().any(|record| record.id == "concurrent-0"));
     assert!(records.iter().any(|record| record.id == "concurrent-1"));
+}
+
+#[test]
+fn monotonic_ingest_appends_to_existing_projection_file() {
+    let temp = tempdir().expect("temp dir");
+    let root = temp.path().join("store");
+    let store = MemoryStore::open(&root).expect("open store");
+    let mut first = record("append-first", "repo-a", "first projection record");
+    first.timestamp = 1.0;
+    store.ingest(&first).expect("ingest first");
+
+    #[cfg(windows)]
+    let mut observer = {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x00000001 | 0x00000002 | 0x00000004)
+            .open(root.join("events.jsonl"))
+            .expect("open projection observer")
+    };
+    #[cfg(not(windows))]
+    let mut observer =
+        std::fs::File::open(root.join("events.jsonl")).expect("open projection observer");
+
+    let mut second = record("append-second", "repo-a", "second projection record");
+    second.timestamp = 2.0;
+    store.ingest(&second).expect("ingest second");
+
+    observer.seek(SeekFrom::Start(0)).expect("rewind observer");
+    let mut observed = String::new();
+    observer
+        .read_to_string(&mut observed)
+        .expect("read observed projection");
+    assert!(
+        observed.contains("append-second"),
+        "monotonic projection replaced the file instead of appending to it"
+    );
+}
+
+#[test]
+fn out_of_order_ingest_rebuilds_projection_in_timestamp_order() {
+    let temp = tempdir().expect("tempdir");
+    let root = temp.path().join("store");
+    let store = MemoryStore::open(&root).expect("open store");
+    let mut later = record("later", "repo-a", "later record");
+    later.timestamp = 10.0;
+    store.ingest(&later).expect("ingest later record");
+
+    #[cfg(windows)]
+    let mut observer = {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x00000001 | 0x00000002 | 0x00000004)
+            .open(root.join("events.jsonl"))
+            .expect("open projection observer")
+    };
+    #[cfg(not(windows))]
+    let mut observer =
+        std::fs::File::open(root.join("events.jsonl")).expect("open projection observer");
+
+    let mut earlier = record("earlier", "repo-a", "earlier record");
+    earlier.timestamp = 1.0;
+    store.ingest(&earlier).expect("ingest earlier record");
+
+    observer.seek(SeekFrom::Start(0)).expect("rewind observer");
+    let mut old_projection = String::new();
+    observer
+        .read_to_string(&mut old_projection)
+        .expect("read old projection");
+    assert!(!old_projection.contains("earlier"));
+
+    let records = read_projection(&root);
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["earlier", "later"]
+    );
+}
+
+#[test]
+fn store_open_recovers_interrupted_projection_state_migration() {
+    let temp = tempdir().expect("tempdir");
+    let root = temp.path().join("store");
+    drop(MemoryStore::open(&root).expect("create current store"));
+
+    let connection = rusqlite::Connection::open(root.join("memory.db")).expect("open sqlite");
+    connection
+        .execute_batch("PRAGMA user_version=1;")
+        .expect("simulate interruption before schema version update");
+    drop(connection);
+
+    drop(MemoryStore::open(&root).expect("resume interrupted migration"));
+    let connection = rusqlite::Connection::open(root.join("memory.db")).expect("reopen sqlite");
+    let version = connection
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+        .expect("read schema version");
+    assert_eq!(version, 2);
+}
+
+#[test]
+fn store_open_truncates_uncheckpointed_projection_tail() {
+    let temp = tempdir().expect("tempdir");
+    let root = temp.path().join("store");
+    let store = MemoryStore::open(&root).expect("open store");
+    store
+        .ingest(&record("checkpointed", "repo-a", "canonical"))
+        .expect("ingest canonical record");
+    drop(store);
+
+    let projection = root.join("events.jsonl");
+    let canonical = std::fs::read(&projection).expect("read checkpointed projection");
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&projection)
+        .expect("open projection for simulated crash tail");
+    file.write_all(b"{\"id\":\"uncheckpointed\"}\n")
+        .expect("append simulated crash tail");
+    file.sync_all().expect("sync simulated crash tail");
+    drop(file);
+
+    drop(MemoryStore::open(&root).expect("recover projection tail"));
+    assert_eq!(
+        std::fs::read(&projection).expect("read recovered projection"),
+        canonical
+    );
+}
+
+#[test]
+fn store_open_rebuilds_projection_when_checkpoint_hash_is_not_hex() {
+    let temp = tempdir().expect("temp dir");
+    let root = temp.path().join("store");
+    let store = MemoryStore::open(&root).expect("store");
+    store
+        .ingest(&record("invalid-checkpoint-hash", "repo-a", "canonical"))
+        .expect("ingest");
+    drop(store);
+
+    let connection = rusqlite::Connection::open(root.join("memory.db")).expect("open database");
+    connection
+        .execute(
+            "UPDATE projection_state SET projected_sha256 = ?1 WHERE singleton = 1",
+            rusqlite::params!["z".repeat(64)],
+        )
+        .expect("corrupt checkpoint hash");
+    drop(connection);
+
+    drop(MemoryStore::open(&root).expect("repair invalid checkpoint hash"));
+    let connection = rusqlite::Connection::open(root.join("memory.db")).expect("open database");
+    let repaired: String = connection
+        .query_row(
+            "SELECT projected_sha256 FROM projection_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("checkpoint hash");
+    assert_eq!(repaired.len(), 64);
+    assert!(repaired.bytes().all(|byte| byte.is_ascii_hexdigit()));
+}
+
+#[test]
+fn store_open_replays_committed_delta_after_partial_projection_append() {
+    let temp = tempdir().expect("tempdir");
+    let root = temp.path().join("store");
+    let store = MemoryStore::open(&root).expect("open store");
+    let mut first = record("first", "repo-a", "first record");
+    first.timestamp = 1.0;
+    store.ingest(&first).expect("ingest first record");
+    drop(store);
+
+    let connection = rusqlite::Connection::open(root.join("memory.db")).expect("open sqlite");
+    connection
+        .execute(
+            "INSERT INTO records
+             (id, session_id, workspace, kind, content, timestamp, metadata_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                "second",
+                "session-1",
+                "repo-a",
+                "user",
+                "second record",
+                2.0,
+                "{}"
+            ],
+        )
+        .expect("commit canonical delta");
+    drop(connection);
+
+    let projection = root.join("events.jsonl");
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&projection)
+        .expect("open projection for partial append");
+    file.write_all(b"{\"id\":\"sec")
+        .expect("write partial projection line");
+    file.sync_all().expect("sync partial projection line");
+    drop(file);
+
+    drop(MemoryStore::open(&root).expect("recover committed delta"));
+    let records = read_projection(&root);
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["first", "second"]
+    );
 }
 
 #[test]

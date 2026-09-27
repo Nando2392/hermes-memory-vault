@@ -16,6 +16,7 @@ from agent.memory_provider import MemoryProvider, RecallStatus
 _MAX_MESSAGE_CHARS = 1_000_000
 _DEFAULT_RECALL_BYTES = 4096
 _MAX_STDIN_BYTES = 8 * 1024 * 1024
+_STORE_OPEN_TIMEOUT_SECONDS = 120
 
 
 def _host_marks_provider_recall_untrusted() -> bool:
@@ -147,7 +148,7 @@ class VaultMemoryProvider(MemoryProvider):
                 text=True,
                 encoding="utf-8",
                 errors="strict",
-                timeout=15,
+                timeout=_STORE_OPEN_TIMEOUT_SECONDS,
                 check=False,
             )
         except (OSError, subprocess.SubprocessError):

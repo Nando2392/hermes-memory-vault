@@ -14,11 +14,11 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 use thiserror::Error;
 
 #[cfg(windows)]
@@ -165,6 +165,32 @@ pub struct MemoryStore {
     connection: Mutex<Connection>,
 }
 
+const PROJECTION_FORMAT: i64 = 2;
+
+#[derive(Debug)]
+struct ProjectionState {
+    current_generation: i64,
+    projected_generation: i64,
+    projected_hash: String,
+    projected_bytes: i64,
+    projection_format: i64,
+    projected_records: i64,
+    projected_max_rowid: i64,
+    projected_last_timestamp: Option<f64>,
+    projected_modified_ns: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    first: u64,
+    second: u64,
+}
+
+struct ValidatedProjection {
+    file: CapFile,
+    identity: FileIdentity,
+}
+
 pub fn validate_export_destination(path: &Path) -> Result<(), MemoryError> {
     let mut candidate = Some(path);
     while let Some(current) = candidate {
@@ -195,9 +221,9 @@ impl MemoryStore {
         let database_guard = capability_data_file(&root_dir, "memory.db")?;
         let wal_guard = capability_data_file(&root_dir, "memory.db-wal")?;
         let shm_guard = capability_data_file(&root_dir, "memory.db-shm")?;
-        let connection = Connection::open(stable_root.join("memory.db"))?;
+        let mut connection = Connection::open(stable_root.join("memory.db"))?;
         connection.busy_timeout(Duration::from_secs(5))?;
-        if connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? < 1 {
+        if connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? < 2 {
             FileExt::unlock(&initialization_lock)?;
             initialization_lock.lock_exclusive()?;
             if connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? < 1 {
@@ -273,6 +299,10 @@ impl MemoryStore {
              END;
              PRAGMA user_version=1;",
                 )?;
+                sync_directory(&root_dir)?;
+            }
+            if connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? < 2 {
+                migrate_projection_state_v2(&mut connection)?;
                 sync_directory(&root_dir)?;
             }
         }
@@ -605,112 +635,436 @@ impl MemoryStore {
         Ok(sessions.len())
     }
 
-    fn projection_is_current(&self) -> Result<bool, MemoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .map_err(|_| MemoryError::LockPoisoned)?;
-        let (current_generation, projected_generation, expected_hash, expected_bytes) = connection
-            .query_row(
-                "SELECT current_generation, projected_generation, projected_sha256, projected_bytes
-                 FROM projection_state WHERE singleton = 1",
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, i64>(3)?,
-                    ))
-                },
-            )?;
-        drop(connection);
-        if current_generation != projected_generation
-            || expected_hash.len() != 64
-            || expected_bytes < 0
-        {
-            return Ok(false);
-        }
-        let mut file = match capability_existing_file(&self.root_dir, "events.jsonl") {
-            Ok(file) => file,
-            Err(MemoryError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(false);
-            }
-            Err(error) => return Err(error),
-        };
-        let mut digest = Sha256::new();
-        let mut actual_bytes = 0i64;
-        let mut buffer = [0u8; 64 * 1024];
-        loop {
-            let count = file.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            actual_bytes = actual_bytes.saturating_add(count as i64);
-            digest.update(&buffer[..count]);
-        }
-        Ok(actual_bytes == expected_bytes && format!("{:x}", digest.finalize()) == expected_hash)
-    }
-
     fn project_jsonl(&self) -> Result<(), MemoryError> {
         let lock_file = capability_lock_file(&self.root_dir, "events.jsonl.lock")?;
         lock_file.lock_exclusive()?;
         remove_orphaned_projection_temps(&self.root_dir, "events.jsonl")?;
-        if self.projection_is_current()? {
-            return Ok(());
-        }
         let mut connection = self
             .connection
             .lock()
             .map_err(|_| MemoryError::LockPoisoned)?;
-        let transaction = connection.transaction()?;
-        let generation = transaction.query_row(
-            "SELECT current_generation FROM projection_state WHERE singleton = 1",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?;
-        let mut statement = transaction.prepare(
-            "SELECT id, session_id, workspace, kind, content, timestamp, metadata_json
-             FROM records ORDER BY timestamp, rowid",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok(MemoryRecord {
-                id: row.get(0)?,
-                session_id: row.get(1)?,
-                workspace: row.get(2)?,
-                kind: row.get(3)?,
-                content: row.get(4)?,
-                timestamp: row.get(5)?,
-                metadata: serde_json::from_str::<Value>(&row.get::<_, String>(6)?)
-                    .unwrap_or(Value::Null),
-            })
-        })?;
-        let mut projected_hash = Sha256::new();
-        let mut projected_bytes = 0i64;
-        capability_atomic_replace(&self.root_dir, "events.jsonl", |file| {
-            for row in rows {
-                let mut line = serde_json::to_vec(&row?)?;
-                line.push(b'\n');
-                projected_hash.update(&line);
-                projected_bytes = projected_bytes.saturating_add(line.len() as i64);
-                file.write_all(&line)?;
+        let state = load_projection_state(&connection)?;
+        let validated_projection = validate_projection_prefix(&self.root_dir, &state)?;
+        if state.projection_format == PROJECTION_FORMAT
+            && state.current_generation == state.projected_generation
+        {
+            if let Some(projection) = validated_projection {
+                if reconcile_projection_checkpoint(&self.root_dir, &connection, &state, projection)?
+                {
+                    return Ok(());
+                }
             }
-            Ok(())
-        })?;
-        drop(statement);
-        transaction.commit()?;
-        connection.execute(
-            "UPDATE projection_state
-             SET projected_generation = ?1, projected_sha256 = ?2, projected_bytes = ?3
-             WHERE singleton = 1",
-            params![
-                generation,
-                format!("{:x}", projected_hash.finalize()),
-                projected_bytes
-            ],
-        )?;
-        Ok(())
+            return rebuild_projection(&self.root_dir, &mut connection);
+        }
+        if let Some(projection) = validated_projection {
+            if try_append_projection(&self.root_dir, &mut connection, &state, projection)? {
+                return Ok(());
+            }
+        }
+        rebuild_projection(&self.root_dir, &mut connection)
     }
+}
+
+fn reconcile_projection_checkpoint(
+    root_dir: &Dir,
+    connection: &Connection,
+    state: &ProjectionState,
+    projection: ValidatedProjection,
+) -> Result<bool, MemoryError> {
+    let metadata = projection.file.metadata()?;
+    if metadata.len() == state.projected_bytes as u64
+        && projection_modified_ns(&metadata)? == state.projected_modified_ns
+    {
+        return projection_path_matches(root_dir, "events.jsonl", projection.identity);
+    }
+    if metadata.len() > state.projected_bytes as u64 {
+        projection.file.set_len(state.projected_bytes as u64)?;
+        projection.file.sync_all()?;
+    }
+    if !projection_path_matches(root_dir, "events.jsonl", projection.identity)? {
+        return Ok(false);
+    }
+    let modified_ns = projection_modified_ns(&projection.file.metadata()?)?;
+    connection.execute(
+        "UPDATE projection_state SET projected_modified_ns = ?1
+         WHERE singleton = 1 AND projected_generation = ?2 AND projected_bytes = ?3",
+        params![
+            modified_ns,
+            state.projected_generation,
+            state.projected_bytes
+        ],
+    )?;
+    Ok(true)
+}
+
+fn migrate_projection_state_v2(connection: &mut Connection) -> Result<(), MemoryError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for (column, definition) in [
+        ("projection_format", "INTEGER NOT NULL DEFAULT 1"),
+        ("projected_records", "INTEGER NOT NULL DEFAULT -1"),
+        ("projected_max_rowid", "INTEGER NOT NULL DEFAULT -1"),
+        ("projected_last_timestamp", "REAL"),
+        ("projected_modified_ns", "INTEGER NOT NULL DEFAULT -1"),
+    ] {
+        let exists = transaction
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('projection_state') WHERE name = ?1",
+                params![column],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            transaction.execute_batch(&format!(
+                "ALTER TABLE projection_state ADD COLUMN {column} {definition};"
+            ))?;
+        }
+    }
+    transaction.pragma_update(None, "user_version", 2i64)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn load_projection_state(connection: &Connection) -> Result<ProjectionState, MemoryError> {
+    Ok(connection.query_row(
+        "SELECT current_generation, projected_generation, projected_sha256, projected_bytes,
+                projection_format, projected_records, projected_max_rowid,
+                projected_last_timestamp, projected_modified_ns
+         FROM projection_state WHERE singleton = 1",
+        [],
+        |row| {
+            Ok(ProjectionState {
+                current_generation: row.get(0)?,
+                projected_generation: row.get(1)?,
+                projected_hash: row.get(2)?,
+                projected_bytes: row.get(3)?,
+                projection_format: row.get(4)?,
+                projected_records: row.get(5)?,
+                projected_max_rowid: row.get(6)?,
+                projected_last_timestamp: row.get(7)?,
+                projected_modified_ns: row.get(8)?,
+            })
+        },
+    )?)
+}
+
+fn validate_projection_prefix(
+    root_dir: &Dir,
+    state: &ProjectionState,
+) -> Result<Option<ValidatedProjection>, MemoryError> {
+    if state.projection_format != PROJECTION_FORMAT
+        || state.projected_hash.len() != 64
+        || state.projected_bytes < 0
+        || state.projected_records < 0
+        || state.projected_max_rowid < 0
+    {
+        return Ok(None);
+    }
+    let Some(expected_hash) = decode_projection_hash(&state.projected_hash) else {
+        return Ok(None);
+    };
+    let mut file = match capability_existing_data_file(root_dir, "events.jsonl") {
+        Ok(file) => file,
+        Err(MemoryError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let identity = capability_file_identity(&file)?;
+    let metadata = file.metadata()?;
+    let actual_bytes = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
+    if actual_bytes < state.projected_bytes {
+        return Ok(None);
+    }
+    if actual_bytes == state.projected_bytes
+        && projection_modified_ns(&metadata)? == state.projected_modified_ns
+    {
+        return Ok(Some(ValidatedProjection { file, identity }));
+    }
+
+    let mut reader = BufReader::new(&mut file);
+    let mut chain = projection_chain_seed();
+    let mut line_hasher = Sha256::new();
+    line_hasher.update(chain);
+    let mut consumed = 0i64;
+    let mut records = 0i64;
+    let mut at_line_boundary = true;
+    while consumed < state.projected_bytes {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok(None);
+        }
+        let remaining =
+            usize::try_from(state.projected_bytes.saturating_sub(consumed)).unwrap_or(usize::MAX);
+        let count = buffer.len().min(remaining);
+        let mut start = 0usize;
+        while start < count {
+            if let Some(relative_newline) =
+                buffer[start..count].iter().position(|byte| *byte == b'\n')
+            {
+                let end = start + relative_newline + 1;
+                line_hasher.update(&buffer[start..end]);
+                chain = line_hasher.finalize().into();
+                line_hasher = Sha256::new();
+                line_hasher.update(chain);
+                records = records.saturating_add(1);
+                at_line_boundary = true;
+                start = end;
+            } else {
+                line_hasher.update(&buffer[start..count]);
+                at_line_boundary = false;
+                start = count;
+            }
+        }
+        reader.consume(count);
+        consumed = consumed.saturating_add(count as i64);
+    }
+    drop(reader);
+    if consumed == state.projected_bytes
+        && at_line_boundary
+        && records == state.projected_records
+        && chain == expected_hash
+    {
+        Ok(Some(ValidatedProjection { file, identity }))
+    } else {
+        Ok(None)
+    }
+}
+
+fn try_append_projection(
+    root_dir: &Dir,
+    connection: &mut Connection,
+    state: &ProjectionState,
+    mut projection: ValidatedProjection,
+) -> Result<bool, MemoryError> {
+    if state.projection_format != PROJECTION_FORMAT
+        || state.current_generation <= state.projected_generation
+        || state.projected_bytes < 0
+    {
+        return Ok(false);
+    }
+
+    let transaction = connection.transaction()?;
+    let generation = transaction.query_row(
+        "SELECT current_generation FROM projection_state WHERE singleton = 1",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let generation_delta = generation.saturating_sub(state.projected_generation);
+    if generation_delta <= 0 {
+        return Ok(false);
+    }
+
+    let (candidate_count, minimum_timestamp, max_rowid) = transaction.query_row(
+        "SELECT COUNT(*), MIN(timestamp), COALESCE(MAX(rowid), 0)
+         FROM records WHERE rowid > ?1",
+        params![state.projected_max_rowid],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<f64>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        },
+    )?;
+    if candidate_count != generation_delta
+        || max_rowid < state.projected_max_rowid
+        || minimum_timestamp.is_some_and(|minimum| {
+            state
+                .projected_last_timestamp
+                .is_some_and(|last| minimum < last)
+        })
+    {
+        return Ok(false);
+    }
+
+    let mut chain = decode_projection_hash(&state.projected_hash).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid projection checkpoint hash",
+        )
+    })?;
+    let mut projected_bytes = state.projected_bytes;
+    let current_len = projection.file.metadata()?.len();
+    if current_len > state.projected_bytes as u64 {
+        projection.file.set_len(state.projected_bytes as u64)?;
+        projection.file.sync_all()?;
+    }
+    projection.file.seek(SeekFrom::End(0))?;
+    let mut statement = transaction.prepare(
+        "SELECT id, session_id, workspace, kind, content, timestamp, metadata_json
+         FROM records WHERE rowid > ?1 ORDER BY timestamp, rowid",
+    )?;
+    let rows = statement.query_map(params![state.projected_max_rowid], |row| {
+        Ok(MemoryRecord {
+            id: row.get(0)?,
+            session_id: row.get(1)?,
+            workspace: row.get(2)?,
+            kind: row.get(3)?,
+            content: row.get(4)?,
+            timestamp: row.get(5)?,
+            metadata: serde_json::from_str::<Value>(&row.get::<_, String>(6)?)
+                .unwrap_or(Value::Null),
+        })
+    })?;
+    let mut appended_records = 0i64;
+    let mut projected_last_timestamp = state.projected_last_timestamp;
+    for row in rows {
+        let record = row?;
+        let mut line = serde_json::to_vec(&record)?;
+        line.push(b'\n');
+        projection.file.write_all(&line)?;
+        chain = projection_chain_extend(chain, &line);
+        projected_bytes = projected_bytes.saturating_add(line.len() as i64);
+        appended_records = appended_records.saturating_add(1);
+        projected_last_timestamp = Some(record.timestamp);
+    }
+    if appended_records != generation_delta {
+        return Ok(false);
+    }
+    projection.file.flush()?;
+    projection.file.sync_all()?;
+    let modified_ns = projection_modified_ns(&projection.file.metadata()?)?;
+    drop(statement);
+    if !projection_path_matches(root_dir, "events.jsonl", projection.identity)? {
+        return Ok(false);
+    }
+    transaction.commit()?;
+
+    connection.execute(
+        "UPDATE projection_state
+         SET projected_generation = ?1, projected_sha256 = ?2, projected_bytes = ?3,
+             projection_format = ?4, projected_records = ?5, projected_max_rowid = ?6,
+             projected_last_timestamp = ?7, projected_modified_ns = ?8
+         WHERE singleton = 1",
+        params![
+            generation,
+            encode_projection_hash(&chain),
+            projected_bytes,
+            PROJECTION_FORMAT,
+            state.projected_records.saturating_add(appended_records),
+            max_rowid,
+            projected_last_timestamp,
+            modified_ns,
+        ],
+    )?;
+    Ok(true)
+}
+
+fn rebuild_projection(root_dir: &Dir, connection: &mut Connection) -> Result<(), MemoryError> {
+    let transaction = connection.transaction()?;
+    let generation = transaction.query_row(
+        "SELECT current_generation FROM projection_state WHERE singleton = 1",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let mut statement = transaction.prepare(
+        "SELECT rowid, id, session_id, workspace, kind, content, timestamp, metadata_json
+             FROM records ORDER BY timestamp, rowid",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            MemoryRecord {
+                id: row.get(1)?,
+                session_id: row.get(2)?,
+                workspace: row.get(3)?,
+                kind: row.get(4)?,
+                content: row.get(5)?,
+                timestamp: row.get(6)?,
+                metadata: serde_json::from_str::<Value>(&row.get::<_, String>(7)?)
+                    .unwrap_or(Value::Null),
+            },
+        ))
+    })?;
+    let mut projected_hash = projection_chain_seed();
+    let mut projected_bytes = 0i64;
+    let mut projected_records = 0i64;
+    let mut projected_max_rowid = 0i64;
+    let mut projected_last_timestamp = None;
+    capability_atomic_replace(root_dir, "events.jsonl", |file| {
+        for row in rows {
+            let (rowid, record) = row?;
+            let mut line = serde_json::to_vec(&record)?;
+            line.push(b'\n');
+            projected_hash = projection_chain_extend(projected_hash, &line);
+            projected_bytes = projected_bytes.saturating_add(line.len() as i64);
+            projected_records = projected_records.saturating_add(1);
+            projected_max_rowid = projected_max_rowid.max(rowid);
+            projected_last_timestamp = Some(record.timestamp);
+            file.write_all(&line)?;
+        }
+        Ok(())
+    })?;
+    let projection_file = capability_existing_file(root_dir, "events.jsonl")?;
+    let projected_modified_ns = projection_modified_ns(&projection_file.metadata()?)?;
+    drop(projection_file);
+    drop(statement);
+    transaction.commit()?;
+    connection.execute(
+        "UPDATE projection_state
+             SET projected_generation = ?1, projected_sha256 = ?2, projected_bytes = ?3,
+                 projection_format = ?4, projected_records = ?5, projected_max_rowid = ?6,
+                 projected_last_timestamp = ?7, projected_modified_ns = ?8
+             WHERE singleton = 1",
+        params![
+            generation,
+            encode_projection_hash(&projected_hash),
+            projected_bytes,
+            PROJECTION_FORMAT,
+            projected_records,
+            projected_max_rowid,
+            projected_last_timestamp,
+            projected_modified_ns,
+        ],
+    )?;
+    Ok(())
+}
+
+fn projection_chain_seed() -> [u8; 32] {
+    Sha256::digest(b"hermes-memory-events-jsonl-v2\0").into()
+}
+
+fn projection_chain_extend(previous: [u8; 32], line: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(previous);
+    digest.update(line);
+    digest.finalize().into()
+}
+
+fn decode_projection_hash(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 {
+        return None;
+    }
+    let mut decoded = [0u8; 32];
+    for (index, byte) in decoded.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(decoded)
+}
+
+fn encode_projection_hash(value: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(64);
+    for byte in value {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn projection_modified_ns(metadata: &cap_std::fs::Metadata) -> Result<i64, MemoryError> {
+    let duration = metadata
+        .modified()?
+        .into_std()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "projection modification time predates Unix epoch",
+            )
+        })?;
+    Ok(i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX))
 }
 
 fn open_or_create_absolute_dir(path: &Path) -> Result<Dir, MemoryError> {
@@ -791,6 +1145,64 @@ fn capability_existing_file(directory: &Dir, name: &str) -> Result<CapFile, Memo
     let file = directory.open_with(name, &options)?;
     ensure_single_link(&file)?;
     Ok(file)
+}
+
+fn capability_existing_data_file(directory: &Dir, name: &str) -> Result<CapFile, MemoryError> {
+    let mut options = CapOpenOptions::new();
+    options.read(true).write(true).follow(FollowSymlinks::No);
+    #[cfg(windows)]
+    options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    let file = directory.open_with(name, &options)?;
+    ensure_single_link(&file)?;
+    Ok(file)
+}
+
+fn capability_file_identity(file: &CapFile) -> Result<FileIdentity, MemoryError> {
+    let metadata = file.metadata()?;
+    #[cfg(windows)]
+    {
+        let first = metadata.volume_serial_number().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "file volume identity is unavailable",
+            )
+        })? as u64;
+        let second = metadata.file_index().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "file index identity is unavailable",
+            )
+        })?;
+        Ok(FileIdentity { first, second })
+    }
+    #[cfg(unix)]
+    {
+        Ok(FileIdentity {
+            first: metadata.dev(),
+            second: metadata.ino(),
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "file identity is unavailable on this platform",
+        )
+        .into())
+    }
+}
+
+fn projection_path_matches(
+    directory: &Dir,
+    name: &str,
+    identity: FileIdentity,
+) -> Result<bool, MemoryError> {
+    match capability_existing_file(directory, name) {
+        Ok(file) => Ok(capability_file_identity(&file)? == identity),
+        Err(MemoryError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn ensure_single_link(file: &CapFile) -> Result<(), MemoryError> {
@@ -1408,6 +1820,37 @@ mod projection_state_tests {
             content: "projection state sentinel".to_owned(),
             timestamp: 1.0,
             metadata: Value::Null,
+        }
+    }
+
+    #[test]
+    fn validated_projection_handle_detects_or_prevents_path_replacement() {
+        let temp = tempdir().expect("temp dir");
+        let directory =
+            Dir::open_ambient_dir(temp.path(), ambient_authority()).expect("open temp dir");
+        let path = temp.path().join("events.jsonl");
+        let moved = temp.path().join("events.previous.jsonl");
+        std::fs::write(&path, b"canonical\n").expect("write projection");
+        let file =
+            capability_existing_data_file(&directory, "events.jsonl").expect("open projection");
+        let identity = capability_file_identity(&file).expect("projection identity");
+
+        #[cfg(windows)]
+        {
+            assert!(std::fs::rename(&path, &moved).is_err());
+            assert!(
+                projection_path_matches(&directory, "events.jsonl", identity)
+                    .expect("compare identity")
+            );
+        }
+        #[cfg(unix)]
+        {
+            std::fs::rename(&path, &moved).expect("move validated projection");
+            std::fs::write(&path, b"replacement\n").expect("write replacement");
+            assert!(
+                !projection_path_matches(&directory, "events.jsonl", identity)
+                    .expect("compare identity")
+            );
         }
     }
 
