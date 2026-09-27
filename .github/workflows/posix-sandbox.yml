@@ -17,3 +17,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Deterministic concurrent unlink regression
         run: cargo test --locked concurrent_sidecar_removal_is_idempotent
+      - name: Full correctness suite
+        run: cargo test --locked --all-targets --all-features
+      - name: Repeat concurrent same-process opens
+        run: |
+          for repetition in {1..50}; do
+            timeout 30s cargo test --locked --test memory concurrent_ingest_projects_complete_parseable_jsonl --quiet || exit 1
+          done

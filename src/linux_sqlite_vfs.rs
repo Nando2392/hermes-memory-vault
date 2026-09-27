@@ -182,7 +182,11 @@ impl Context {
                 drop(current);
                 #[cfg(test)]
                 tests::before_unlink();
-                self.root.remove_file(name)?;
+                match self.root.remove_file(name) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
                 if sync_dir {
                     self.root.try_clone()?.into_std_file().sync_all()?;
                 }
@@ -442,7 +446,6 @@ fn identity_std(file: &std::fs::File) -> io::Result<Identity> {
 }
 
 fn io_error_code(error: &io::Error, operation: c_int) -> c_int {
-    eprintln!("[DEBUG-vfs-4957] operation={operation} error={error:?}");
     match error.kind() {
         io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidInput => ffi::SQLITE_PERM,
         io::ErrorKind::NotFound => ffi::SQLITE_CANTOPEN,
@@ -972,10 +975,9 @@ unsafe extern "C" fn file_device_characteristics(_file: *mut ffi::sqlite3_file) 
 
 impl Shm {
     fn open(context: &Context) -> Result<Self, c_int> {
-        let cap_file = context.open_nofollow(SHM_NAME, true).map_err(|error| {
-            eprintln!("[DEBUG-vfs-4957] SHM open error={error:?}");
-            ffi::SQLITE_CANTOPEN
-        })?;
+        let cap_file = context
+            .open_nofollow(SHM_NAME, true)
+            .map_err(|_| ffi::SQLITE_CANTOPEN)?;
         let identity = identity(&cap_file).map_err(|_| ffi::SQLITE_IOERR_SHMOPEN)?;
         let file = cap_file.into_std();
         let fd = file.as_raw_fd();
