@@ -21,6 +21,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, UNIX_EPOCH};
 use thiserror::Error;
 
+#[cfg(all(test, unix))]
+mod posix_open_tests;
+
 #[cfg(windows)]
 use cap_std::fs::OpenOptionsExt;
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -221,6 +224,8 @@ impl MemoryStore {
         let database_guard = capability_data_file(&root_dir, "memory.db")?;
         let wal_guard = capability_data_file(&root_dir, "memory.db-wal")?;
         let shm_guard = capability_data_file(&root_dir, "memory.db-shm")?;
+        #[cfg(all(test, unix))]
+        posix_open_tests::before_sqlite_open();
         let mut connection = Connection::open(stable_root.join("memory.db"))?;
         connection.busy_timeout(Duration::from_secs(5))?;
         if connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? < 2 {
