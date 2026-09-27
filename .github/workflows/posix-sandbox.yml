@@ -1,0 +1,17 @@
+name: POSIX SQLite sandbox
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Deterministic concurrent unlink regression
+        run: cargo test --locked concurrent_sidecar_removal_is_idempotent

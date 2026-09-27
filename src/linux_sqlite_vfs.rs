@@ -180,6 +180,8 @@ impl Context {
                     ));
                 }
                 drop(current);
+                #[cfg(test)]
+                tests::before_unlink();
                 self.root.remove_file(name)?;
                 if sync_dir {
                     self.root.try_clone()?.into_std_file().sync_all()?;
@@ -1366,4 +1368,47 @@ unsafe extern "C" fn vfs_last_error(
         unsafe { *output = 0 };
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static BEFORE_UNLINK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn before_unlink() {
+        let hook = BEFORE_UNLINK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[test]
+    fn concurrent_sidecar_removal_is_idempotent() {
+        let temporary = tempfile::tempdir().expect("synthetic directory");
+        let root = Dir::open_ambient_dir(temporary.path(), cap_std::ambient_authority())
+            .expect("test capability");
+        let context = Context {
+            token: "test-unlink".into(),
+            root,
+            main: Mutex::new(None),
+        };
+        let file = context.open_nofollow(WAL_NAME, true).expect("test sidecar");
+        let expected = identity(&file).expect("sidecar identity");
+        drop(file);
+        let competing_root = context.root.try_clone().expect("competing capability");
+        BEFORE_UNLINK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                competing_root
+                    .remove_file(WAL_NAME)
+                    .expect("competing removal");
+            }));
+        });
+        context
+            .remove_if_identity(WAL_NAME, expected, false)
+            .expect("already removed sidecar must not fail a concurrent open");
+    }
 }
