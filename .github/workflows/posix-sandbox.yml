@@ -2,6 +2,8 @@ name: POSIX SQLite sandbox
 
 on:
   workflow_dispatch:
+  push:
+    branches: [test/posix-sqlite-hardening]
 
 permissions:
   contents: read
