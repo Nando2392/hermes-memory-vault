@@ -24,6 +24,9 @@ use thiserror::Error;
 #[cfg(all(test, unix))]
 mod posix_open_tests;
 
+#[cfg(target_os = "linux")]
+mod linux_sqlite_vfs;
+
 #[cfg(windows)]
 use cap_std::fs::OpenOptionsExt;
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -226,7 +229,7 @@ impl MemoryStore {
         let shm_guard = capability_data_file(&root_dir, "memory.db-shm")?;
         #[cfg(all(test, unix))]
         posix_open_tests::before_sqlite_open();
-        let mut connection = Connection::open(stable_root.join("memory.db"))?;
+        let mut connection = open_database(&root_dir, &database_guard, &stable_root)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         if connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? < 2 {
             FileExt::unlock(&initialization_lock)?;
@@ -668,6 +671,37 @@ impl MemoryStore {
         }
         rebuild_projection(&self.root_dir, &mut connection)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn open_database(
+    root: &Dir,
+    database: &CapFile,
+    _stable_root: &Path,
+) -> Result<Connection, MemoryError> {
+    linux_sqlite_vfs::open(root, database)
+}
+
+#[cfg(windows)]
+fn open_database(
+    _root: &Dir,
+    _database: &CapFile,
+    stable_root: &Path,
+) -> Result<Connection, MemoryError> {
+    Ok(Connection::open(stable_root.join("memory.db"))?)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn open_database(
+    _root: &Dir,
+    _database: &CapFile,
+    _stable_root: &Path,
+) -> Result<Connection, MemoryError> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "secure SQLite storage is currently supported only on Windows and Linux",
+    )
+    .into())
 }
 
 fn reconcile_projection_checkpoint(

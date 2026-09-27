@@ -336,6 +336,7 @@ dependencies = [
  "cap-std",
  "clap",
  "fs2",
+ "libc",
  "regex",
  "rusqlite",
  "serde",
