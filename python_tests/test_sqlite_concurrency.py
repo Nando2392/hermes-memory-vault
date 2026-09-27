@@ -6,6 +6,8 @@ from pathlib import Path
 import sqlite3
 import subprocess
 
+import pytest
+
 RUST_BIN = Path(__file__).parents[1] / "target" / "debug" / (
     "hermes-memory.exe" if os.name == "nt" else "hermes-memory"
 )
@@ -73,3 +75,28 @@ def test_native_reader_snapshot_and_cli_writer_share_wal_locks(tmp_path: Path) -
     ingest(root, "after-checkpoint")
     with sqlite3.connect(root / "memory.db") as connection:
         assert connection.execute("SELECT count(*) FROM records").fetchone()[0] == 3
+
+
+def test_native_write_lock_blocks_cli_and_recovers_after_release(tmp_path: Path) -> None:
+    """The CLI must reject a blocked write and succeed after lock release."""
+    root = tmp_path / "vault"
+    ingest(root, "initial")
+    writer = sqlite3.connect(root / "memory.db", timeout=0)
+    try:
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute("UPDATE records SET content='native writer transaction'")
+        with pytest.raises(subprocess.CalledProcessError) as failure:
+            ingest(root, "blocked-writer")
+        assert failure.value.returncode == 2
+        assert failure.value.stderr.strip() == "hermes-memory: operation failed"
+        assert writer.execute("SELECT count(*) FROM records").fetchone()[0] == 1
+        writer.commit()
+    finally:
+        writer.close()
+    ingest(root, "blocked-writer")
+    with sqlite3.connect(root / "memory.db") as connection:
+        assert connection.execute("SELECT count(*) FROM records").fetchone()[0] == 2
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert connection.execute(
+            "SELECT content FROM records WHERE id='initial'"
+        ).fetchone()[0] == "native writer transaction"
