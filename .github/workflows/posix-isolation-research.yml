@@ -1,0 +1,30 @@
+name: POSIX isolation research
+on:
+  workflow_dispatch:
+  push:
+    branches: [test/posix-sqlite-hardening]
+    paths:
+      - scripts/posix_isolation_probe.py
+      - .github/workflows/posix-isolation-research.yml
+permissions:
+  contents: read
+jobs:
+  counterexamples:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax and safe help
+        run: |
+          python3 -m py_compile scripts/posix_isolation_probe.py
+          python3 scripts/posix_isolation_probe.py --help
+      - name: Falsify same-UID Landlock and openat2 containment
+        run: |
+          set -o pipefail
+          timeout 60s python3 scripts/posix_isolation_probe.py --run | tee isolation-results.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: isolation-counterexamples
+          path: isolation-results.json
+          if-no-files-found: warn
