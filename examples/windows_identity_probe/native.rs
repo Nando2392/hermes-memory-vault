@@ -386,6 +386,7 @@ fn configure(db: &Connection) -> Result<()> {
 fn sqlite_worker(root: &Path, id: &Value) -> Result<()> {
     let store = root.join("store");
     let report = root.join("result-a");
+    let broker_storage = broker_storage_control(&root.join("broker-store"))?;
     let first = Connection::open(store.join("memory.db"))?;
     let mode: String = first.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
     ensure(mode == "wal", "SQLite did not enter WAL")?;
@@ -440,7 +441,7 @@ fn sqlite_worker(root: &Path, id: &Value) -> Result<()> {
     write_report(
         &report,
         "ready.json",
-        &json!({"identity":id,"records":records(&first)?,"files":files,"sqlite_version":version,"sqlite_source_id":source,"vfs":vfs_name,"compile_options":options,"journal_mode":mode,"connections":2,"closed_rollback_journal":true}),
+        &json!({"identity":id,"records":records(&first)?,"files":files,"sqlite_version":version,"sqlite_source_id":source,"vfs":vfs_name,"compile_options":options,"journal_mode":mode,"connections":2,"closed_rollback_journal":true,"broker_storage":broker_storage}),
     )?;
     let deadline = Instant::now() + Duration::from_secs(90);
     while !STOP.load(Ordering::Acquire) && Instant::now() < deadline {
@@ -459,6 +460,48 @@ fn sqlite_worker(root: &Path, id: &Value) -> Result<()> {
     )?;
     Ok(())
 }
+fn broker_storage_control(root: &Path) -> Result<Value> {
+    use hermes_memory::{MemoryRecord, MemoryStore, SearchRequest};
+    let record = MemoryRecord {
+        id: "broker-windows-one".into(),
+        session_id: "probe-session".into(),
+        workspace: "sandbox".into(),
+        kind: "note".into(),
+        content: "Windows durable quince Unicode ñ".into(),
+        timestamp: 1.0,
+        metadata: json!({"nested":{"source":"service","values":[1,true]}}),
+    };
+    let query = SearchRequest {
+        query: "quince".into(),
+        workspace: Some("sandbox".into()),
+        session_id: Some("probe-session".into()),
+        limit: 10,
+        max_bytes: 65536,
+    };
+    let store = MemoryStore::open_broker(root)?;
+    ensure(
+        MemoryStore::open_broker(root).is_err(),
+        "second broker instance was admitted",
+    )?;
+    ensure(store.ingest(&record)?, "broker did not insert record")?;
+    ensure(!store.ingest(&record)?, "broker duplicated record")?;
+    ensure(store.search(&query)?.len() == 1, "broker search failed")?;
+    drop(store);
+    let reopened = MemoryStore::open_broker(root)?;
+    ensure(!reopened.ingest(&record)?, "reopen duplicated record")?;
+    let hits = reopened.search(&query)?;
+    ensure(
+        hits.len() == 1 && serde_json::to_value(&hits[0])? == serde_json::to_value(&record)?,
+        "broker full-field recovery failed",
+    )?;
+    let native = Connection::open(root.join("memory.db"))?;
+    let integrity: String = native.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+    ensure(integrity == "ok", "broker integrity check failed")?;
+    Ok(
+        json!({"exclusive_instance":true,"inserted":1,"duplicates_rejected":2,"full_field_reopen":true,"integrity_check":integrity}),
+    )
+}
+
 fn error_code(result: io::Result<()>) -> u32 {
     match result {
         Ok(()) => 0,
@@ -784,6 +827,7 @@ pub fn run() -> Result<()> {
         created_root = true;
         mkdir(&root.join("bin"), &rx)?;
         mkdir(&root.join("store"), &format!("(A;OICI;FA;;;{a})"))?;
+        mkdir(&root.join("broker-store"), &format!("(A;OICI;FA;;;{a})"))?;
         mkdir(&root.join("result-a"), &format!("(A;OICI;FA;;;{a})"))?;
         mkdir(&root.join("scratch"), &format!("(A;OICI;FA;;;{b})"))?;
         mkdir(&root.join("result-b"), &format!("(A;OICI;FA;;;{b})"))?;
@@ -793,6 +837,7 @@ pub fn run() -> Result<()> {
         ];
         for (dir, sid) in [
             ("store", &a),
+            ("broker-store", &a),
             ("result-a", &a),
             ("scratch", &b),
             ("result-b", &b),
