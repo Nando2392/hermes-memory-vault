@@ -21,6 +21,11 @@ name = "hermes-memory-broker"
 path = "src/bin/hermes-memory-broker.rs"
 required-features = ["experimental-broker"]
 
+[[example]]
+name = "windows-identity-probe"
+path = "examples/windows_identity_probe.rs"
+required-features = ["experimental-broker"]
+
 [dependencies]
 cap-std = "4"
 cap-primitives = "4"
@@ -35,7 +40,7 @@ sha2 = "0.10"
 thiserror = "2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_Services", "Win32_System_Memory", "Win32_System_Environment", "Win32_System_IO"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

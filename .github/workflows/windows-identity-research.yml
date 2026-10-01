@@ -1,0 +1,51 @@
+name: Windows identity research (disposable only)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [test/posix-sqlite-hardening]
+    paths:
+      - examples/windows_identity_probe.rs
+      - examples/windows_identity_probe/**
+      - .github/workflows/windows-identity-research.yml
+
+permissions:
+  contents: read
+
+jobs:
+  identity-proof:
+    if: github.ref == 'refs/heads/test/posix-sqlite-hardening'
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo test --locked --features experimental-broker --example windows-identity-probe
+      - run: cargo clippy --locked --features experimental-broker --example windows-identity-probe -- -D warnings
+      - run: cargo build --locked --release --features experimental-broker --example windows-identity-probe
+      - name: Disposable SCM identities and SQLite ACL proof
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw 'Hosted disposable runner required' }
+          $exe = Join-Path $pwd 'target/release/examples/windows-identity-probe.exe'
+          $p = Start-Process -FilePath $exe -ArgumentList '--run','--allow-disposable-services' -PassThru -NoNewWindow -RedirectStandardOutput 'windows-identity-results.json' -RedirectStandardError 'windows-identity-errors.log'
+          if (-not $p.WaitForExit(180000)) {
+            Stop-Process -Id $p.Id -Force
+            throw 'Probe exceeded 180 seconds; discard runner VM; no cleanup success claimed'
+          }
+          $p.WaitForExit()
+          if ($p.ExitCode -ne 0) { throw "Probe failed with exit $($p.ExitCode); inspect artifacts" }
+          $report = Get-Content 'windows-identity-results.json' -Raw | ConvertFrom-Json
+          if ($report.report.status -ne 'BOUNDED_SCOPE_COMPLETED') { throw 'No completed proof' }
+          if ($report.cleanup_errors.Count -ne 0) { throw 'Cleanup not verified' }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-identity-evidence
+          path: |
+            windows-identity-results.json
+            windows-identity-errors.log
+          if-no-files-found: warn
