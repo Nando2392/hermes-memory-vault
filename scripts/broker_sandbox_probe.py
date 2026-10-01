@@ -440,6 +440,9 @@ def run(binary: Path) -> int:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as impostor:
                     fake = base / "wrong-server.sock"
                     impostor.bind(str(fake))
+                    # Pass pathname ownership validation, but retain the root
+                    # listener so SO_PEERCRED must reject before sending bytes.
+                    os.chown(fake, service, service)
                     fake.chmod(0o666)
                     impostor.listen(1)
                     impostor.settimeout(TIMEOUT)

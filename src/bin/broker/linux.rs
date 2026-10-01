@@ -241,6 +241,17 @@ fn emit(response: &Response) -> Result<(), &'static str> {
 mod tests {
     use super::*;
     #[test]
+    fn invalid_store_does_not_leave_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = dir.path().join("broker.sock");
+        let uid = unsafe { libc::geteuid() };
+        assert_ne!(uid, 0, "run as an unprivileged CI user");
+        let client = if uid == 61002 { 61003 } else { 61002 };
+        assert!(serve(&dir.path().join("missing"), &socket, client, "sandbox").is_err());
+        assert!(!socket.exists(), "invalid store left a stale socket");
+    }
+    #[test]
     fn actual_socket_pair_reports_kernel_peer_uid() {
         let (a, _b) = UnixStream::pair().unwrap();
         assert_eq!(peer_uid(&a).unwrap(), unsafe { libc::geteuid() });
