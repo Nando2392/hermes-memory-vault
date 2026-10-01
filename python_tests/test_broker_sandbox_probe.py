@@ -42,6 +42,149 @@ class ProbeTests(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
+    def test_projection_compares_every_persisted_field(self):
+        probe = self.load()
+        self.assertTrue(
+            callable(getattr(probe, "validate_projection", None)),
+            "full-field projection validator missing",
+        )
+        record = {
+            "id": "event",
+            "session_id": "session",
+            "workspace": "sandbox",
+            "kind": "message",
+            "content": "Unicode café\nline",
+            "timestamp": 1.25,
+            "metadata": {"nested": [True, None, {"a": 1, "b": "é"}]},
+        }
+        row = (
+            "event",
+            "session",
+            "sandbox",
+            "message",
+            "Unicode café\nline",
+            1.25,
+            '{"nested": [true, null, {"b": "é", "a": 1}]}',
+        )
+        self.assertEqual(probe.validate_projection([row], [record]), [record])
+        for field, changed in (
+            ("id", "other"),
+            ("session_id", "other"),
+            ("workspace", "other"),
+            ("kind", "event"),
+            ("content", "wrong"),
+            ("timestamp", 2.0),
+            ("metadata", {"nested": [False]}),
+        ):
+            with self.subTest(field=field), self.assertRaises(RuntimeError):
+                probe.validate_projection([row], [{**record, field: changed}])
+        other = {**record, "id": "another", "metadata": None}
+        other_row = ("another", *row[1:6], "null")
+        self.assertEqual(
+            probe.validate_projection([row, other_row], [other, record]),
+            [other, record],
+        )
+        for projected in (
+            [],
+            [record, record],
+            [{**record, "extra": 1}],
+            [{key: value for key, value in record.items() if key != "metadata"}],
+            [{**record, "metadata": {"nested": [1, None, {"a": 1, "b": "é"}]}}],
+        ):
+            with self.subTest(projected=projected), self.assertRaises(RuntimeError):
+                probe.validate_projection([row], projected)
+        with self.assertRaises(RuntimeError):
+            probe.validate_projection([row, row], [record])
+
+    def test_concurrent_clients_launch_before_wait_and_validate_replies(self):
+        import json
+        import subprocess
+        import sys
+        import tempfile
+        import threading
+
+        probe = self.load()
+        self.assertTrue(
+            callable(getattr(probe, "concurrent_requests", None)),
+            "bounded concurrent runner missing",
+        )
+        envelopes = [{"request_id": f"client-{i}"} for i in range(4)]
+        processes = []
+        with tempfile.TemporaryDirectory() as name:
+            # Real portable child processes rendezvous: serial launch/wait fails.
+            code = (
+                "import json, pathlib, sys, time; "
+                "value=json.load(sys.stdin); root=pathlib.Path(sys.argv[1]); "
+                "(root/value['request_id']).touch(); end=time.monotonic()+5\n"
+                "while len(list(root.iterdir())) < 4:\n"
+                " if time.monotonic() >= end: sys.exit(2)\n"
+                " time.sleep(0.01)\n"
+                "print(json.dumps(dict(protocol=1, request_id=value['request_id'], "
+                "ok=True, result=dict(received=value['request_id']))))"
+            )
+
+            def launch(**kwargs):
+                self.assertIs(threading.current_thread(), threading.main_thread())
+                process = subprocess.Popen([sys.executable, "-c", code, name], **kwargs)
+                processes.append(process)
+                return process
+
+            replies = probe.concurrent_requests(launch, envelopes, timeout=8)
+        self.assertEqual(replies, [{"received": e["request_id"]} for e in envelopes])
+        self.assertTrue(all(p.returncode == 0 for p in processes))
+        self.assertLess(len(json.dumps(envelopes)), 4096)
+
+    def test_concurrent_deadline_reaps_entire_cohort(self):
+        import subprocess
+        import sys
+
+        probe = self.load()
+        processes = []
+
+        def launch(**kwargs):
+            process = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"], **kwargs
+            )
+            processes.append(process)
+            return process
+
+        with self.assertRaisesRegex(RuntimeError, "deadline"):
+            probe.concurrent_requests(
+                launch, [{"request_id": str(i)} for i in range(4)], timeout=0.2
+            )
+        self.assertTrue(processes)
+        self.assertTrue(all(process.poll() is not None for process in processes))
+
+    def test_concurrent_bounds_and_bad_reply_fail_closed(self):
+        import subprocess
+        import sys
+
+        probe = self.load()
+        processes = []
+
+        def launch(**kwargs):
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        'print(\'{"protocol":1,"request_id":"wrong",'
+                        '"ok":true,"result":{}}\')'
+                    ),
+                ],
+                **kwargs,
+            )
+            processes.append(process)
+            return process
+
+        for envelopes in ([], [{}] * 5, [{"request_id": "x", "body": "x" * 4096}]):
+            with self.assertRaisesRegex(RuntimeError, "budget"):
+                probe.concurrent_requests(launch, envelopes)
+        self.assertEqual(processes, [])
+        with self.assertRaisesRegex(RuntimeError, "uncorrelated"):
+            probe.concurrent_requests(launch, [{"request_id": "expected"}])
+        self.assertTrue(all(process.poll() is not None for process in processes))
+
     def test_frame_roundtrip(self):
         probe = self.load()
         value = {"protocol": 1, "request_id": "portable", "ok": True, "result": {}}

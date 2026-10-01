@@ -36,6 +36,52 @@ def require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
+RECORD_FIELDS = (
+    "id",
+    "session_id",
+    "workspace",
+    "kind",
+    "content",
+    "timestamp",
+    "metadata",
+)
+
+
+def validate_projection(
+    rows: list[tuple[Any, ...]], projected: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Compare all records columns, decoding SQLite's metadata_json TEXT."""
+    canonical = []
+    for row in rows:
+        require(len(row) == len(RECORD_FIELDS), "unexpected records schema")
+        record = dict(zip(RECORD_FIELDS, row, strict=True))
+        record["metadata"] = json.loads(record["metadata"])
+        canonical.append(record)
+    for label, records in (("canonical", canonical), ("JSONL", projected)):
+        require(
+            all(
+                isinstance(record, dict) and set(record) == set(RECORD_FIELDS)
+                for record in records
+            ),
+            f"{label} fields differ from records schema",
+        )
+        ids = [record["id"] for record in records]
+        require(all(isinstance(value, str) for value in ids), f"{label} invalid ID")
+        require(len(ids) == len(set(ids)), f"{label} duplicate IDs")
+    canonical.sort(key=lambda record: record["id"])
+    # JSON comparison ignores object key order/whitespace, but not bool vs number.
+    require(
+        json.dumps(canonical, sort_keys=True, allow_nan=False)
+        == json.dumps(
+            sorted(projected, key=lambda record: record["id"]),
+            sort_keys=True,
+            allow_nan=False,
+        ),
+        "JSONL full-field projection mismatch",
+    )
+    return canonical
+
+
 def validate_reply(value: dict[str, Any], request_id: str, ok: bool) -> dict[str, Any]:
     require(
         type(value.get("protocol")) is int and value["protocol"] == 1,
@@ -51,6 +97,67 @@ def validate_reply(value: dict[str, Any], request_id: str, ok: bool) -> dict[str
             "missing error code",
         )
     return result
+
+
+def concurrent_requests(
+    launch_request: Callable[..., Any],
+    envelopes: list[dict[str, Any]],
+    timeout: float = TIMEOUT,
+) -> list[dict[str, Any]]:
+    """Launch a tiny cohort on this thread, then collect under one deadline.
+
+    Pre-filled temporary stdin files avoid blocking pipe writes before collection.
+    File-backed stdout/stderr also avoid pipe backpressure; only bounded reply
+    bytes are read. This is a trusted CLI fixture, not an output/disk DoS limit.
+    """
+    import subprocess
+    import tempfile
+    from contextlib import ExitStack
+
+    require(0 < len(envelopes) <= 4, "concurrent client budget exceeded")
+    payloads = [json.dumps(value, allow_nan=False).encode() for value in envelopes]
+    require(
+        all(len(payload) <= 4096 for payload in payloads), "payload budget exceeded"
+    )
+    processes = []
+    deadline = time.monotonic() + timeout
+    with ExitStack() as files:
+        try:
+            for payload in payloads:
+                require(time.monotonic() < deadline, "concurrent deadline exceeded")
+                source, output, errors = (
+                    files.enter_context(tempfile.TemporaryFile()) for _ in range(3)
+                )
+                source.write(payload)
+                source.seek(0)
+                process = launch_request(stdin=source, stdout=output, stderr=errors)
+                processes.append((process, output, errors))
+            replies = []
+            for envelope, (process, output, errors) in zip(
+                envelopes, processes, strict=True
+            ):
+                remaining = deadline - time.monotonic()
+                require(remaining > 0, "concurrent deadline exceeded")
+                try:
+                    process.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    raise RuntimeError("concurrent deadline exceeded") from None
+                output.seek(0)
+                errors.seek(0)
+                require(process.returncode == 0, f"CLI failed: {errors.read(500)!r}")
+                reply = output.read(4097)
+                require(len(reply) <= 4096, "concurrent reply budget exceeded")
+                replies.append(
+                    validate_reply(json.loads(reply), envelope["request_id"], True)
+                )
+            return replies
+        finally:
+            # Kill the entire remaining cohort before waiting for any one child.
+            for process, _, _ in processes:
+                if process.poll() is None:
+                    process.kill()
+            for process, _, _ in processes:
+                process.wait(timeout=3)
 
 
 def make_report(
@@ -306,14 +413,11 @@ def run(binary: Path) -> int:
                         )
                         for table in tables
                     }
-                    events = (store / "events.jsonl").read_text()
+                    events = (store / "events.jsonl").read_text(encoding="utf-8")
                     projected = [json.loads(line) for line in events.splitlines()]
-                    require(
-                        sorted(row["id"] for row in projected)
-                        == sorted(row[0] for row in rows["records"]),
-                        "JSONL does not project canonical IDs",
-                    )
+                    canonical = validate_projection(rows["records"], projected)
                     return {
+                        "records": canonical,
                         "tables": rows,
                         "jsonl": events,
                         "sqlite_version": sqlite3.sqlite_version,
@@ -539,6 +643,106 @@ def run(binary: Path) -> int:
                     client, direct_denied, children
                 )
                 checks.append("eight_direct_open_denials")
+
+                batches = [
+                    [
+                        {
+                            "id": f"concurrent-{batch}-{item}",
+                            "session_id": f"concurrent-session-{batch}",
+                            "workspace": "sandbox",
+                            "kind": "message" if item == 0 else "note",
+                            "content": f"brokertoken batch {batch} item {item} café\nline",
+                            "timestamp": 10.25 + batch * 2 + item,
+                            "metadata": {
+                                "batch": batch,
+                                "item": item,
+                                "nested": [True, None, {"text": "café"}],
+                            },
+                        }
+                        for item in range(2)
+                    ]
+                    for batch in range(4)
+                ]
+                expected_records = sorted(
+                    baseline["records"] + [item for batch in batches for item in batch],
+                    key=lambda item: item["id"],
+                )
+
+                def launch_client(**kwargs: Any) -> subprocess.Popen:
+                    return launch(
+                        client,
+                        [
+                            str(executable),
+                            "request",
+                            "--socket",
+                            str(endpoint),
+                            "--server-uid",
+                            str(service),
+                        ],
+                        **kwargs,
+                    )
+
+                for phase, inserted, duplicates in (
+                    ("unique", 2, 0),
+                    ("duplicate", 0, 2),
+                ):
+                    replies = concurrent_requests(
+                        launch_client,
+                        [
+                            {
+                                "protocol": 1,
+                                "request_id": f"concurrent-{phase}-{index}",
+                                "op": "ingest",
+                                "body": {"records": batch},
+                            }
+                            for index, batch in enumerate(batches)
+                        ],
+                    )
+                    require(
+                        all(
+                            reply
+                            == {
+                                "inserted": inserted,
+                                "duplicates": duplicates,
+                                "durable": True,
+                                "projection_ready": True,
+                            }
+                            for reply in replies
+                        ),
+                        f"concurrent {phase} acknowledgements mismatch",
+                    )
+                    after = state()
+                    require(
+                        after["records"] == expected_records,
+                        f"concurrent {phase} lost or changed canonical records",
+                    )
+                    require(
+                        all(
+                            after["tables"][table] == baseline["tables"][table]
+                            for table in ("snapshot_state", "snapshot_counters")
+                        ),
+                        "concurrent ingest mutated snapshot state",
+                    )
+                    if phase == "duplicate":
+                        require(
+                            after == baseline, "concurrent duplicates mutated state"
+                        )
+                    baseline = after
+                    results[f"concurrent_{phase}"] = {
+                        "clients": len(batches),
+                        "records_per_client": 2,
+                        "replies": replies,
+                        "canonical_records": len(expected_records),
+                        "projection_comparison": "all seven persisted fields; unique IDs",
+                    }
+                    checks.append(f"four_concurrent_{phase}_full_field_projection")
+                hits = request("search", query)["hits"]
+                require(
+                    sorted(hit["id"] for hit in hits)
+                    == [record["id"] for record in expected_records],
+                    "concurrent commits missing from FTS",
+                )
+                checks.append("concurrent_commits_searchable")
                 stale = endpoint.lstat()
                 stop(daemon)
                 require(daemon.returncode == -signal.SIGKILL, "service not SIGKILLed")
