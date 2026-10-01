@@ -329,7 +329,13 @@ fn audit_handle(
             return Err(std::io::Error::from_raw_os_error(code as i32).into());
         }
         let _descriptor = Local(sd);
-        audit_descriptor(sd, service, kind)?;
+        audit_descriptor(sd, service, kind).map_err(|error| match error {
+            MemoryError::Io(error) => MemoryError::Io(std::io::Error::new(
+                error.kind(),
+                format!("broker ACL audit at {}: {error}", path.display()),
+            )),
+            other => other,
+        })?;
         let mut final_path = vec![0u16; 32768];
         let len =
             GetFinalPathNameByHandleW(handle, final_path.as_mut_ptr(), final_path.len() as u32, 0);

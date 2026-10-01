@@ -191,6 +191,12 @@ fn windows_broker_native_audit_rejects_user_owned_root_without_mutation() {
     let root = tempfile::tempdir().unwrap();
     let error = audit_path(root.path(), "S-1-5-80-1-2-3-4-5", ObjectKind::Root).unwrap_err();
     assert!(
+        error
+            .to_string()
+            .contains(&root.path().display().to_string()),
+        "missing audit location: {error}"
+    );
+    assert!(
         matches!(error, MemoryError::Io(ref e) if e.kind() == std::io::ErrorKind::PermissionDenied),
         "{error}"
     );

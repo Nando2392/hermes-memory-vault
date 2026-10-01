@@ -33,6 +33,10 @@ jobs:
         shell: pwsh
         run: |
           if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw 'Hosted disposable runner required' }
+          @("$env:SystemDrive\", $env:ProgramData) | ForEach-Object {
+            $acl = Get-Acl -LiteralPath $_
+            [pscustomobject]@{ path = $_; owner = $acl.Owner; sddl = $acl.Sddl }
+          } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 'windows-ancestor-acls.json'
           $exe = Join-Path $pwd 'target/release/examples/windows-identity-probe.exe'
           $p = Start-Process -FilePath $exe -ArgumentList '--run','--allow-disposable-services' -PassThru -NoNewWindow -RedirectStandardOutput 'windows-identity-results.json' -RedirectStandardError 'windows-identity-errors.log'
           if (-not $p.WaitForExit(180000)) {
@@ -51,4 +55,5 @@ jobs:
           path: |
             windows-identity-results.json
             windows-identity-errors.log
+            windows-ancestor-acls.json
           if-no-files-found: warn
