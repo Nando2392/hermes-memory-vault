@@ -21,6 +21,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, UNIX_EPOCH};
 use thiserror::Error;
 
+#[cfg(test)]
+mod broker_store_tests;
+
 #[cfg(all(test, unix))]
 mod posix_open_tests;
 
@@ -165,10 +168,13 @@ impl SnapshotRequest {
 pub struct MemoryStore {
     root_dir: Dir,
     _root_guard: CapFile,
-    _database_guard: CapFile,
-    _wal_guard: CapFile,
-    _shm_guard: CapFile,
+    _database_guard: Option<CapFile>,
+    _wal_guard: Option<CapFile>,
+    _shm_guard: Option<CapFile>,
     connection: Mutex<Connection>,
+    // Declared after connection: the instance lock outlives SQLite close.
+    #[cfg(all(feature = "experimental-broker", target_os = "linux"))]
+    _broker_lock: Option<File>,
 }
 
 const PROJECTION_FORMAT: i64 = 2;
@@ -217,6 +223,69 @@ pub fn validate_export_destination(path: &Path) -> Result<(), MemoryError> {
 }
 
 impl MemoryStore {
+    /// Opens an experimental Linux broker store in an already provisioned namespace.
+    ///
+    /// The effective UID must be a dedicated, nonroot, trusted service identity;
+    /// this does not isolate hostile processes sharing that UID. The administrator
+    /// must provision a fresh private root, trusted ancestors, a local filesystem,
+    /// no inherited writable handles/mappings or prior aliases, and secure process
+    /// credentials, executable and configuration. This is not provisioning or
+    /// migration, an ACL/mount audit, or protection from root/capability holders.
+    /// Trusted administrators/service peers must not rename the namespace while
+    /// open. SQLite owns its native WAL/SHM/journal lifetime; no custom VFS is used.
+    /// Callers must not expose this path or native database access to clients.
+    #[cfg(feature = "experimental-broker")]
+    pub fn open_broker(root: impl AsRef<Path>) -> Result<Self, MemoryError> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = root;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "experimental broker requires Linux",
+            )
+            .into())
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let root = root.as_ref();
+            validate_broker_namespace(root)?;
+            let root_dir = Dir::open_ambient_dir(root, ambient_authority())?;
+            let root_guard = capability_root_guard(&root_dir)?;
+            // Only this dedicated lock is preopened. Never preopen SQLite sidecars.
+            let instance_lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(root.join("memory.broker.lock"))?;
+            FileExt::try_lock_exclusive(&instance_lock)?;
+            let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW;
+            // Explicit native Unix VFS, stable absolute pathname, no URI or procfd.
+            // This neither registers a VFS nor changes the process-wide default.
+            let mut connection =
+                Connection::open_with_flags_and_vfs(root.join("memory.db"), flags, "unix")?;
+            configure_broker_connection(&mut connection)?;
+            initialize_schema(&mut connection, &root_dir)?;
+            let store = Self {
+                root_dir,
+                _root_guard: root_guard,
+                _database_guard: None,
+                _wal_guard: None,
+                _shm_guard: None,
+                connection: Mutex::new(connection),
+                _broker_lock: Some(instance_lock),
+            };
+            store.project_jsonl()?;
+            Ok(store)
+        }
+    }
+
     pub fn open(root: impl AsRef<Path>) -> Result<Self, MemoryError> {
         let root = root.as_ref().to_path_buf();
         let root_dir = open_or_create_absolute_dir(&root)?;
@@ -231,96 +300,21 @@ impl MemoryStore {
         posix_open_tests::before_sqlite_open();
         let mut connection = open_database(&root_dir, &database_guard, &stable_root)?;
         connection.busy_timeout(Duration::from_secs(5))?;
+        reject_future_schema(&connection)?;
         if connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? < 2 {
             FileExt::unlock(&initialization_lock)?;
             initialization_lock.lock_exclusive()?;
-            if connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? < 1 {
-                connection.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=FULL;
-             PRAGMA foreign_keys=ON;
-             CREATE TABLE IF NOT EXISTS records (
-               id TEXT PRIMARY KEY,
-               session_id TEXT NOT NULL,
-               workspace TEXT NOT NULL,
-               kind TEXT NOT NULL,
-               content TEXT NOT NULL,
-               timestamp REAL NOT NULL,
-               metadata_json TEXT NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS records_workspace_time
-               ON records(workspace, timestamp DESC);
-             CREATE TABLE IF NOT EXISTS snapshot_state (
-               session_id TEXT NOT NULL,
-               workspace TEXT NOT NULL,
-               position INTEGER NOT NULL,
-               fingerprint TEXT NOT NULL,
-               record_id TEXT NOT NULL,
-               PRIMARY KEY(session_id, workspace, position)
-             );
-             CREATE TABLE IF NOT EXISTS snapshot_counters (
-               session_id TEXT NOT NULL,
-               workspace TEXT NOT NULL,
-               fingerprint TEXT NOT NULL,
-               next_occurrence INTEGER NOT NULL,
-               PRIMARY KEY(session_id, workspace, fingerprint)
-             );
-             CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(
-               content,
-               content='records',
-               content_rowid='rowid',
-               tokenize='unicode61'
-             );
-             CREATE TRIGGER IF NOT EXISTS records_ai AFTER INSERT ON records BEGIN
-               INSERT INTO records_fts(rowid, content) VALUES (new.rowid, new.content);
-             END;
-             CREATE TRIGGER IF NOT EXISTS records_ad AFTER DELETE ON records BEGIN
-               INSERT INTO records_fts(records_fts, rowid, content)
-               VALUES ('delete', old.rowid, old.content);
-             END;
-             CREATE TRIGGER IF NOT EXISTS records_au AFTER UPDATE ON records BEGIN
-               INSERT INTO records_fts(records_fts, rowid, content)
-               VALUES ('delete', old.rowid, old.content);
-               INSERT INTO records_fts(rowid, content) VALUES (new.rowid, new.content);
-             END;
-             CREATE TABLE IF NOT EXISTS projection_state (
-               singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-               current_generation INTEGER NOT NULL,
-               projected_generation INTEGER NOT NULL,
-               projected_sha256 TEXT NOT NULL,
-               projected_bytes INTEGER NOT NULL
-             );
-             INSERT OR IGNORE INTO projection_state
-               (singleton, current_generation, projected_generation, projected_sha256, projected_bytes)
-               SELECT 1, COUNT(*), -1, '', -1 FROM records;
-             CREATE TRIGGER IF NOT EXISTS projection_records_ai AFTER INSERT ON records BEGIN
-               UPDATE projection_state
-               SET current_generation = current_generation + 1 WHERE singleton = 1;
-             END;
-             CREATE TRIGGER IF NOT EXISTS projection_records_ad AFTER DELETE ON records BEGIN
-               UPDATE projection_state
-               SET current_generation = current_generation + 1 WHERE singleton = 1;
-             END;
-             CREATE TRIGGER IF NOT EXISTS projection_records_au AFTER UPDATE ON records BEGIN
-               UPDATE projection_state
-               SET current_generation = current_generation + 1 WHERE singleton = 1;
-             END;
-             PRAGMA user_version=1;",
-                )?;
-                sync_directory(&root_dir)?;
-            }
-            if connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? < 2 {
-                migrate_projection_state_v2(&mut connection)?;
-                sync_directory(&root_dir)?;
-            }
+            initialize_schema(&mut connection, &root_dir)?;
         }
         let store = Self {
             root_dir,
             _root_guard: root_guard,
-            _database_guard: database_guard,
-            _wal_guard: wal_guard,
-            _shm_guard: shm_guard,
+            _database_guard: Some(database_guard),
+            _wal_guard: Some(wal_guard),
+            _shm_guard: Some(shm_guard),
             connection: Mutex::new(connection),
+            #[cfg(all(feature = "experimental-broker", target_os = "linux"))]
+            _broker_lock: None,
         };
         drop(initialization_lock);
         store.project_jsonl()?;
@@ -734,6 +728,202 @@ fn reconcile_projection_checkpoint(
         ],
     )?;
     Ok(true)
+}
+
+#[cfg(all(feature = "experimental-broker", any(target_os = "linux", test)))]
+fn configure_broker_connection(connection: &mut Connection) -> Result<(), MemoryError> {
+    reject_future_schema(connection)?;
+    connection.busy_timeout(Duration::from_secs(5))?;
+    let mode: String = connection.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
+    if mode != "wal" {
+        return Err(
+            std::io::Error::new(std::io::ErrorKind::Unsupported, "broker requires WAL").into(),
+        );
+    }
+    connection.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")?;
+    Ok(())
+}
+
+#[cfg(all(feature = "experimental-broker", any(target_os = "linux", test)))]
+fn broker_directory_trusted(
+    owner: u32,
+    mode: u32,
+    service: u32,
+    is_root: bool,
+    is_tmp: bool,
+) -> bool {
+    if service == 0 {
+        return false;
+    }
+    if is_root {
+        return owner == service && mode & 0o077 == 0;
+    }
+    (owner == 0 || owner == service)
+        && (mode & 0o022 == 0 || (is_tmp && owner == 0 && mode & 0o1000 != 0))
+}
+
+#[cfg(all(feature = "experimental-broker", target_os = "linux"))]
+fn validate_broker_namespace(root: &Path) -> Result<(), MemoryError> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid takes no arguments and has no memory safety preconditions.
+    let service = unsafe { libc::geteuid() };
+    let deny = || {
+        MemoryError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "untrusted broker namespace",
+        ))
+    };
+    if !root.is_absolute()
+        || service == 0
+        || root
+            .components()
+            .any(|c| !matches!(c, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(deny());
+    }
+    let mut path = PathBuf::new();
+    for component in root.components() {
+        path.push(component.as_os_str());
+        let metadata = std::fs::symlink_metadata(&path)?;
+        // The /tmp exception is only for that exact root-owned sticky ancestor.
+        // Its next child is checked on the next iteration: trusted owner and no
+        // group/world write; sticky semantics prevent other UIDs replacing it.
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || !broker_directory_trusted(
+                metadata.uid(),
+                metadata.mode(),
+                service,
+                path == root,
+                path == Path::new("/tmp"),
+            )
+        {
+            return Err(deny());
+        }
+    }
+    for name in [
+        "memory.db",
+        "memory.db-wal",
+        "memory.db-shm",
+        "memory.db-journal",
+        "memory.broker.lock",
+        "events.jsonl.lock",
+        "export.lock",
+        "memory.init.lock",
+        "events.jsonl",
+    ] {
+        match std::fs::symlink_metadata(root.join(name)) {
+            Ok(metadata) => {
+                if !metadata.is_file()
+                    || metadata.file_type().is_symlink()
+                    || metadata.uid() != service
+                    || metadata.mode() & 0o022 != 0
+                    || metadata.nlink() != 1
+                {
+                    return Err(deny());
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+fn initialize_schema(connection: &mut Connection, root_dir: &Dir) -> Result<(), MemoryError> {
+    reject_future_schema(connection)?;
+    if connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? < 1 {
+        connection.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=FULL;
+             PRAGMA foreign_keys=ON;
+             CREATE TABLE IF NOT EXISTS records (
+               id TEXT PRIMARY KEY,
+               session_id TEXT NOT NULL,
+               workspace TEXT NOT NULL,
+               kind TEXT NOT NULL,
+               content TEXT NOT NULL,
+               timestamp REAL NOT NULL,
+               metadata_json TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS records_workspace_time
+               ON records(workspace, timestamp DESC);
+             CREATE TABLE IF NOT EXISTS snapshot_state (
+               session_id TEXT NOT NULL,
+               workspace TEXT NOT NULL,
+               position INTEGER NOT NULL,
+               fingerprint TEXT NOT NULL,
+               record_id TEXT NOT NULL,
+               PRIMARY KEY(session_id, workspace, position)
+             );
+             CREATE TABLE IF NOT EXISTS snapshot_counters (
+               session_id TEXT NOT NULL,
+               workspace TEXT NOT NULL,
+               fingerprint TEXT NOT NULL,
+               next_occurrence INTEGER NOT NULL,
+               PRIMARY KEY(session_id, workspace, fingerprint)
+             );
+             CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(
+               content,
+               content='records',
+               content_rowid='rowid',
+               tokenize='unicode61'
+             );
+             CREATE TRIGGER IF NOT EXISTS records_ai AFTER INSERT ON records BEGIN
+               INSERT INTO records_fts(rowid, content) VALUES (new.rowid, new.content);
+             END;
+             CREATE TRIGGER IF NOT EXISTS records_ad AFTER DELETE ON records BEGIN
+               INSERT INTO records_fts(records_fts, rowid, content)
+               VALUES ('delete', old.rowid, old.content);
+             END;
+             CREATE TRIGGER IF NOT EXISTS records_au AFTER UPDATE ON records BEGIN
+               INSERT INTO records_fts(records_fts, rowid, content)
+               VALUES ('delete', old.rowid, old.content);
+               INSERT INTO records_fts(rowid, content) VALUES (new.rowid, new.content);
+             END;
+             CREATE TABLE IF NOT EXISTS projection_state (
+               singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+               current_generation INTEGER NOT NULL,
+               projected_generation INTEGER NOT NULL,
+               projected_sha256 TEXT NOT NULL,
+               projected_bytes INTEGER NOT NULL
+             );
+             INSERT OR IGNORE INTO projection_state
+               (singleton, current_generation, projected_generation, projected_sha256, projected_bytes)
+               SELECT 1, COUNT(*), -1, '', -1 FROM records;
+             CREATE TRIGGER IF NOT EXISTS projection_records_ai AFTER INSERT ON records BEGIN
+               UPDATE projection_state
+               SET current_generation = current_generation + 1 WHERE singleton = 1;
+             END;
+             CREATE TRIGGER IF NOT EXISTS projection_records_ad AFTER DELETE ON records BEGIN
+               UPDATE projection_state
+               SET current_generation = current_generation + 1 WHERE singleton = 1;
+             END;
+             CREATE TRIGGER IF NOT EXISTS projection_records_au AFTER UPDATE ON records BEGIN
+               UPDATE projection_state
+               SET current_generation = current_generation + 1 WHERE singleton = 1;
+             END;
+             PRAGMA user_version=1;",
+                )?;
+        sync_directory(root_dir)?;
+    }
+    if connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? < 2 {
+        migrate_projection_state_v2(connection)?;
+        sync_directory(root_dir)?;
+    }
+    Ok(())
+}
+
+fn reject_future_schema(connection: &Connection) -> Result<(), MemoryError> {
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version > 2 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "memory schema is newer than this binary",
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn migrate_projection_state_v2(connection: &mut Connection) -> Result<(), MemoryError> {

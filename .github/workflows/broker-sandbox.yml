@@ -1,0 +1,54 @@
+name: Experimental broker sandbox
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [test/posix-sqlite-hardening]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - src/**
+      - scripts/broker_sandbox_probe.py
+      - scripts/posix_identity_probe.py
+      - python_tests/test_broker_sandbox_probe.py
+      - .github/workflows/broker-sandbox.yml
+
+permissions:
+  contents: read
+
+jobs:
+  rust-contract:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --features experimental-broker --bin hermes-memory-broker
+      - run: cargo test --locked --features experimental-broker --lib broker_store_tests
+      - run: cargo build --locked --features experimental-broker --bin hermes-memory-broker
+
+  linux-identities:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked --features experimental-broker --bin hermes-memory-broker
+      - name: Run actual broker with isolated synthetic identities
+        run: |
+          set -o pipefail
+          sudo -n env GITHUB_ACTIONS=true timeout 180s python3 scripts/broker_sandbox_probe.py --binary "$PWD/target/release/hermes-memory-broker" --run | tee broker-results.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: broker-sandbox-evidence
+          path: broker-results.json
+          if-no-files-found: warn

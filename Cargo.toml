@@ -5,6 +5,9 @@ edition = "2021"
 license = "MIT"
 description = "Local-first Rust memory data plane for Hermes Agent"
 
+[features]
+experimental-broker = []
+
 [lib]
 name = "hermes_memory"
 path = "src/lib.rs"
@@ -12,6 +15,11 @@ path = "src/lib.rs"
 [[bin]]
 name = "hermes-memory"
 path = "src/main.rs"
+
+[[bin]]
+name = "hermes-memory-broker"
+path = "src/bin/hermes-memory-broker.rs"
+required-features = ["experimental-broker"]
 
 [dependencies]
 cap-std = "4"
