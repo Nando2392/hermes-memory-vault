@@ -221,8 +221,12 @@ fn mutation(v: &Value, inserted: u64, duplicates: u64) -> Result<()> {
             && r["duplicates"] == duplicates
             && r["durable"] == true
             && r["projection_ready"] == true,
-        "mutation counts/durability mismatch",
+        &format!("mutation counts/durability mismatch: expected inserted={inserted} duplicates={duplicates}; actual result={r}"),
     )
+}
+fn snapshot_replay(v: &Value) -> Result<()> {
+    // An identical snapshot is consumed by the overlap path, not by INSERT OR IGNORE.
+    mutation(v, 0, 0)
 }
 fn search(root: &Path, config: &Config, stage: &str) -> Result<Value> {
     let v = call(
@@ -306,7 +310,7 @@ pub(super) fn client(root: &Path) -> Result<()> {
         snapshot(),
         None,
     )?;
-    mutation(&snap_duplicate, 0, 1)?;
+    snapshot_replay(&snap_duplicate)?;
     let found = search(root, &config, "first")?;
     let scope = call(
         root,
@@ -357,7 +361,7 @@ pub(super) fn client(root: &Path) -> Result<()> {
         snapshot(),
         None,
     )?;
-    mutation(&snap, 0, 1)?;
+    snapshot_replay(&snap)?;
     let final_search = search(root, &config, "final")?;
     ensure(
         found["response"]["result"] == final_search["response"]["result"],
@@ -443,6 +447,21 @@ pub(super) fn integrity(root: &Path) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn snapshot_replay_matches_actual_store_overlap_semantics_across_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let request: hermes_memory::SnapshotRequest = serde_json::from_value(snapshot()).unwrap();
+        {
+            let store = hermes_memory::MemoryStore::open(root.path()).unwrap();
+            assert_eq!(store.ingest_snapshot(&request).unwrap(), (1, 0));
+        }
+        let store = hermes_memory::MemoryStore::open(root.path()).unwrap();
+        let (inserted, duplicates) = store.ingest_snapshot(&request).unwrap();
+        snapshot_replay(&json!({"response":{"result":{
+            "inserted":inserted,"duplicates":duplicates,"durable":true,"projection_ready":true
+        }}}))
+        .unwrap();
+    }
     #[test]
     fn bounded_child_wait_reaps_a_real_unprivileged_child() {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
