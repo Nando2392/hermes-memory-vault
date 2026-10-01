@@ -5,6 +5,7 @@ on:
     branches: [test/posix-sqlite-hardening]
     paths:
       - scripts/posix_isolation_probe.py
+      - scripts/posix_identity_probe.py
       - .github/workflows/posix-isolation-research.yml
 permissions:
   contents: read
@@ -27,4 +28,23 @@ jobs:
         with:
           name: isolation-counterexamples
           path: isolation-results.json
+          if-no-files-found: warn
+  identity-boundary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax and safe help
+        run: |
+          python3 -m py_compile scripts/posix_identity_probe.py
+          python3 scripts/posix_identity_probe.py --help
+      - name: Separate identities with native SQLite and process recovery
+        run: |
+          set -o pipefail
+          sudo -n env GITHUB_ACTIONS=true timeout 90s python3 scripts/posix_identity_probe.py --run | tee identity-results.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: identity-boundary-results
+          path: identity-results.json
           if-no-files-found: warn
