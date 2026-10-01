@@ -1,4 +1,4 @@
-//! Disposable SCM identity/storage experiment, NOT a Windows broker.
+//! Disposable SCM identity/storage/pipe experiment, NOT a production broker.
 //! Never run on a workstation. Default and --help perform no provisioning.
 #[cfg(windows)]
 #[path = "windows_identity_probe/native.rs"]
@@ -19,11 +19,11 @@ fn entry() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || args == ["--help"] {
         println!(
-            "Disposable Windows SCM identity + SQLite ACL probe (not a broker).\n\
+            "Disposable Windows SCM identity + SQLite ACL + local pipe probe (not a broker).\n\
             --run --allow-disposable-services\n\
             Requires elevated GitHub-hosted Windows runner; creates two transient\n\
-            virtual-account own-process services and one fresh ProgramData fixture.\n\
-            No IPC authentication, symlink, full matrix, or crash-recovery claim.\n\
+            virtual-account own-process services and one fresh protected volume-root fixture.\n\
+            No remote-network, symlink, full matrix, or crash-recovery claim.\n\
             Local use is limited to --help and pure helper tests."
         );
         return Ok(());

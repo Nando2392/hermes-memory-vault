@@ -63,8 +63,43 @@ pub fn fixture_ace_allowed(trusted: bool, writer: bool, reader: bool, mask: u32)
     trusted || writer || (reader && !namespace_mutation(mask, false))
 }
 
+/// Only explicit OS owner/privilege denials count; arbitrary failure is not proof.
+pub fn pipe_owner_denied(code: u32) -> bool {
+    matches!(code, 5 | 1307 | 1314)
+}
+
+pub fn ipc_privileges(names: &[&str]) -> bool {
+    names == ["SeChangeNotifyPrivilege"]
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ipc_requires_only_changenotify_installed_not_disabled_impersonation() {
+        assert!(super::ipc_privileges(&["SeChangeNotifyPrivilege"]));
+        assert!(!super::ipc_privileges(&[]));
+        assert!(!super::ipc_privileges(&[
+            "SeChangeNotifyPrivilege",
+            "SeImpersonatePrivilege"
+        ]));
+        assert!(!super::ipc_privileges(&[
+            "SeChangeNotifyPrivilege",
+            "SeAssignPrimaryTokenPrivilege"
+        ]));
+        assert!(!super::ipc_privileges(&[
+            "SeChangeNotifyPrivilege",
+            "SeChangeNotifyPrivilege"
+        ]));
+    }
+    #[test]
+    fn pipe_owner_forgery_requires_explicit_os_denial() {
+        for code in [5, 1307, 1314] {
+            assert!(super::pipe_owner_denied(code), "code {code}");
+        }
+        for code in [0, 2, 87, 231, u32::MAX] {
+            assert!(!super::pipe_owner_denied(code));
+        }
+    }
     use super::*;
     #[test]
     fn fixture_allowlist_rejects_even_read_for_unknown_sids() {

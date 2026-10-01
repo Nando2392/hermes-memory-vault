@@ -1,5 +1,7 @@
-//! Native disposable-runner adapter. No broker or network IPC is implemented.
-//! All provisioning is reachable only after the public admission + elevation gates.
+//! Native disposable-runner adapter. Local IPC proof, not a production broker.
+#[path = "pipe_probe.rs"]
+mod pipe_probe;
+// All provisioning is reachable only after the public admission + elevation gates.
 use super::policy;
 use rusqlite::Connection;
 use serde_json::{json, Value};
@@ -298,15 +300,12 @@ fn audit_dir(path: &Path, writers: &[&str], readers: &[&str], ancestor: bool) ->
         )
     }
 }
-fn program_data() -> Result<(PathBuf, Vec<Value>)> {
-    let raw = std::env::var("ProgramData")?;
+fn fixture_volume() -> Result<(PathBuf, Vec<Value>)> {
+    let raw = format!("{}\\", std::env::var("SystemDrive")?);
     let bytes = raw.as_bytes();
     ensure(
-        bytes.len() >= 4
-            && bytes[0].is_ascii_alphabetic()
-            && &bytes[1..3] == b":\\"
-            && raw[3..].eq_ignore_ascii_case("ProgramData"),
-        "only drive-root ProgramData accepted",
+        bytes.len() == 3 && bytes[0].is_ascii_alphabetic() && &bytes[1..3] == b":\\",
+        "only system drive root accepted",
     )?;
     let volume = &raw[..3];
     let mut fs_name = [0u16; 32];
@@ -331,10 +330,10 @@ fn program_data() -> Result<(PathBuf, Vec<Value>)> {
         String::from_utf16_lossy(&fs_name[..4]) == "NTFS",
         "not NTFS",
     )?;
-    let audits = vec![
-        audit_dir(Path::new(volume), &[], &[], true)?,
-        audit_dir(Path::new(&raw), &[], &[], true)?,
-    ];
+    // ProgramData on hosted Windows grants ordinary users WRITE_EA/WRITE_ATTRIBUTES.
+    // Never weaken that ancestor or the broker admission policy: create our fresh
+    // protected namespace directly under the independently audited volume root.
+    let audits = vec![audit_dir(Path::new(volume), &[], &[], true)?];
     Ok((PathBuf::from(raw), audits))
 }
 fn write_report(dir: &Path, name: &str, value: &Value) -> Result<()> {
@@ -347,7 +346,9 @@ fn write_report(dir: &Path, name: &str, value: &Value) -> Result<()> {
     file.write_all(&serde_json::to_vec(value)?)?;
     file.sync_all()?;
     drop(file);
-    fs::rename(pending, dir.join(name))?;
+    // SAFETY: both paths are live NUL-terminated strings on this fixture volume.
+    // MoveFileW (unlike fs::rename) refuses to replace a completed receipt.
+    win(unsafe { MoveFileW(wide(&pending).as_ptr(), wide(dir.join(name)).as_ptr()) })?;
     Ok(())
 }
 fn read_report(dir: &Path, name: &str, deadline: Instant) -> Result<Value> {
@@ -371,6 +372,38 @@ fn read_report(dir: &Path, name: &str, deadline: Instant) -> Result<Value> {
         }
     }
 }
+#[cfg(test)]
+mod receipt_tests {
+    use super::*;
+
+    #[test]
+    fn completed_receipt_cannot_be_replaced_by_later_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        write_report(dir.path(), "ready.json", &json!({"stage":1})).unwrap();
+        assert!(write_report(dir.path(), "ready.json", &json!({"stage":2})).is_err());
+        assert_eq!(
+            read_report(dir.path(), "ready.json", Instant::now()).unwrap()["stage"],
+            1
+        );
+    }
+
+    #[test]
+    fn service_error_receipt_wins_over_stale_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        write_report(dir.path(), "ready.json", &json!({"ready":true})).unwrap();
+        write_report(
+            dir.path(),
+            "error.json",
+            &json!({"error":"failed after ready"}),
+        )
+        .unwrap();
+        assert!(read_report(dir.path(), "ready.json", Instant::now())
+            .unwrap_err()
+            .to_string()
+            .contains("failed after ready"));
+    }
+}
+
 fn records(db: &Connection) -> Result<Vec<String>> {
     Ok(db
         .prepare("SELECT value FROM proof ORDER BY id")?
@@ -438,11 +471,14 @@ fn sqlite_worker(root: &Path, id: &Value) -> Result<()> {
         .prepare("PRAGMA compile_options")?
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    // Publish ready only after both real IPC listeners have been created.
+    let mut pipe = pipe_probe::Server::prepare(root)?;
     write_report(
         &report,
         "ready.json",
-        &json!({"identity":id,"records":records(&first)?,"files":files,"sqlite_version":version,"sqlite_source_id":source,"vfs":vfs_name,"compile_options":options,"journal_mode":mode,"connections":2,"closed_rollback_journal":true,"broker_storage":broker_storage}),
+        &json!({"identity":id,"records":records(&first)?,"files":files,"sqlite_version":version,"sqlite_source_id":source,"vfs":vfs_name,"compile_options":options,"journal_mode":mode,"connections":2,"closed_rollback_journal":true,"broker_storage":broker_storage,"ipc_listeners_bound":true}),
     )?;
+    let ipc = pipe.run(root)?;
     let deadline = Instant::now() + Duration::from_secs(90);
     while !STOP.load(Ordering::Acquire) && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(100));
@@ -456,7 +492,7 @@ fn sqlite_worker(root: &Path, id: &Value) -> Result<()> {
     write_report(
         &report,
         "final.json",
-        &json!({"records":records(&first)?,"integrity_check":integrity}),
+        &json!({"records":records(&first)?,"integrity_check":integrity,"ipc":ipc}),
     )?;
     Ok(())
 }
@@ -535,6 +571,7 @@ fn attempt(path: &Path, scratch: &Path, op: &str) -> u32 {
     }
 }
 fn attacker_worker(root: &Path, id: &Value) -> Result<()> {
+    let ipc = pipe_probe::client(root)?;
     let scratch = root.join("scratch");
     // Positive controls under the exact attacking token, including a closed source and hardlink.
     let source = scratch.join("source");
@@ -555,7 +592,7 @@ fn attacker_worker(root: &Path, id: &Value) -> Result<()> {
     write_report(
         &root.join("result-b"),
         "result.json",
-        &json!({"identity":id,"positive_controls":["create","read","overwrite","rename","hardlink","delete"],"cases":cases}),
+        &json!({"identity":id,"positive_controls":["create","read","overwrite","rename","hardlink","delete"],"cases":cases,"ipc":ipc}),
     )?;
     let deadline = Instant::now() + Duration::from_secs(90);
     while !STOP.load(Ordering::Acquire) && Instant::now() < deadline {
@@ -616,12 +653,16 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
                     "service has enabled administrators group",
                 )?;
             }
-            for privilege in id["privileges"].as_array().ok_or("missing privileges")? {
-                ensure(
-                    privilege["name"] == "SeChangeNotifyPrivilege",
-                    "unexpected service privilege",
-                )?;
-            }
+            let privileges = id["privileges"]
+                .as_array()
+                .ok_or("missing privileges")?
+                .iter()
+                .map(|privilege| privilege["name"].as_str().ok_or("missing privilege name"))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            ensure(
+                policy::ipc_privileges(&privileges),
+                "service must have only SeChangeNotifyPrivilege installed",
+            )?;
             if role == "a" {
                 sqlite_worker(root, &id)
             } else {
@@ -792,7 +833,7 @@ pub fn run() -> Result<()> {
         admin["elevated"] == true,
         "elevated administrator token required",
     )?;
-    let (parent, ancestors) = program_data()?;
+    let (parent, ancestors) = fixture_volume()?;
     let nonce = format!(
         "{}_{}",
         std::process::id(),
@@ -844,6 +885,12 @@ pub fn run() -> Result<()> {
         ] {
             acl_audits.push(audit_dir(&root.join(dir), &[sid], &[], false)?);
         }
+        let ipc_config = pipe_probe::Config::new(&a, &b, &nonce);
+        write_report(
+            &root,
+            "ipc-config.json",
+            &serde_json::to_value(&ipc_config)?,
+        )?;
         // Create-new destination inherits protected binary-directory SD, never the source ACL.
         let source = std::env::current_exe()?;
         let target = root.join("bin/probe.exe");
@@ -868,6 +915,11 @@ pub fn run() -> Result<()> {
             Instant::now() + Duration::from_secs(25),
         )?;
         observations["service_a"] = ready.clone();
+        ensure(
+            ready["ipc_listeners_bound"] == true,
+            "IPC readiness missing",
+        )?;
+        observations["ipc_admin"] = pipe_probe::admin_attempt(&root, &ipc_config)?;
         for name in policy::TARGETS {
             ensure(
                 fs::metadata(root.join("store").join(name))?.len() > 0,
@@ -878,12 +930,35 @@ pub fn run() -> Result<()> {
         let (process, observation) = track(&services[1], &b)?;
         processes.push(process);
         observations["tracked_b"] = observation;
+        let client_ready = read_report(
+            &root.join("result-b"),
+            "ipc-client-ready.json",
+            Instant::now() + Duration::from_secs(25),
+        )?;
+        ensure(
+            client_ready["controls_completed"] == true,
+            "client preflight missing",
+        )?;
+        observations["ipc_client_ready"] = client_ready;
+        write_report(&root, "ipc-client-go.json", &json!({"start":true}))?;
         let attacker = read_report(
             &root.join("result-b"),
             "result.json",
             Instant::now() + Duration::from_secs(25),
         )?;
         observations["service_b"] = attacker.clone();
+        let ipc_server = read_report(
+            &root.join("result-a"),
+            "ipc.json",
+            Instant::now() + Duration::from_secs(10),
+        )?;
+        observations["ipc_server"] = ipc_server.clone();
+        ensure(
+            ipc_server["storage_dispatches"] == 1
+                && ipc_server["ack_before_disconnect"] == true
+                && ipc_server["wrong_server_pin"]["bytes_received"] == 0,
+            "incomplete server IPC evidence",
+        )?;
         ensure(
             policy::identities_distinct(
                 admin["user"].as_str().ok_or("admin SID missing")?,
@@ -923,11 +998,13 @@ pub fn run() -> Result<()> {
             Instant::now() + Duration::from_secs(2),
         )?;
         ensure(
-            final_report["records"] == json!(RECORDS) && final_report["integrity_check"] == "ok",
+            final_report["records"] == json!(RECORDS)
+                && final_report["integrity_check"] == "ok"
+                && final_report["ipc"] == ipc_server,
             "final records/integrity failed",
         )?;
         Ok(
-            json!({"scope":"SCM_VIRTUAL_IDENTITIES_SQLITE_DIRECT_ACL_ONLY","admin":admin,"expected_sids":[a,b],"ancestors":ancestors,"fixture_acl":acl_audits,"service_a":ready,"service_b":attacker,"final":final_report,"attempts":tuples.len(),"exact_access_denied":tuples.iter().filter(|case| case.2 == 5).count(),"crash_recovery":"DEFERRED_NOT_ATTEMPTED","ipc_authentication":"NOT_IMPLEMENTED","symlink_reparse_matrix":"DEFERRED"}),
+            json!({"scope":"SCM_VIRTUAL_IDENTITIES_SQLITE_ACL_AND_LOCAL_AUTHENTICATED_PIPE","admin":admin,"expected_sids":[a,b],"ancestors":ancestors,"fixture_acl":acl_audits,"service_a":ready,"service_b":attacker,"final":final_report,"attempts":tuples.len(),"exact_access_denied":tuples.iter().filter(|case| case.2 == 5).count(),"crash_recovery":"DEFERRED_NOT_ATTEMPTED","ipc_authentication":ipc_server,"symlink_reparse_matrix":"DEFERRED"}),
         )
     })();
     // Always attempt every owned registration; do not remove files if any process may remain.
@@ -976,6 +1053,30 @@ pub fn run() -> Result<()> {
         }
     }
     drop(manager);
+    // Retain diagnostic evidence even if track() saw an already-failed service
+    // before read_report() could surface its error.json. Capture before cleanup
+    // deletes the fixture, including the raw owner-forgery syscall result.
+    if created_root {
+        for (role, name) in [
+            ("a", "error.json"),
+            ("b", "error.json"),
+            ("b", "ipc-owner-attempt.json"),
+            ("a", "ipc-admin.json"),
+            ("a", "ipc.json"),
+        ] {
+            let key = format!("receipt_{role}_{name}");
+            match fs::read(root.join(format!("result-{role}")).join(name)) {
+                Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+                    Ok(value) => observations[&key] = value,
+                    Err(error) => cleanup_errors.push(format!("invalid diagnostic {key}: {error}")),
+                },
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    observations[&key] = json!({"status":"NOT_WRITTEN"});
+                }
+                Err(error) => cleanup_errors.push(format!("read diagnostic {key}: {error}")),
+            }
+        }
+    }
     if created_root && stopped {
         if let Err(e) = fs::remove_dir_all(&root) {
             cleanup_errors.push(e.to_string());
