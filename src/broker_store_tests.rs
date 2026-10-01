@@ -26,7 +26,10 @@ fn broker_directory_policy_requires_trusted_nonroot_service() {
     assert!(broker_directory_trusted(0, 0o1777, 1001, false, true));
 }
 
-#[cfg(all(feature = "experimental-broker", not(target_os = "linux")))]
+#[cfg(all(
+    feature = "experimental-broker",
+    not(any(target_os = "linux", windows))
+))]
 #[test]
 fn broker_is_unsupported_without_creating_root() {
     let temp = tempfile::tempdir().unwrap();

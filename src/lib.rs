@@ -24,6 +24,13 @@ use thiserror::Error;
 #[cfg(test)]
 mod broker_store_tests;
 
+#[cfg(all(windows, feature = "experimental-broker"))]
+mod windows_broker_store;
+#[cfg(all(test, windows, feature = "experimental-broker"))]
+mod windows_broker_store_tests;
+#[cfg(all(windows, feature = "experimental-broker"))]
+pub mod windows_pipe;
+
 #[cfg(all(test, unix))]
 mod posix_open_tests;
 
@@ -173,7 +180,7 @@ pub struct MemoryStore {
     _shm_guard: Option<CapFile>,
     connection: Mutex<Connection>,
     // Declared after connection: the instance lock outlives SQLite close.
-    #[cfg(all(feature = "experimental-broker", target_os = "linux"))]
+    #[cfg(all(feature = "experimental-broker", any(target_os = "linux", windows)))]
     _broker_lock: Option<File>,
 }
 
@@ -223,25 +230,42 @@ pub fn validate_export_destination(path: &Path) -> Result<(), MemoryError> {
 }
 
 impl MemoryStore {
-    /// Opens an experimental Linux broker store in an already provisioned namespace.
+    /// Opens an experimental Linux/Windows broker in an already provisioned namespace.
     ///
-    /// The effective UID must be a dedicated, nonroot, trusted service identity;
+    /// On Windows the process must have a non-elevated SCM virtual-account
+    /// TokenUser (not merely a service group), no administrator group, and no
+    /// thread impersonation. The absolute local NTFS root must have a protected
+    /// SYSTEM/Administrators/actual-service-SID-only DACL with inheritable service
+    /// control. All ancestors are audited by handle against replacement/ACL and
+    /// metadata mutation; reparse paths, aliases and legacy/unknown entries fail
+    /// closed. Default user-writable ProgramData ancestry may therefore be refused.
+    /// This never provisions a directory or repairs/changes an existing ACL.
+    ///
+    /// On Linux the effective UID must be a dedicated, nonroot, trusted service identity;
     /// this does not isolate hostile processes sharing that UID. The administrator
     /// must provision a fresh private root, trusted ancestors, a local filesystem,
     /// no inherited writable handles/mappings or prior aliases, and secure process
     /// credentials, executable and configuration. This is not provisioning or
-    /// migration, an ACL/mount audit, or protection from root/capability holders.
-    /// Trusted administrators/service peers must not rename the namespace while
+    /// migration, a Linux ACL/mount audit, or protection from privileged principals.
+    /// Fresh provenance and absence of prior/inherited writable handles/mappings
+    /// are administrator preconditions, not facts inferred from current ACLs.
+    /// Service-controlled private TEMP/TMP and safe process/configuration policy
+    /// remain provisioning obligations. Trusted administrators/service peers must
+    /// not rename or weaken the namespace while
     /// open. SQLite owns its native WAL/SHM/journal lifetime; no custom VFS is used.
     /// Callers must not expose this path or native database access to clients.
     #[cfg(feature = "experimental-broker")]
     pub fn open_broker(root: impl AsRef<Path>) -> Result<Self, MemoryError> {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        {
+            windows_broker_store::open(root.as_ref())
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             let _ = root;
             Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                "experimental broker requires Linux",
+                "experimental broker requires Linux or Windows",
             )
             .into())
         }
@@ -313,7 +337,7 @@ impl MemoryStore {
             _wal_guard: Some(wal_guard),
             _shm_guard: Some(shm_guard),
             connection: Mutex::new(connection),
-            #[cfg(all(feature = "experimental-broker", target_os = "linux"))]
+            #[cfg(all(feature = "experimental-broker", any(target_os = "linux", windows)))]
             _broker_lock: None,
         };
         drop(initialization_lock);
@@ -730,7 +754,10 @@ fn reconcile_projection_checkpoint(
     Ok(true)
 }
 
-#[cfg(all(feature = "experimental-broker", any(target_os = "linux", test)))]
+#[cfg(all(
+    feature = "experimental-broker",
+    any(target_os = "linux", windows, test)
+))]
 fn configure_broker_connection(connection: &mut Connection) -> Result<(), MemoryError> {
     reject_future_schema(connection)?;
     connection.busy_timeout(Duration::from_secs(5))?;

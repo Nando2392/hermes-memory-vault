@@ -5,6 +5,9 @@ on:
   push:
     branches: [test/posix-sqlite-hardening]
     paths:
+      - Cargo.toml
+      - src/lib.rs
+      - src/windows_*.rs
       - examples/windows_identity_probe.rs
       - examples/windows_identity_probe/**
       - .github/workflows/windows-identity-research.yml
