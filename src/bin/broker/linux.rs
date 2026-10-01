@@ -154,10 +154,10 @@ pub fn serve(
         Err(e) if e.kind() == io::ErrorKind::NotFound => (),
         _ => return Err("unavailable"),
     }
+    let store = hermes_memory::MemoryStore::open_broker(root).map_err(|_| "unavailable")?;
     let listener = UnixListener::bind(socket).map_err(|_| "unavailable")?;
     // Never unlink supplied endpoints, including on startup failure or exit.
     fs::set_permissions(socket, fs::Permissions::from_mode(0o666)).map_err(|_| "unavailable")?;
-    let store = hermes_memory::MemoryStore::open_broker(root).map_err(|_| "unavailable")?;
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(s) => s,
