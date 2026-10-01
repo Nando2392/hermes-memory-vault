@@ -102,6 +102,7 @@ fn write_frame(w: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
     w.write_all(&(bytes.len() as u32).to_be_bytes())?;
     w.write_all(bytes)
 }
+#[cfg(any(target_os = "linux", test))]
 fn authenticate(peer: u32, expected: u32) -> Result<(), &'static str> {
     if peer == expected {
         Ok(())
@@ -109,6 +110,7 @@ fn authenticate(peer: u32, expected: u32) -> Result<(), &'static str> {
         Err("unauthorized")
     }
 }
+#[cfg(any(target_os = "linux", test))]
 fn receive_authenticated(
     r: &mut impl Read,
     peer: u32,
@@ -123,6 +125,7 @@ fn receive_authenticated(
         }
     })
 }
+#[cfg(any(target_os = "linux", test))]
 fn send_authenticated(
     w: &mut impl Write,
     peer: u32,
@@ -132,6 +135,7 @@ fn send_authenticated(
     authenticate(peer, expected)?;
     write_frame(w, bytes).map_err(|_| "outcome_unknown")
 }
+#[cfg(any(target_os = "linux", test))]
 fn service_identity(service: u32, client: u32) -> Result<(), &'static str> {
     if service == 0 || service == client || client == 0 {
         Err("unauthorized")
@@ -139,6 +143,7 @@ fn service_identity(service: u32, client: u32) -> Result<(), &'static str> {
         Ok(())
     }
 }
+#[cfg(any(target_os = "linux", test))]
 fn protected_directory(
     owner: u32,
     mode: u32,
@@ -153,10 +158,13 @@ fn protected_directory(
     }
     Ok(())
 }
+#[cfg(any(target_os = "linux", test))]
 mod deadline;
 #[cfg(target_os = "linux")]
 pub mod linux;
 mod protocol;
+#[cfg(windows)]
+pub mod windows;
 #[cfg(test)]
 mod tests {
     use super::*;

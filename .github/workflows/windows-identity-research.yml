@@ -8,6 +8,8 @@ on:
       - Cargo.toml
       - src/lib.rs
       - src/windows_*.rs
+      - src/bin/hermes-memory-broker.rs
+      - src/bin/broker/**
       - examples/windows_identity_probe.rs
       - examples/windows_identity_probe/**
       - .github/workflows/windows-identity-research.yml
@@ -26,9 +28,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
-      - run: cargo test --locked --features experimental-broker --example windows-identity-probe
-      - run: cargo clippy --locked --features experimental-broker --example windows-identity-probe -- -D warnings
-      - run: cargo build --locked --release --features experimental-broker --example windows-identity-probe
+      - run: cargo test --locked --all-targets --all-features
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo build --locked --release --features experimental-broker --example windows-identity-probe --bin hermes-memory-broker
       - name: Disposable SCM identities and SQLite ACL proof
         shell: pwsh
         run: |

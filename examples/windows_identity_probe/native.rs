@@ -1,6 +1,8 @@
 //! Native disposable-runner adapter. Local IPC proof, not a production broker.
 #[path = "pipe_probe.rs"]
 mod pipe_probe;
+#[path = "production_probe.rs"]
+mod production_probe;
 // All provisioning is reachable only after the public admission + elevation gates.
 use super::policy;
 use rusqlite::Connection;
@@ -594,6 +596,7 @@ fn attacker_worker(root: &Path, id: &Value) -> Result<()> {
         "result.json",
         &json!({"identity":id,"positive_controls":["create","read","overwrite","rename","hardlink","delete"],"cases":cases,"ipc":ipc}),
     )?;
+    production_probe::client(root)?;
     let deadline = Instant::now() + Duration::from_secs(90);
     while !STOP.load(Ordering::Acquire) && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(100));
@@ -840,7 +843,11 @@ pub fn run() -> Result<()> {
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
     );
     let root = parent.join(format!("HMVProbe_{nonce}"));
-    let names = [format!("HMVProbe_{nonce}_A"), format!("HMVProbe_{nonce}_B")];
+    let names = [
+        format!("HMVProbe_{nonce}_A"),
+        format!("HMVProbe_{nonce}_B"),
+        format!("HMVProbe-{}-C", nonce.replace('_', "-")),
+    ];
     // SAFETY: local manager only; no service enumeration or existing registration opened.
     let manager = sc(unsafe {
         OpenSCManagerW(
@@ -855,15 +862,16 @@ pub fn run() -> Result<()> {
     let mut created_root = false;
     let proof = (|| -> Result<Value> {
         // Registration precedes name-to-SID resolution. Nothing is started until all ACLs exist.
-        for (name, role) in names.iter().zip(["a", "b"]) {
+        for (name, role) in names.iter().zip(["a", "b", "c"]) {
             services.push(create_service(&manager, name, &root, role)?);
         }
         let a = service_sid(&names[0])?;
         let b = service_sid(&names[1])?;
+        let c = service_sid(&names[2])?;
         for service in &services {
             restrict_privileges(service)?;
         }
-        let rx = format!("(A;OICI;FRFX;;;{a})(A;OICI;FRFX;;;{b})");
+        let rx = format!("(A;OICI;FRFX;;;{a})(A;OICI;FRFX;;;{b})(A;OICI;FRFX;;;{c})");
         mkdir(&root, &rx)?;
         created_root = true;
         mkdir(&root.join("bin"), &rx)?;
@@ -873,8 +881,8 @@ pub fn run() -> Result<()> {
         mkdir(&root.join("scratch"), &format!("(A;OICI;FA;;;{b})"))?;
         mkdir(&root.join("result-b"), &format!("(A;OICI;FA;;;{b})"))?;
         let mut acl_audits = vec![
-            audit_dir(&root, &[], &[&a, &b], false)?,
-            audit_dir(&root.join("bin"), &[], &[&a, &b], false)?,
+            audit_dir(&root, &[], &[&a, &b, &c], false)?,
+            audit_dir(&root.join("bin"), &[], &[&a, &b, &c], false)?,
         ];
         for (dir, sid) in [
             ("store", &a),
@@ -885,6 +893,8 @@ pub fn run() -> Result<()> {
         ] {
             acl_audits.push(audit_dir(&root.join(dir), &[sid], &[], false)?);
         }
+        let (_, binary) = production_probe::prepare(&root, &services[2], &names[2], &b)?;
+        observations["production_binary"] = binary;
         let ipc_config = pipe_probe::Config::new(&a, &b, &nonce);
         write_report(
             &root,
@@ -991,6 +1001,34 @@ pub fn run() -> Result<()> {
             "parent record verification failed",
         )?;
         stop(&services[0], Instant::now() + Duration::from_secs(15))?;
+        observations["production_start"] =
+            production_probe::start(&services[2], &c, &mut processes)?;
+        observations["production_admin"] = production_probe::admin_denial(&root)?;
+        write_report(&root, "production-go.json", &json!({"start":true}))?;
+        let first = read_report(
+            &root.join("result-b"),
+            "production-first.json",
+            Instant::now() + Duration::from_secs(90),
+        )?;
+        observations["production_first"] = first.clone();
+        observations["production_stop"] =
+            production_probe::stopped(&services[2], processes.last().ok_or("C process missing")?)?;
+        observations["production_restart"] =
+            production_probe::start(&services[2], &c, &mut processes)?;
+        write_report(&root, "production-restarted.json", &json!({"restart":true}))?;
+        let durable = read_report(
+            &root.join("result-b"),
+            "production-final.json",
+            Instant::now() + Duration::from_secs(90),
+        )?;
+        ensure(
+            first["search"]["response"]["result"] == durable["search"]["response"]["result"],
+            "restart changed exact records",
+        )?;
+        observations["production_final"] = durable;
+        observations["production_final_stop"] =
+            production_probe::stopped(&services[2], processes.last().ok_or("C process missing")?)?;
+        observations["production_integrity"] = production_probe::integrity(&root)?;
         stop(&services[1], Instant::now() + Duration::from_secs(15))?;
         let final_report = read_report(
             &root.join("result-a"),
