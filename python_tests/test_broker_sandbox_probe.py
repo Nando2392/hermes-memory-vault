@@ -9,6 +9,32 @@ SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "broker_sandbox_probe
 
 
 class ProbeTests(unittest.TestCase):
+    def test_readiness_retries_transition_and_ping_before_acceptance(self):
+        probe = self.load()
+        self.assertTrue(
+            callable(getattr(probe, "wait_ready", None)), "readiness helper missing"
+        )
+        observations = iter([False, False, True])
+        calls = []
+        probe.wait_ready(
+            lambda: None,
+            lambda: next(observations),
+            lambda: calls.append("ping"),
+            timeout=1,
+            interval=0,
+        )
+        self.assertEqual(calls, ["ping"])
+
+    def test_readiness_rejects_dead_process_and_expires(self):
+        probe = self.load()
+        self.assertTrue(
+            callable(getattr(probe, "wait_ready", None)), "readiness helper missing"
+        )
+        with self.assertRaisesRegex(RuntimeError, "exited"):
+            probe.wait_ready(lambda: 1, lambda: True, lambda: None)
+        with self.assertRaisesRegex(RuntimeError, "deadline"):
+            probe.wait_ready(lambda: None, lambda: False, lambda: None, timeout=0)
+
     def load(self):
         self.assertTrue(SCRIPT.exists(), "broker harness not implemented")
         spec = importlib.util.spec_from_file_location("broker_probe", SCRIPT)

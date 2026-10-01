@@ -5,11 +5,30 @@ from __future__ import annotations
 import json
 import socket
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 MAX_FRAME = 8 * 1024 * 1024
 TIMEOUT = 15.0
+
+
+def wait_ready(
+    poll: Callable[[], int | None],
+    ready: Callable[[], bool],
+    ping: Callable[[], Any],
+    timeout: float = TIMEOUT,
+    interval: float = 0.02,
+) -> None:
+    """Wait for final socket permissions, then require authenticated service I/O."""
+    deadline = time.monotonic() + timeout
+    while True:
+        require(poll() is None, "broker exited before socket readiness")
+        require(time.monotonic() < deadline, "socket readiness deadline exceeded")
+        if ready():
+            ping()
+            return
+        time.sleep(interval)
 
 
 def require(condition: bool, message: str) -> None:
@@ -250,24 +269,21 @@ def run(binary: Path) -> int:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
-                deadline = time.monotonic() + TIMEOUT
-                while not endpoint.exists():
+
+                def ready() -> bool:
+                    try:
+                        info = endpoint.lstat()
+                    except FileNotFoundError:
+                        return False
                     require(
-                        daemon.poll() is None, "broker exited before socket readiness"
+                        stat.S_ISSOCK(info.st_mode) and info.st_uid == service,
+                        "socket must be service-owned",
                     )
-                    require(
-                        time.monotonic() < deadline,
-                        "socket readiness deadline exceeded",
-                    )
-                    time.sleep(0.02)
-                info = endpoint.lstat()
-                require(
-                    stat.S_ISSOCK(info.st_mode)
-                    and info.st_uid == service
-                    and stat.S_IMODE(info.st_mode) == 0o666,
-                    "socket must be service-owned 0666 to test peer authentication",
-                )
-                request("ping", {})
+                    mode = stat.S_IMODE(info.st_mode)
+                    require(mode in (0o700, 0o666), "unexpected socket permissions")
+                    return mode == 0o666
+
+                wait_ready(daemon.poll, ready, lambda: request("ping", {}))
                 return daemon
 
             def native_state() -> dict[str, Any]:
