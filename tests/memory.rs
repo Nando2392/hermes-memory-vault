@@ -1,8 +1,26 @@
-use hermes_memory::{MemoryRecord, MemoryStore, SearchRequest, SnapshotItem, SnapshotRequest};
+#![cfg(any(windows, all(target_os = "linux", feature = "experimental-broker")))]
+
+mod support;
+
+use hermes_memory::{
+    MemoryError, MemoryRecord, MemoryStore as ProductMemoryStore, SearchRequest, SnapshotItem,
+    SnapshotRequest,
+};
 use serde_json::json;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::sync::{Arc, Barrier};
+use std::path::Path;
+use std::sync::{mpsc, Arc};
+use std::time::Duration;
+use support::open_store;
 use tempfile::tempdir;
+
+struct MemoryStore;
+
+impl MemoryStore {
+    fn open(root: impl AsRef<Path>) -> Result<ProductMemoryStore, MemoryError> {
+        open_store(root)
+    }
+}
 
 #[cfg(unix)]
 fn link_directory(target: &std::path::Path, link: &std::path::Path) {
@@ -46,6 +64,64 @@ fn read_projection(root: &std::path::Path) -> Vec<MemoryRecord> {
         .lines()
         .map(|line| serde_json::from_str::<MemoryRecord>(line).expect("valid JSONL record"))
         .collect()
+}
+
+#[test]
+fn cross_workspace_snapshot_id_conflict_does_not_advance_state() {
+    let reference_dir = tempdir().unwrap();
+    let reference = MemoryStore::open(reference_dir.path()).unwrap();
+    let snapshot = SnapshotRequest {
+        session_id: "session-1".into(),
+        workspace: "beta".into(),
+        items: vec![SnapshotItem {
+            kind: "checkpoint".into(),
+            content: "snapshotmarker".into(),
+            timestamp: 0.0,
+            metadata: json!({}),
+        }],
+    };
+    reference.ingest_snapshot(&snapshot).unwrap();
+    let generated = read_projection(reference_dir.path()).remove(0);
+    let temp = tempdir().unwrap();
+    let store = MemoryStore::open(temp.path()).unwrap();
+    store
+        .ingest(&record(&generated.id, "alpha", "blocker"))
+        .unwrap();
+    assert!(store.ingest_snapshot(&snapshot).is_err());
+    assert_eq!(read_projection(temp.path()).len(), 1);
+    assert!(
+        store.ingest_snapshot(&snapshot).is_err(),
+        "conflict must not advance snapshot counter/state"
+    );
+}
+
+#[test]
+fn cross_workspace_duplicate_id_rolls_back_entire_batch() {
+    let temp = tempdir().unwrap();
+    let store = MemoryStore::open(temp.path()).unwrap();
+    assert!(store.ingest(&record("shared", "alpha", "first")).unwrap());
+    assert_eq!(
+        store
+            .ingest_many(&[record("shared", "alpha", "retry")])
+            .unwrap(),
+        (0, 1)
+    );
+    let before = std::fs::read(temp.path().join("events.jsonl")).unwrap();
+    let result = store.ingest_many(&[
+        record("fresh", "beta", "must roll back"),
+        record("shared", "beta", "must conflict"),
+    ]);
+    assert!(
+        result.is_err(),
+        "cross-workspace ID reuse must not count as duplicate"
+    );
+    assert_eq!(
+        before,
+        std::fs::read(temp.path().join("events.jsonl")).unwrap()
+    );
+    assert!(store
+        .ingest(&record("fresh", "beta", "rollback proved"))
+        .unwrap());
 }
 
 #[test]
@@ -468,6 +544,7 @@ fn export_rejects_symlink_or_junction_that_escapes_vault() {
         .is_none());
 }
 
+#[cfg(windows)]
 #[test]
 fn store_open_rejects_symlink_or_junction_root_without_writing_outside() {
     let temp = tempdir().expect("temp dir");
@@ -483,6 +560,7 @@ fn store_open_rejects_symlink_or_junction_root_without_writing_outside() {
         .is_none());
 }
 
+#[cfg(windows)]
 #[test]
 fn store_open_rejects_hardlinked_database_without_modifying_target() {
     let temp = tempdir().expect("temp dir");
@@ -496,6 +574,7 @@ fn store_open_rejects_hardlinked_database_without_modifying_target() {
     assert!(std::fs::read(&outside).expect("outside target").is_empty());
 }
 
+#[cfg(windows)]
 #[test]
 fn store_open_rejects_hardlinked_sqlite_sidecars() {
     for sidecar in ["memory.db-wal", "memory.db-shm"] {
@@ -511,6 +590,7 @@ fn store_open_rejects_hardlinked_sqlite_sidecars() {
     }
 }
 
+#[cfg(windows)]
 #[test]
 fn store_open_rejects_hardlinked_initialization_lock() {
     let temp = tempdir().expect("temp dir");
@@ -523,6 +603,7 @@ fn store_open_rejects_hardlinked_initialization_lock() {
     assert!(MemoryStore::open(&root).is_err());
 }
 
+#[cfg(windows)]
 #[test]
 fn store_open_rejects_hardlinked_jsonl_projection() {
     let temp = tempdir().expect("temp dir");
@@ -583,30 +664,64 @@ fn capability_export_atomically_replaces_existing_files() {
     assert!(vault.join("Index.md").is_file());
 }
 
+// This shared-connection test covers the Linux single-broker model; it is not
+// a substitute for Windows independent connections below.
 #[test]
 fn concurrent_ingest_projects_complete_parseable_jsonl() {
     let temp = tempdir().expect("temp dir");
     let root = temp.path().join("store");
-    let barrier = Arc::new(Barrier::new(2));
+    let store = Arc::new(MemoryStore::open(&root).expect("open one store"));
+    let (start_tx, start_rx) = mpsc::sync_channel::<()>(0);
+    let start_rx = Arc::new(std::sync::Mutex::new(start_rx));
+    let (result_tx, result_rx) = mpsc::sync_channel(2);
     let handles = (0..2)
         .map(|index| {
-            let root = root.clone();
-            let barrier = Arc::clone(&barrier);
+            let store = Arc::clone(&store);
+            let start_rx = Arc::clone(&start_rx);
+            let result_tx = result_tx.clone();
             std::thread::spawn(move || {
-                let store = MemoryStore::open(root).expect("open concurrent store");
-                barrier.wait();
-                store
-                    .ingest(&record(
-                        &format!("concurrent-{index}"),
-                        "repo-a",
-                        "concurrent projection marker",
-                    ))
-                    .expect("concurrent ingest");
+                let result = start_rx
+                    .lock()
+                    .map_err(|_| "start lock poisoned".to_owned())?
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|error| error.to_string())
+                    .and_then(|()| {
+                        store
+                            .ingest(&record(
+                                &format!("concurrent-{index}"),
+                                "repo-a",
+                                "concurrent projection marker",
+                            ))
+                            .map_err(|error| error.to_string())
+                            .and_then(|inserted| {
+                                inserted.then_some(()).ok_or_else(|| "duplicate".to_owned())
+                            })
+                    });
+                result_tx.send((index, result)).expect("report result");
+                Ok::<(), String>(())
             })
         })
         .collect::<Vec<_>>();
+    for _ in 0..2 {
+        start_tx.send(()).expect("release writer");
+    }
+    let mut outcomes = Vec::new();
+    for _ in 0..2 {
+        outcomes.push(
+            result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("bounded writer result"),
+        );
+    }
+    assert!(
+        outcomes.iter().all(|(_, result)| result.is_ok()),
+        "{outcomes:?}"
+    );
     for handle in handles {
-        handle.join().expect("join ingest");
+        handle
+            .join()
+            .expect("join ingest")
+            .expect("worker completion");
     }
     let lines = std::fs::read_to_string(root.join("events.jsonl")).expect("event projection");
     let records = lines
@@ -616,6 +731,127 @@ fn concurrent_ingest_projects_complete_parseable_jsonl() {
     assert_eq!(records.len(), 2);
     assert!(records.iter().any(|record| record.id == "concurrent-0"));
     assert!(records.iter().any(|record| record.id == "concurrent-1"));
+    drop(store);
+    let reopened = MemoryStore::open(&root).expect("reopen broker store");
+    for id in ["concurrent-0", "concurrent-1"] {
+        let hits = reopened
+            .search(&SearchRequest {
+                query: "concurrent projection marker".to_owned(),
+                workspace: Some("repo-a".to_owned()),
+                session_id: None,
+                limit: 10,
+                max_bytes: 4096,
+            })
+            .expect("search reopened store");
+        assert!(hits.iter().any(|record| record.id == id));
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_independent_open_concurrent_ingest_projects_complete_jsonl() {
+    let temp = tempdir().expect("temp dir");
+    let root = temp.path().join("store");
+    let bound = Duration::from_secs(5);
+    let (ready_tx, ready_rx) = mpsc::sync_channel(2);
+    let (result_tx, result_rx) = mpsc::sync_channel(2);
+    let mut starts = Vec::new();
+    let mut handles = Vec::new();
+    for index in 0..2 {
+        let root = root.clone();
+        let ready_tx = ready_tx.clone();
+        let result_tx = result_tx.clone();
+        let (start_tx, start_rx) = mpsc::sync_channel(1);
+        starts.push(start_tx);
+        handles.push(std::thread::spawn(move || {
+            // Direct product entrypoint, one independently owned connection per
+            // worker. Both must be open simultaneously before either ingests.
+            let opened = ProductMemoryStore::open(&root).map_err(|error| error.to_string());
+            let readiness = opened.as_ref().map(|_| ()).map_err(Clone::clone);
+            let _ = ready_tx.send((index, readiness));
+            let result = opened.and_then(|store| {
+                // No Barrier: failed open/parent assertion drops the start sender,
+                // and even a missing release cannot orphan this worker forever.
+                start_rx
+                    .recv_timeout(bound)
+                    .map_err(|error| error.to_string())?;
+                store
+                    .ingest(&record(
+                        &format!("independent-{index}"),
+                        "repo-a",
+                        "independent projection marker",
+                    ))
+                    .map_err(|error| error.to_string())
+                    .and_then(|inserted| {
+                        inserted.then_some(()).ok_or_else(|| "duplicate".to_owned())
+                    })
+            }); // Drop the connection before reporting completion.
+            let _ = result_tx.send((index, result));
+        }));
+    }
+    drop(ready_tx);
+    drop(result_tx);
+    let ready = (0..2)
+        .map(|_| {
+            ready_rx
+                .recv_timeout(bound)
+                .expect("bounded independent open")
+        })
+        .collect::<Vec<_>>();
+    assert!(ready.iter().all(|(_, result)| result.is_ok()), "{ready:?}");
+    for start in starts {
+        start.send(()).expect("release independent writer");
+    }
+    let outcomes = (0..2)
+        .map(|_| {
+            result_rx
+                .recv_timeout(bound)
+                .expect("bounded independent ingest")
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        outcomes.iter().all(|(_, result)| result.is_ok()),
+        "{outcomes:?}"
+    );
+    for handle in handles {
+        handle.join().expect("independent writer completion");
+    }
+    let records = read_projection(&root);
+    assert_eq!(records.len(), 2);
+    for id in ["independent-0", "independent-1"] {
+        assert_eq!(records.iter().filter(|record| record.id == id).count(), 1);
+    }
+    let reopened = ProductMemoryStore::open(&root).expect("reopen independent store");
+    let hits = reopened
+        .search(&SearchRequest {
+            query: "independent projection marker".to_owned(),
+            workspace: Some("repo-a".to_owned()),
+            session_id: None,
+            limit: 10,
+            max_bytes: 4096,
+        })
+        .expect("search independent committed records");
+    assert_eq!(hits.len(), 2);
+    for id in ["independent-0", "independent-1"] {
+        assert!(hits.iter().any(|record| record.id == id));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn broker_second_instance_rejected_without_mutation() {
+    let temp = tempdir().expect("temp dir");
+    let root = temp.path().join("store");
+    let store = MemoryStore::open(&root).expect("open broker store");
+    store
+        .ingest(&record("live", "repo-a", "unchanged marker"))
+        .expect("ingest sentinel");
+    let before = std::fs::read(root.join("events.jsonl")).expect("read sentinel projection");
+    assert!(MemoryStore::open(&root).is_err());
+    assert_eq!(
+        std::fs::read(root.join("events.jsonl")).expect("reread projection"),
+        before
+    );
 }
 
 #[test]

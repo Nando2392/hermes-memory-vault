@@ -1,3 +1,5 @@
+mod support;
+
 use hermes_memory::{
     broker_export::{ExportCursor, ExportPage},
     client_export::render_markdown,
@@ -44,11 +46,12 @@ fn files(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBu
     collect(root, root, &mut out);
     out
 }
+#[cfg(any(windows, all(target_os = "linux", feature = "experimental-broker")))]
 #[test]
 fn multiple_pages_spanning_sessions_match_legacy_bytes() {
     let temp = tempfile::tempdir().unwrap();
     // Synthetic local store is only an oracle for the legacy format, not used by the client.
-    let store = hermes_memory::MemoryStore::open(temp.path().join("oracle")).unwrap();
+    let store = support::open_store(temp.path().join("oracle")).unwrap();
     let records = vec![
         record("a", "s[一]", 1.0),
         record("b", "s[一]", 2.0),

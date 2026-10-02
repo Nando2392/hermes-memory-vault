@@ -31,6 +31,7 @@ struct WireError {
 #[serde(rename_all = "snake_case")]
 enum ErrorCode {
     InvalidRequest,
+    ReservedWorkspace,
     UnsupportedVersion,
     Unauthorized,
     ResourceLimit,
@@ -42,6 +43,7 @@ impl ErrorCode {
     fn from_code(code: &str) -> Self {
         match code {
             "invalid_request" => Self::InvalidRequest,
+            "reserved_workspace" => Self::ReservedWorkspace,
             "unsupported_version" => Self::UnsupportedVersion,
             "unauthorized" => Self::Unauthorized,
             "resource_limit" => Self::ResourceLimit,

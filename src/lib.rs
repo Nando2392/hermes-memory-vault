@@ -40,11 +40,8 @@ pub mod windows_enrollment;
 #[cfg(all(windows, feature = "experimental-broker"))]
 pub mod windows_provision;
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, not(windows)))]
 mod posix_open_tests;
-
-#[cfg(target_os = "linux")]
-mod linux_sqlite_vfs;
 
 #[cfg(windows)]
 use cap_std::fs::OpenOptionsExt;
@@ -58,6 +55,8 @@ use std::os::windows::io::AsRawHandle;
 use windows_sys::Win32::Storage::FileSystem::{
     GetFinalPathNameByHandleW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
+
+pub mod workspace_policy;
 
 #[derive(Debug, Error)]
 pub enum MemoryError {
@@ -348,38 +347,48 @@ impl MemoryStore {
     }
 
     pub fn open(root: impl AsRef<Path>) -> Result<Self, MemoryError> {
-        let root = root.as_ref().to_path_buf();
-        let root_dir = open_or_create_absolute_dir(&root)?;
-        let root_guard = capability_root_guard(&root_dir)?;
-        let stable_root = stable_root_path(&root_guard, &root)?;
-        let initialization_lock = capability_lock_file(&root_dir, "memory.init.lock")?;
-        initialization_lock.lock_shared()?;
-        let database_guard = capability_data_file(&root_dir, "memory.db")?;
-        let wal_guard = capability_data_file(&root_dir, "memory.db-wal")?;
-        let shm_guard = capability_data_file(&root_dir, "memory.db-shm")?;
-        #[cfg(all(test, unix))]
-        posix_open_tests::before_sqlite_open();
-        let mut connection = open_database(&root_dir, &database_guard, &stable_root)?;
-        connection.busy_timeout(Duration::from_secs(5))?;
-        reject_future_schema(&connection)?;
-        if connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? < 2 {
-            FileExt::unlock(&initialization_lock)?;
-            initialization_lock.lock_exclusive()?;
-            initialize_schema(&mut connection, &root_dir)?;
+        #[cfg(not(windows))]
+        {
+            let _ = root;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "direct POSIX memory storage is unsupported; use the separately provisioned experimental broker",
+            )
+            .into());
         }
-        let store = Self {
-            root_dir,
-            _root_guard: root_guard,
-            _database_guard: Some(database_guard),
-            _wal_guard: Some(wal_guard),
-            _shm_guard: Some(shm_guard),
-            connection: Mutex::new(connection),
-            #[cfg(all(feature = "experimental-broker", any(target_os = "linux", windows)))]
-            _broker_lock: None,
-        };
-        drop(initialization_lock);
-        store.project_jsonl()?;
-        Ok(store)
+        #[cfg(windows)]
+        {
+            let root = root.as_ref().to_path_buf();
+            let root_dir = open_or_create_absolute_dir(&root)?;
+            let root_guard = capability_root_guard(&root_dir)?;
+            let stable_root = stable_root_path(&root_guard, &root)?;
+            let initialization_lock = capability_lock_file(&root_dir, "memory.init.lock")?;
+            initialization_lock.lock_shared()?;
+            let database_guard = capability_data_file(&root_dir, "memory.db")?;
+            let wal_guard = capability_data_file(&root_dir, "memory.db-wal")?;
+            let shm_guard = capability_data_file(&root_dir, "memory.db-shm")?;
+            let mut connection = open_database(&root_dir, &database_guard, &stable_root)?;
+            connection.busy_timeout(Duration::from_secs(5))?;
+            reject_future_schema(&connection)?;
+            if connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? < 2 {
+                FileExt::unlock(&initialization_lock)?;
+                initialization_lock.lock_exclusive()?;
+                initialize_schema(&mut connection, &root_dir)?;
+            }
+            let store = Self {
+                root_dir,
+                _root_guard: root_guard,
+                _database_guard: Some(database_guard),
+                _wal_guard: Some(wal_guard),
+                _shm_guard: Some(shm_guard),
+                connection: Mutex::new(connection),
+                #[cfg(all(feature = "experimental-broker", any(target_os = "linux", windows)))]
+                _broker_lock: None,
+            };
+            drop(initialization_lock);
+            store.project_jsonl()?;
+            Ok(store)
+        }
     }
 
     pub fn ingest(&self, record: &MemoryRecord) -> Result<bool, MemoryError> {
@@ -400,15 +409,20 @@ impl MemoryStore {
         let mut inserted = 0usize;
         let mut duplicates = 0usize;
         for record in &records {
-            let exists = transaction
+            let existing_workspace = transaction
                 .query_row(
-                    "SELECT 1 FROM records WHERE id = ?1",
+                    "SELECT workspace FROM records WHERE id = ?1",
                     params![record.id],
-                    |_| Ok(()),
+                    |row| row.get::<_, String>(0),
                 )
-                .optional()?
-                .is_some();
-            if exists {
+                .optional()?;
+            if let Some(workspace) = existing_workspace {
+                if workspace != record.workspace {
+                    return Err(MemoryError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "record ID belongs to another workspace",
+                    )));
+                }
                 duplicates += 1;
                 continue;
             }
@@ -501,6 +515,19 @@ impl MemoryStore {
                 metadata: item.metadata.clone(),
             }
             .sanitized()?;
+            let existing_workspace = transaction
+                .query_row(
+                    "SELECT workspace FROM records WHERE id = ?1",
+                    params![record.id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if existing_workspace.is_some_and(|existing| existing != record.workspace) {
+                return Err(MemoryError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "record ID belongs to another workspace",
+                )));
+            }
             let changed = transaction.execute(
                 "INSERT OR IGNORE INTO records
                  (id, session_id, workspace, kind, content, timestamp, metadata_json)
@@ -728,15 +755,6 @@ impl MemoryStore {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn open_database(
-    root: &Dir,
-    database: &CapFile,
-    _stable_root: &Path,
-) -> Result<Connection, MemoryError> {
-    linux_sqlite_vfs::open(root, database)
-}
-
 #[cfg(windows)]
 fn open_database(
     _root: &Dir,
@@ -744,19 +762,6 @@ fn open_database(
     stable_root: &Path,
 ) -> Result<Connection, MemoryError> {
     Ok(Connection::open(stable_root.join("memory.db"))?)
-}
-
-#[cfg(not(any(target_os = "linux", windows)))]
-fn open_database(
-    _root: &Dir,
-    _database: &CapFile,
-    _stable_root: &Path,
-) -> Result<Connection, MemoryError> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "secure SQLite storage is currently supported only on Windows and Linux",
-    )
-    .into())
 }
 
 fn reconcile_projection_checkpoint(
@@ -2147,10 +2152,19 @@ mod projection_state_tests {
         }
     }
 
+    #[cfg(any(windows, all(target_os = "linux", feature = "experimental-broker")))]
     #[test]
     fn projection_state_is_persisted_and_byte_tampering_is_repaired() {
         let temp = tempdir().expect("temp dir");
+        #[cfg(windows)]
         let store = MemoryStore::open(temp.path()).expect("open store");
+        #[cfg(all(target_os = "linux", feature = "experimental-broker"))]
+        let store = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("secure fixture");
+            MemoryStore::open_broker(temp.path()).expect("open broker store")
+        };
         store.ingest(&record()).expect("ingest record");
         let canonical =
             std::fs::read(temp.path().join("events.jsonl")).expect("read canonical projection");
@@ -2182,7 +2196,10 @@ mod projection_state_tests {
         std::fs::write(temp.path().join("events.jsonl"), byte_distinct)
             .expect("tamper projection bytes");
 
+        #[cfg(windows)]
         let repaired = MemoryStore::open(temp.path()).expect("reopen and repair");
+        #[cfg(all(target_os = "linux", feature = "experimental-broker"))]
+        let repaired = MemoryStore::open_broker(temp.path()).expect("reopen and repair");
         drop(repaired);
         assert_eq!(
             std::fs::read(temp.path().join("events.jsonl")).expect("read repaired projection"),

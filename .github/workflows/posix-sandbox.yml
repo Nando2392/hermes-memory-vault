@@ -15,12 +15,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Deterministic concurrent unlink regression
-        run: cargo test --locked concurrent_sidecar_removal_is_idempotent
-      - name: Full correctness suite
-        run: cargo test --locked --all-targets --all-features
-      - name: Repeat concurrent same-process opens
+      - name: Direct POSIX retirement inventory
         run: |
-          for repetition in {1..50}; do
-            timeout 30s cargo test --locked --test memory concurrent_ingest_projects_complete_parseable_jsonl --quiet || exit 1
-          done
+          set -o pipefail
+          cargo test --locked --lib -- --list | tee direct-lib-tests.txt
+          grep -Fx 'posix_open_tests::direct_posix_open_is_unsupported_without_io: test' direct-lib-tests.txt
+          cargo test --locked --test cli -- --list | tee direct-cli-tests.txt
+          grep -Fx 'direct_posix_commands_are_unsupported_without_io: test' direct-cli-tests.txt
+      - name: Direct POSIX retirement is pre-I/O and fail-closed
+        run: |
+          cargo test --locked --lib posix_open_tests::direct_posix_open_is_unsupported_without_io -- --exact --nocapture
+          cargo test --locked --lib posix_open_tests::direct_posix_open_rejects_aliases_before_io -- --exact --nocapture
+          cargo test --locked --lib posix_open_tests::direct_posix_open_preserves_hardlinked_sentinels -- --exact --nocapture
+          cargo test --locked --test cli direct_posix_commands_are_unsupported_without_io -- --exact --nocapture
+      - name: Stock SQLite broker semantic inventory
+        run: |
+          set -o pipefail
+          cargo test --locked --features experimental-broker --test memory -- --list | tee broker-memory-tests.txt
+          grep -Fx 'concurrent_ingest_projects_complete_parseable_jsonl: test' broker-memory-tests.txt
+          grep -Fx 'broker_second_instance_rejected_without_mutation: test' broker-memory-tests.txt
+      - name: Stock SQLite broker semantics and bounded writers
+        run: |
+          timeout --kill-after=5s 30s cargo test --locked --features experimental-broker --test memory concurrent_ingest_projects_complete_parseable_jsonl -- --exact --nocapture
+          cargo test --locked --features experimental-broker --test memory broker_second_instance_rejected_without_mutation -- --exact --nocapture
+          cargo test --locked --features experimental-broker --lib broker_store_tests -- --nocapture
+          cargo test --locked --features experimental-broker --test broker_export -- --nocapture
+      - name: Full portable and broker correctness suites
+        run: |
+          cargo test --locked --all-targets --no-default-features
+          cargo test --locked --all-targets --all-features

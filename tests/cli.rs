@@ -60,6 +60,7 @@ fn cli_version_exits_successfully() {
     );
 }
 
+#[cfg(windows)]
 #[test]
 fn cli_ingest_and_search_exchange_json() {
     let temp = tempdir().expect("temp dir");
@@ -106,6 +107,48 @@ fn cli_ingest_and_search_exchange_json() {
     let hits: Value = serde_json::from_slice(&search.stdout).expect("search JSON");
     assert_eq!(hits.as_array().expect("array").len(), 1);
     assert_eq!(hits[0]["id"], "cli-1");
+}
+
+#[cfg(not(windows))]
+#[test]
+fn direct_posix_commands_are_unsupported_without_io() {
+    let temp = tempdir().expect("temp dir");
+    for (index, command, input) in [
+        (
+            0,
+            "ingest",
+            json!({
+                "id": "valid-id",
+                "session_id": "valid-session",
+                "workspace": "valid-workspace",
+                "kind": "user",
+                "content": "valid content",
+                "timestamp": 1.0
+            })
+            .to_string(),
+        ),
+        (
+            1,
+            "snapshot",
+            json!({
+                "session_id": "valid-session",
+                "workspace": "valid-workspace",
+                "items": []
+            })
+            .to_string(),
+        ),
+    ] {
+        let root_path = temp.path().join(format!("unsupported-{index}"));
+        let root = root_path.to_string_lossy().to_string();
+        let output = run_with_stdin(&[command, "--root", &root], &input);
+        assert!(!output.status.success(), "{command} unexpectedly succeeded");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("unsupported"),
+            "unexpected {command} error: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!root_path.exists(), "{command} created its root");
+    }
 }
 
 #[test]

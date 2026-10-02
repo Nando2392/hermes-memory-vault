@@ -190,6 +190,7 @@ fn broker_policy_is_applied_to_every_connection() {
     }
 }
 
+#[cfg(windows)]
 #[test]
 fn future_schema_rejected_before_mutation() {
     let temp = tempfile::tempdir().unwrap();

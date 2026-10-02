@@ -1,0 +1,300 @@
+name: Windows broker small case (disposable only)
+
+# Future CI only: source preflight is NOT workflow review or dispatch approval.
+# Independently review this workflow before publishing or acknowledging below.
+on:
+  workflow_dispatch:
+    inputs:
+      reviewed:
+        description: 'Independent source AND workflow review completed; disposable 6 MiB only'
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  small:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/test/posix-sqlite-hardening' && inputs.reviewed == true
+    runs-on: windows-2022
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Verify native hosted gates and reviewed source provenance
+        shell: python
+        run: |
+          import hashlib, json, os, pathlib, subprocess
+          root = pathlib.Path.cwd()
+          evidence = root / 'target/ci-small-raw'
+          evidence.mkdir(parents=True, exist_ok=False)
+          provenance = {'schema': 1, 'case': 'small-6MiB', 'gate_pass': False}
+          def digest(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+          try:
+              expected = {
+                  'GITHUB_ACTIONS': 'true', 'RUNNER_ENVIRONMENT': 'github-hosted',
+                  'RUNNER_OS': 'Windows', 'ImageOS': 'win22',
+                  'GITHUB_EVENT_NAME': 'workflow_dispatch',
+                  'GITHUB_REF': 'refs/heads/test/posix-sqlite-hardening',
+              }
+              # Observe runner-provided values; NEVER assign hosted-gate variables.
+              provenance['host'] = {key: os.environ.get(key) for key in expected}
+              for key, value in expected.items():
+                  if os.environ.get(key) != value:
+                      raise RuntimeError(f'Hosted gate rejected {key}')
+              def git(*args):
+                  return subprocess.check_output(['git', *args], text=True, timeout=15).strip()
+              provenance['commit'] = git('rev-parse', 'HEAD')
+              if provenance['commit'] != os.environ['GITHUB_SHA']:
+                  raise RuntimeError('Checkout differs from dispatched commit')
+              # This reviewed source has none of these build-input overrides.
+              for name in ('.cargo', 'build.rs', 'rust-toolchain', 'rust-toolchain.toml'):
+                  if (root / name).exists():
+                      raise RuntimeError(f'Unreviewed build override: {name}')
+              paths = sorted([p.relative_to(root).as_posix()
+                              for folder in ('src', 'examples')
+                              for p in (root / folder).rglob('*') if p.is_file()]
+                             + ['Cargo.toml', 'Cargo.lock'])
+              if any((root / p).is_symlink() for p in paths):
+                  raise RuntimeError('Source symlink refused')
+              inventory = [{'path': p, 'sha256': digest(root / p)} for p in paths]
+              provenance['source_files'] = inventory
+              source_digest = hashlib.sha256(json.dumps(inventory, separators=(',', ':')).encode()).hexdigest()
+              provenance['source_sha256'] = source_digest
+              # Derived from all 44 build-source files after platform-test fixes.
+              # Changing this pin requires another independent source review.
+              if source_digest != 'cde4e143744cb36597a4aedabfe3cfdc501b18f4388ebd86242ec740378fd8e7':
+                  raise RuntimeError('Build inputs differ from reviewed small-case snapshot')
+              provenance['workflow_sha256'] = digest(root / '.github/workflows/windows-broker-benchmark.yml')
+              provenance['gate_pass'] = True
+          except Exception as error:
+              provenance['error'] = str(error)[:4096]
+              raise
+          finally:
+              (evidence / 'provenance.json').write_text(json.dumps(provenance, indent=2), encoding='utf-8')
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build actual release executables with locked dependencies
+        timeout-minutes: 18
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          cargo build --locked --release --features experimental-broker --example windows_broker_benchmark --bin hermes-memory-admin --bin hermes-memory-broker --bin hermes-memory-client
+          $originalExit = $LASTEXITCODE
+          try {
+            @{ schema = 1; exit_code = $originalExit } | ConvertTo-Json | Set-Content -Encoding utf8 target/ci-small-raw/build-status.json
+          } catch {
+            Write-Warning 'Could not persist build status'
+            if ($originalExit -eq 0) { exit 1 }
+          }
+          exit $originalExit
+
+      - name: Run only synthetic small case with bounded direct-child supervision
+        timeout-minutes: 12
+        shell: python
+        run: |
+          import hashlib, json, pathlib, subprocess, sys, threading, time
+          root = pathlib.Path.cwd()
+          evidence = root / 'target/ci-small-raw'
+          result_path = evidence / 'result.json'
+          stream_limit = 1024 * 1024
+          result_limit = 16 * 1024 * 1024
+          deadline_seconds = 600
+          status = {'schema': 1, 'case': 'small-6MiB', 'child_exit_code': None,
+                    'timed_out': False, 'validated': False, 'deadline_seconds': deadline_seconds,
+                    'cleanup': 'Harness-owned services only; fixtures retained for hosted VM disposal'}
+          code = 1
+          child = None
+          threads = []
+          captures = {name: {'bytes': bytearray(), 'eof': False, 'overflow': False, 'error': None}
+                      for name in ('stdout', 'stderr')}
+          lock = threading.Lock()
+          bad_capture = threading.Event()
+          def read_stream(pipe, name):
+              state = captures[name]
+              try:
+                  while True:
+                      chunk = pipe.read1(16384)
+                      if not chunk:
+                          with lock:
+                              state['eof'] = True
+                          return
+                      with lock:
+                          remaining = stream_limit - len(state['bytes'])
+                          state['bytes'].extend(chunk[:remaining])
+                          if len(chunk) > remaining:
+                              state['overflow'] = True
+                              bad_capture.set()
+              except Exception as error:
+                  with lock:
+                      state['error'] = str(error)[:4096]
+                  bad_capture.set()
+          try:
+              binaries = {
+                  'harness': root / 'target/release/examples/windows_broker_benchmark.exe',
+                  'admin': root / 'target/release/hermes-memory-admin.exe',
+                  'broker': root / 'target/release/hermes-memory-broker.exe',
+                  'client': root / 'target/release/hermes-memory-client.exe',
+              }
+              pins = {}
+              for role, path in binaries.items():
+                  if not path.is_file() or path.is_symlink():
+                      raise RuntimeError(f'Missing or nonregular {role} executable')
+                  with path.open('rb') as source:
+                      pins[role] = hashlib.file_digest(source, 'sha256').hexdigest()
+              provenance_path = evidence / 'provenance.json'
+              provenance = json.loads(provenance_path.read_text(encoding='utf-8'))
+              provenance['executable_sha256'] = pins
+              provenance_path.write_text(json.dumps(provenance, indent=2), encoding='utf-8')
+              if result_path.exists():
+                  raise RuntimeError('Refusing to clobber result')
+              args = [str(binaries['harness']), '--run', '--allow-disposable-services',
+                      '--allow-virtual-accounts', '--allow-acl-mutation', '--reviewed',
+                      '--result', str(result_path), '--broker-exe', str(binaries['broker']),
+                      '--client-exe', str(binaries['client']), '--admin-exe', str(binaries['admin'])]
+              status['argv'] = args
+              # No shell, PID search, tree kill, service cleanup or ACL repair.
+              # On Windows Popen.kill uses ONLY this retained direct-child handle.
+              child = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, cwd=root, shell=False)
+              started = time.monotonic()
+              for name in captures:
+                  thread = threading.Thread(target=read_stream, args=(getattr(child, name), name), daemon=True)
+                  threads.append(thread)
+                  thread.start()
+              while child.poll() is None:
+                  if time.monotonic() - started >= deadline_seconds:
+                      status['timed_out'] = True
+                      break
+                  if bad_capture.is_set():
+                      break
+                  time.sleep(0.02)
+              if child.poll() is None:
+                  child.kill()
+                  child.wait(timeout=2)
+              status['child_exit_code'] = child.returncode
+              # A descendant retaining a writer cannot make EOF/join unbounded.
+              drain_deadline = time.monotonic() + 0.5
+              for thread in threads:
+                  thread.join(max(0, drain_deadline - time.monotonic()))
+              status['elapsed_seconds'] = time.monotonic() - started
+              if status['timed_out']:
+                  code = 124
+                  raise RuntimeError('600-second child deadline; dispose VM; no cleanup success claimed')
+              if child.returncode != 0:
+                  code = child.returncode
+                  raise RuntimeError('Harness failed; original exit code retained')
+              with lock:
+                  if any(not c['eof'] or c['overflow'] or c['error'] for c in captures.values()):
+                      raise RuntimeError('Incomplete, oversized or failed harness capture')
+              if not result_path.is_file() or result_path.is_symlink():
+                  raise RuntimeError('Missing regular controller result')
+              with result_path.open('rb') as source:
+                  raw = source.read(result_limit + 1)
+              if len(raw) > result_limit:
+                  raise RuntimeError('Controller result exceeds 16 MiB evidence/validation cap')
+              report = json.loads(raw)
+              if (report.get('schema') != 1 or report.get('case') != 'small-6MiB'
+                      or report.get('pass') is not True or 'error' in report
+                      or report.get('source_unchanged') is not True
+                      or report.get('client_registration_deleted') is not True
+                      or report.get('client', {}).get('pass') is not True):
+                  raise RuntimeError('Controller did not prove a completed small case')
+              if report.get('executable_sha256') != {role: pins[role] for role in ('admin', 'broker', 'client')}:
+                  raise RuntimeError('Controller executable pins differ from built executables')
+              # Expected denial commands may exit nonzero, but may NEVER have
+              # incomplete/overflow/error captures mistaken for authorization denial.
+              for group in (report.get('commands'), report['client'].get('commands')):
+                  if not isinstance(group, list) or not group:
+                      raise RuntimeError('Missing actual command evidence')
+                  for command in group:
+                      if any(command.get(k) is not True for k in ('capture_complete', 'child_exited')):
+                          raise RuntimeError('Incomplete nested command capture')
+                      if any(command.get(k) is not False for k in ('timed_out', 'stop_requested', 'stdout_overflow', 'stderr_overflow')):
+                          raise RuntimeError('Nested command exceeded capture/deadline policy')
+                      if any(command.get(k) is not None for k in ('spawn_error', 'capture_error', 'kill_error', 'wait_error')):
+                          raise RuntimeError('Nested command infrastructure error')
+              status['validated'] = True
+              code = 0
+          except Exception as error:
+              status['error'] = str(error)[:4096]
+              # Retain a real failure status even if evidence validation also fails.
+              if child is not None and child.poll() is not None:
+                  status['child_exit_code'] = child.returncode
+                  if child.returncode != 0 and not status['timed_out']:
+                      code = child.returncode
+          finally:
+              # Exception path also bounds the single owned process, never SCM children.
+              if child is not None and child.poll() is None:
+                  try:
+                      child.kill()
+                      child.wait(timeout=2)
+                      status['child_exit_code'] = child.returncode
+                  except Exception as error:
+                      status['shutdown_error'] = str(error)[:4096]
+              status['workflow_exit_code'] = code
+              try:
+                  with lock:
+                      status['capture'] = {}
+                      for name, state in captures.items():
+                          (evidence / (name + '.bin')).write_bytes(state['bytes'])
+                          status['capture'][name] = {k: v for k, v in state.items() if k != 'bytes'}
+                  (evidence / 'execution.json').write_text(json.dumps(status, indent=2), encoding='utf-8')
+              except Exception as error:
+                  print('Evidence persistence failed:', str(error)[:4096], file=sys.stderr)
+                  if code == 0:
+                      code = 1
+          sys.exit(code)
+
+      - name: Stage only bounded allowlisted evidence, including failures
+        if: always()
+        timeout-minutes: 2
+        shell: python
+        run: |
+          import json, pathlib, stat
+          root = pathlib.Path.cwd()
+          source = root / 'target/ci-small-raw'
+          stage = root / 'target/ci-small-upload'
+          stage.mkdir(parents=True, exist_ok=False)
+          # At most 21 MiB payload plus this tiny index. Never walk fixtures,
+          # drives, user profiles, event logs, environments, or service directories.
+          limits = {'provenance.json': 1048576, 'build-status.json': 1048576,
+                    'execution.json': 1048576, 'result.json': 16777216,
+                    'stdout.bin': 1048576, 'stderr.bin': 1048576}
+          index = {'schema': 1, 'files': [], 'fixtures': 'Not collected; disposable VM retention only'}
+          for name, limit in limits.items():
+              path = source / name
+              entry = {'name': name, 'cap_bytes': limit}
+              try:
+                  info = path.lstat()
+                  if not stat.S_ISREG(info.st_mode) or path.is_symlink():
+                      raise RuntimeError('Not a regular evidence file')
+                  with path.open('rb') as handle:
+                      payload = handle.read(limit + 1)
+                  truncated = len(payload) > limit
+                  target = name + '.prefix' if truncated else name
+                  (stage / target).write_bytes(payload[:limit])
+                  entry.update({'uploaded_as': target, 'retained_bytes': min(len(payload), limit),
+                                'original_bytes': info.st_size, 'truncated': truncated})
+              except FileNotFoundError:
+                  entry['missing'] = True
+              except Exception as error:
+                  entry['error'] = str(error)[:4096]
+              index['files'].append(entry)
+          (stage / 'artifact-index.json').write_text(json.dumps(index, indent=2), encoding='utf-8')
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-broker-small-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/ci-small-upload/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6

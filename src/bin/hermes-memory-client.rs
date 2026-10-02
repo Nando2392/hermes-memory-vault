@@ -225,7 +225,8 @@ fn prepare(command: Command, input: impl Read) -> Result<Prepared, ClientError> 
             (root, workspace, Operation::Export { vault })
         }
     };
-    text(&workspace, 256)?;
+    hermes_memory::workspace_policy::validate_workspace(&workspace)
+        .map_err(ClientError::Invalid)?;
     Ok(Prepared {
         root,
         workspace,
@@ -330,6 +331,7 @@ fn exchange(
         let error = response.error.ok_or(ClientError::OutcomeUnknown)?;
         if ![
             "invalid_request",
+            "reserved_workspace",
             "unsupported_version",
             "unauthorized",
             "resource_limit",
@@ -369,6 +371,35 @@ fn request_bytes(op: &str, body: &Value) -> Result<Vec<u8>, ClientError> {
     Ok(bytes)
 }
 #[cfg(windows)]
+fn enrolled_request_bytes(
+    enrollment: &hermes_memory::windows_enrollment::ClientEnrollment,
+    workspace: &str,
+    op: &str,
+    body: &Value,
+) -> Result<Vec<u8>, ClientError> {
+    use hermes_memory::workspace_policy::{valid_root_key, validate_workspace, ScopeMode};
+    validate_workspace(workspace).map_err(ClientError::Invalid)?;
+    if enrollment.scope_mode == ScopeMode::Fixed
+        && !enrollment.workspaces.iter().any(|w| w == workspace)
+    {
+        return Err(ClientError::Unauthorized);
+    }
+    let key = match enrollment.legacy_root_key.as_deref() {
+        Some(key) if valid_root_key(key) => key,
+        None if enrollment.scope_mode == ScopeMode::Fixed => return request_bytes(op, body),
+        _ => return Err(ClientError::Unauthorized),
+    };
+    let bytes = serde_json::to_vec(
+        &json!({"protocol":1,"request_id":"client","op":op,"body":body,
+        "policy":{"scope_mode":enrollment.scope_mode,"legacy_root_key":key}}),
+    )
+    .map_err(|_| ClientError::Invalid("serialization"))?;
+    if bytes.len() > MAX_FRAME {
+        return Err(ClientError::ResourceLimit);
+    }
+    Ok(bytes)
+}
+#[cfg(windows)]
 fn admission_error(error: io::Error) -> ClientError {
     if error.kind() == io::ErrorKind::PermissionDenied {
         ClientError::Unauthorized
@@ -389,11 +420,9 @@ fn run(cli: Cli) -> Result<Value, ClientError> {
         None => hermes_memory::windows_enrollment::load_for_root(&prepared.root),
     }
     .map_err(admission_error)?;
-    if !enrollment.workspaces.contains(&prepared.workspace) {
-        return Err(ClientError::Unauthorized);
-    }
+    let workspace = prepared.workspace.clone();
     execute(prepared, |op, body| {
-        let bytes = request_bytes(op, &body)?;
+        let bytes = enrolled_request_bytes(&enrollment, &workspace, op, &body)?;
         let mut stream = hermes_memory::windows_pipe::connect_authenticated(
             &enrollment.pipe,
             &enrollment.server_sid,
@@ -459,6 +488,48 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn protected_enrollment_pins_every_client_operation() {
+        use hermes_memory::windows_enrollment::ClientEnrollment;
+        let mut enrollment: ClientEnrollment = serde_json::from_value(json!({"schema":1,"profile_root":"C:/fixture","service_name":"fixture","server_sid":"S-1-5-80-1-2-3-4-5","client_sid":"S-1-5-21-1-2-3-1001","pipe":r"\\.\pipe\HermesMemory.fixture","workspaces":["initial"],"release_sha256":"a".repeat(64),"scope_mode":"vault-owner","legacy_root_key":"b".repeat(64)})).unwrap();
+        for op in ["ingest", "snapshot", "search", "export_page"] {
+            let bytes = enrolled_request_bytes(&enrollment, "new-label", op, &json!({})).unwrap();
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["policy"]["scope_mode"], "vault-owner");
+            assert_eq!(value["policy"]["legacy_root_key"], "b".repeat(64));
+        }
+        enrollment.scope_mode = hermes_memory::workspace_policy::ScopeMode::Fixed;
+        assert!(enrolled_request_bytes(&enrollment, "new-label", "search", &json!({})).is_err());
+        assert!(enrolled_request_bytes(&enrollment, "initial", "search", &json!({})).is_ok());
+        enrollment.legacy_root_key = None;
+        let legacy: Value = serde_json::from_slice(
+            &enrolled_request_bytes(&enrollment, "initial", "search", &json!({})).unwrap(),
+        )
+        .unwrap();
+        assert!(legacy.get("policy").is_none());
+        enrollment.scope_mode = hermes_memory::workspace_policy::ScopeMode::VaultOwner;
+        assert!(enrolled_request_bytes(&enrollment, "new-label", "search", &json!({})).is_err());
+    }
+    #[test]
+    fn client_accepts_full_unicode_labels_and_rejects_reserved_paths() {
+        let command = |workspace: String| Command::Search {
+            root: "C:/fixture".into(),
+            query: "x".into(),
+            workspace: Some(workspace),
+            session_id: None,
+            limit: 1,
+            max_bytes: 100,
+        };
+        assert!(prepare(command("🌍".repeat(128)), io::empty()).is_ok());
+        for label in [
+            "*",
+            "a/b",
+            "redacted-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert!(prepare(command(label.into()), io::empty()).is_err());
+        }
+    }
     #[test]
     fn wire_results_preserve_legacy_stdout_and_ack_only_validated_replies() {
         struct Wire {

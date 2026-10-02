@@ -74,6 +74,10 @@ pub struct ClientEnrollment {
     pub client_sid: String,
     pub pipe: String,
     pub workspaces: Vec<String>,
+    #[serde(default)]
+    pub scope_mode: crate::workspace_policy::ScopeMode,
+    #[serde(default)]
+    pub legacy_root_key: Option<String>,
     pub release_sha256: String,
 }
 fn parse(bytes: &[u8], root: &Path, user: &str) -> io::Result<ClientEnrollment> {
@@ -84,6 +88,15 @@ fn parse(bytes: &[u8], root: &Path, user: &str) -> io::Result<ClientEnrollment> 
         c.schema == 1
             && canonical_profile_key(Path::new(&c.profile_root))? == canonical_profile_key(root)?,
         "schema or profile mismatch",
+    )?;
+    require(
+        match c.legacy_root_key.as_deref() {
+            Some(key) => {
+                crate::workspace_policy::valid_root_key(key) && key == canonical_profile_key(root)?
+            }
+            None => c.scope_mode == crate::workspace_policy::ScopeMode::Fixed,
+        },
+        "scope/root policy mismatch",
     )?;
     let tail = c.server_sid.strip_prefix("S-1-5-80-").unwrap_or("");
     require(
@@ -112,15 +125,9 @@ fn parse(bytes: &[u8], root: &Path, user: &str) -> io::Result<ClientEnrollment> 
     require(
         !c.workspaces.is_empty()
             && c.workspaces.len() <= 256
-            && c.workspaces.iter().all(|w| {
-                !w.is_empty()
-                    && w.len() <= 256
-                    && w.trim() == w
-                    && !w
-                        .chars()
-                        .any(|ch| ch.is_control() || matches!(ch, '*' | '?'))
-                    && seen.insert(w)
-            }),
+            && c.workspaces
+                .iter()
+                .all(|w| crate::workspace_policy::validate_workspace(w).is_ok() && seen.insert(w)),
         "invalid workspace allowlist",
     )?;
     require(
@@ -667,6 +674,55 @@ mod tests {
     }
     #[test]
     fn strict_config_binds_identity_root_and_bounded_fields() {
+        let mut owner = serde_json::json!({"schema":1,"profile_root":"C:/profile","service_name":"Hermes-1","server_sid":"S-1-5-80-1-2-3-4-5","client_sid":"S-1-5-21-1-2-3-1001","pipe":r"\\.\pipe\HermesMemory.test","workspaces":["main"],"release_sha256":"a".repeat(64),"scope_mode":"vault-owner","legacy_root_key":canonical_profile_key(Path::new("C:/profile")).unwrap()});
+        assert!(parse(
+            &serde_json::to_vec(&owner).unwrap(),
+            Path::new("C:/profile"),
+            "S-1-5-21-1-2-3-1001"
+        )
+        .is_ok());
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("a".repeat(64)),
+        ] {
+            owner["legacy_root_key"] = invalid;
+            assert!(parse(
+                &serde_json::to_vec(&owner).unwrap(),
+                Path::new("C:/profile"),
+                "S-1-5-21-1-2-3-1001"
+            )
+            .is_err());
+        }
+        owner["legacy_root_key"] =
+            serde_json::json!(canonical_profile_key(Path::new("C:/profile")).unwrap());
+        owner["workspaces"] = serde_json::json!(["🌍".repeat(128), "plain"]);
+        assert!(parse(
+            &serde_json::to_vec(&owner).unwrap(),
+            Path::new("C:/profile"),
+            "S-1-5-21-1-2-3-1001"
+        )
+        .is_ok());
+        for invalid in [
+            "a/b",
+            "redacted-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            owner["workspaces"] = serde_json::json!([invalid]);
+            assert!(parse(
+                &serde_json::to_vec(&owner).unwrap(),
+                Path::new("C:/profile"),
+                "S-1-5-21-1-2-3-1001"
+            )
+            .is_err());
+        }
+        owner["workspaces"] = serde_json::json!(["main"]);
+        owner.as_object_mut().unwrap().remove("legacy_root_key");
+        assert!(parse(
+            &serde_json::to_vec(&owner).unwrap(),
+            Path::new("C:/profile"),
+            "S-1-5-21-1-2-3-1001"
+        )
+        .is_err());
         let valid = serde_json::json!({"schema":1,"profile_root":"C:/profile","service_name":"Hermes-1","server_sid":"S-1-5-80-1-2-3-4-5","client_sid":"S-1-5-21-1-2-3-1001","pipe":r"\\.\pipe\HermesMemory.test","workspaces":["main"],"release_sha256":"a".repeat(64)});
         let root = Path::new(r"C:\profile");
         let user = "S-1-5-21-1-2-3-1001";

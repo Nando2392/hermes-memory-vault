@@ -35,15 +35,31 @@ fn respond(stream: &mut (impl Read + Write), response: &Response) -> Result<(), 
 trait PeerStream: Read + Write {
     fn reauthenticate(&mut self) -> io::Result<()>;
 }
+#[cfg(test)]
 fn serve_one(
     stream: &mut impl PeerStream,
     store: &hermes_memory::MemoryStore,
     workspace: &str,
 ) -> Result<(), &'static str> {
+    serve_one_policy(
+        stream,
+        store,
+        workspace,
+        hermes_memory::workspace_policy::ScopeMode::Fixed,
+        None,
+    )
+}
+fn serve_one_policy(
+    stream: &mut impl PeerStream,
+    store: &hermes_memory::MemoryStore,
+    workspace: &str,
+    mode: hermes_memory::workspace_policy::ScopeMode,
+    key: Option<&str>,
+) -> Result<(), &'static str> {
     stream.reauthenticate().map_err(|_| "unauthorized")?;
     let bytes = read_frame(stream).map_err(|_| "invalid_request")?;
     stream.reauthenticate().map_err(|_| "unauthorized")?;
-    let response = match protocol::decode(&bytes, workspace) {
+    let response = match protocol::decode_with_policy(&bytes, workspace, mode, key) {
         Ok(request) => dispatch(store, request),
         Err(code) => rejection(&bytes, code),
     };
@@ -460,7 +476,13 @@ fn worker(
                 if !stop.load(Ordering::Acquire) {
                     // A connection failure is never retried and never stops the
                     // whole service. The authenticated stream bounds final ACK.
-                    let _ = serve_one(&mut stream, &store, &config.workspace);
+                    let _ = serve_one_policy(
+                        &mut stream,
+                        &store,
+                        &config.workspace,
+                        config.scope_mode,
+                        config.legacy_root_key.as_deref(),
+                    );
                 }
             }
             Err(e)
@@ -551,6 +573,8 @@ pub struct Config {
     pub server_sid: String,
     pub client_sid: String,
     pub workspace: String,
+    pub scope_mode: hermes_memory::workspace_policy::ScopeMode,
+    pub legacy_root_key: Option<String>,
     pub service_name: String,
 }
 fn numeric_sid(s: &str) -> bool {
@@ -583,6 +607,16 @@ fn endpoint(pipe: &str, sid: &str) -> Result<(), &'static str> {
 }
 fn validate(config: &Config) -> Result<(), &'static str> {
     endpoint(&config.pipe, &config.server_sid)?;
+    use hermes_memory::workspace_policy::{valid_root_key, validate_workspace, ScopeMode};
+    validate_workspace(&config.workspace)?;
+    if config
+        .legacy_root_key
+        .as_deref()
+        .is_some_and(|k| !valid_root_key(k))
+        || (config.scope_mode == ScopeMode::VaultOwner && config.legacy_root_key.is_none())
+    {
+        return Err("invalid_request");
+    }
     for path in std::iter::once(&config.temp_dir).chain(config.bootstrap_config.iter()) {
         hermes_memory::windows_enrollment::canonical_profile_key(path)
             .map_err(|_| "invalid_request")?;
@@ -595,9 +629,6 @@ fn validate(config: &Config) -> Result<(), &'static str> {
         || config.server_sid.split('-').count() != 9
         || !numeric_sid(&config.client_sid)
         || config.client_sid == config.server_sid
-        || config.workspace.trim().is_empty()
-        || config.workspace.len() > 256
-        || config.workspace.contains(['*', '\0'])
         || config.service_name.is_empty()
         || config.service_name.len() > 80
         || !config
@@ -684,6 +715,114 @@ mod tests {
         fn reauthenticate(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+    #[test]
+    fn owner_runtime_dispatches_multiple_workspaces_without_cross_recall() {
+        use hermes_memory::workspace_policy::ScopeMode;
+        use serde_json::Value;
+        let dir = tempfile::tempdir().unwrap();
+        let store = hermes_memory::MemoryStore::open(dir.path()).unwrap();
+        hermes_memory::MemoryStore::prepare_export_index(&store).unwrap();
+        let key = "a".repeat(64);
+        let call = |op: &str, body: Value, pin: Value| {
+            let bytes = serde_json::to_vec(&serde_json::json!({"protocol":1,"request_id":"r","op":op,"body":body,"policy":pin})).unwrap();
+            let mut input = Vec::new();
+            write_frame(&mut input, &bytes).unwrap();
+            input.extend_from_slice(ACK);
+            let mut stream = Duplex {
+                input: io::Cursor::new(input),
+                ..Default::default()
+            };
+            serve_one_policy(
+                &mut stream,
+                &store,
+                "sandbox",
+                ScopeMode::VaultOwner,
+                Some(&key),
+            )
+            .unwrap();
+            serde_json::from_slice::<Value>(&read_frame(&mut stream.output.as_slice()).unwrap())
+                .unwrap()
+        };
+        let pin = serde_json::json!({"scope_mode":"vault-owner","legacy_root_key":key});
+        for (id, workspace) in [("one", "alpha".to_string()), ("two", "🌍".repeat(128))] {
+            let result = call(
+                "ingest",
+                serde_json::json!({"records":[{"id":id,"session_id":"same","workspace":workspace,"kind":"event","content":"sentinel","timestamp":0}]}),
+                pin.clone(),
+            );
+            assert_eq!(result["ok"], true, "{result}");
+            let result = call(
+                "search",
+                serde_json::json!({"workspace":workspace,"query":"sentinel","limit":10,"max_bytes":4096}),
+                pin.clone(),
+            );
+            assert_eq!(result["result"]["hits"].as_array().unwrap().len(), 1);
+            assert_eq!(result["result"]["hits"][0]["id"], id);
+            let body = serde_json::json!({"session_id":"same","workspace":workspace,"items":[{"kind":"checkpoint","content":"snapshot sentinel","timestamp":1,"metadata":{}}]});
+            let snap = call("snapshot", body.clone(), pin.clone());
+            assert_eq!(snap["result"]["inserted"], 1, "{snap}");
+            let retry = call("snapshot", body, pin.clone());
+            assert_eq!(retry["result"]["inserted"], 0);
+            let page = call(
+                "export_page",
+                serde_json::json!({"workspace":workspace,"high_water":null,"after":null,"max_records":1,"max_bytes":65536}),
+                pin.clone(),
+            );
+            assert_eq!(page["ok"], true, "{page}");
+            assert_eq!(page["result"]["records"][0]["workspace"], workspace);
+            let next = page["result"]["next"].clone();
+            assert!(!next.is_null());
+            let other = if workspace == "alpha" {
+                "🌍".repeat(128)
+            } else {
+                "alpha".into()
+            };
+            let replay = call(
+                "export_page",
+                serde_json::json!({"workspace":other,"high_water":page["result"]["high_water"],"after":next,"max_records":1,"max_bytes":65536}),
+                pin.clone(),
+            );
+            assert_eq!(replay["error"]["code"], "invalid_request");
+            let second = call(
+                "export_page",
+                serde_json::json!({"workspace":workspace,"high_water":page["result"]["high_water"],"after":next,"max_records":1,"max_bytes":65536}),
+                pin.clone(),
+            );
+            assert_eq!(second["result"]["records"][0]["workspace"], workspace);
+        }
+        let secret = "token=abcdefghijklmnopqrstuvwxyz123456";
+        let result = call(
+            "ingest",
+            serde_json::json!({"records":[{"id":"secret-workspace","session_id":"same","workspace":secret,"kind":"event","content":"secretmarker","timestamp":0}]}),
+            pin.clone(),
+        );
+        assert_eq!(result["ok"], true);
+        let result = call(
+            "search",
+            serde_json::json!({"workspace":secret,"query":"secretmarker","limit":10,"max_bytes":4096}),
+            pin.clone(),
+        );
+        let canonical = result["result"]["hits"][0]["workspace"].as_str().unwrap();
+        assert!(canonical.starts_with("redacted-"));
+        let alias = call(
+            "search",
+            serde_json::json!({"workspace":canonical,"query":"secretmarker","limit":10,"max_bytes":4096}),
+            pin.clone(),
+        );
+        assert_eq!(alias["error"]["code"], "reserved_workspace");
+        let reserved = call(
+            "search",
+            serde_json::json!({"workspace":format!("redacted-{}", "a".repeat(64)),"query":"sentinel","limit":10,"max_bytes":4096}),
+            pin.clone(),
+        );
+        assert_eq!(reserved["error"]["code"], "reserved_workspace");
+        let denied = call(
+            "search",
+            serde_json::json!({"workspace":"alpha","query":"sentinel","limit":10,"max_bytes":4096}),
+            Value::Null,
+        );
+        assert_eq!(denied["error"]["code"], "unauthorized");
     }
     #[test]
     fn authenticated_server_reuses_dispatch_and_workspace_gate() {
@@ -1094,12 +1233,24 @@ mod tests {
             server_sid: "S-1-5-80-1-2-3-4-5".into(),
             client_sid: "S-1-5-21-1-2-3-1001".into(),
             workspace: "sandbox".into(),
+            scope_mode: Default::default(),
+            legacy_root_key: None,
             service_name: "HermesMemoryTest".into(),
         }
     }
     #[test]
     fn validates_complete_service_configuration_before_io() {
         assert_eq!(validate(&config()), Ok(()));
+        let mut owner = config();
+        owner.scope_mode = hermes_memory::workspace_policy::ScopeMode::VaultOwner;
+        assert!(validate(&owner).is_err());
+        for key in ["", "abc", &"A".repeat(64)] {
+            owner.legacy_root_key = Some(key.into());
+            assert!(validate(&owner).is_err());
+        }
+        owner.legacy_root_key = Some("a".repeat(64));
+        owner.workspace = "🌍".repeat(128);
+        assert!(validate(&owner).is_ok());
         let mut c = config();
         c.workspace = "*".into();
         assert!(validate(&c).is_err());

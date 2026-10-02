@@ -1,7 +1,21 @@
+#![cfg(any(windows, all(target_os = "linux", feature = "experimental-broker")))]
+
+mod support;
+
 use hermes_memory::broker_export::{ExportError, ExportPageRequest, MAX_EXPORT_BYTES};
-use hermes_memory::{MemoryRecord, MemoryStore};
+use hermes_memory::{MemoryError, MemoryRecord, MemoryStore as ProductMemoryStore};
 use serde_json::json;
+use std::path::Path;
+use support::open_store;
 use tempfile::tempdir;
+
+struct MemoryStore;
+
+impl MemoryStore {
+    fn open(root: impl AsRef<Path>) -> Result<ProductMemoryStore, MemoryError> {
+        open_store(root)
+    }
+}
 
 fn request(workspace: &str) -> ExportPageRequest {
     ExportPageRequest {

@@ -31,6 +31,10 @@ enum Command {
         workspace: String,
         #[arg(long)]
         service_name: String,
+        #[arg(long, value_enum, default_value = "fixed")]
+        scope_mode: hermes_memory::workspace_policy::ScopeMode,
+        #[arg(long)]
+        legacy_root_key: Option<String>,
     },
     RequestWindows {
         #[arg(long)]
@@ -84,6 +88,8 @@ fn run(command: Command) -> Result<(), &'static str> {
             client_sid,
             workspace,
             service_name,
+            scope_mode,
+            legacy_root_key,
         } => broker::windows::service(broker::windows::Config {
             root,
             temp_dir,
@@ -93,6 +99,8 @@ fn run(command: Command) -> Result<(), &'static str> {
             client_sid,
             workspace,
             service_name,
+            scope_mode,
+            legacy_root_key,
         }),
         Command::RequestWindows { pipe, server_sid } => {
             broker::windows::request(&pipe, &server_sid)
@@ -135,7 +143,17 @@ mod tests {
             "--bootstrap-config",
             "C:/admin/bootstrap.json",
         ]);
-        assert!(Cli::try_parse_from(args).is_ok());
+        assert!(Cli::try_parse_from(args.clone()).is_ok());
+        args.extend([
+            "--scope-mode",
+            "vault-owner",
+            "--legacy-root-key",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ]);
+        assert!(Cli::try_parse_from(args.clone()).is_ok());
+        let mode_index = args.len() - 3;
+        args[mode_index] = "unknown";
+        assert!(Cli::try_parse_from(args).is_err());
     }
     #[test]
     fn windows_commands_require_explicit_pinned_identity() {
@@ -188,7 +206,9 @@ mod tests {
                 server_sid: "bad".into(),
                 client_sid: "bad".into(),
                 workspace: "*".into(),
-                service_name: "bad".into()
+                service_name: "bad".into(),
+                scope_mode: Default::default(),
+                legacy_root_key: None
             }),
             Err("invalid_request")
         );

@@ -36,6 +36,8 @@ pub struct Inputs {
     pub legacy_root: String,
     pub client_sid: String,
     pub workspace: String,
+    #[serde(default)]
+    pub scope_mode: crate::workspace_policy::ScopeMode,
     pub install_root: String,
     pub service_name: Option<String>,
     pub broker_source: String,
@@ -53,6 +55,8 @@ pub struct Plan {
     pub service_name: String,
     pub client_sid: String,
     pub workspace: String,
+    #[serde(default)]
+    pub scope_mode: crate::workspace_policy::ScopeMode,
     pub enrollment: String,
     pub pipe: String,
     pub broker_sha256: String,
@@ -97,13 +101,7 @@ pub fn plan(i: &Inputs) -> io::Result<Plan> {
         "invalid client TokenUser SID",
     )?;
     require(
-        !i.workspace.is_empty()
-            && i.workspace.len() <= 256
-            && i.workspace.trim() == i.workspace
-            && !i
-                .workspace
-                .chars()
-                .any(|c| c.is_control() || matches!(c, '*' | '?')),
+        crate::workspace_policy::validate_workspace(&i.workspace).is_ok(),
         "invalid single workspace",
     )?;
     require(
@@ -134,6 +132,7 @@ pub fn plan(i: &Inputs) -> io::Result<Plan> {
         service_name,
         client_sid: i.client_sid.clone(),
         workspace: i.workspace.clone(),
+        scope_mode: i.scope_mode,
         broker_sha256: i.broker_sha256.clone(),
         client_sha256: i.client_sha256.clone(),
         release_sha256: i.release_sha256.clone(),
@@ -564,36 +563,34 @@ pub fn default_install_root() -> io::Result<String> {
     Ok(format!("{}HermesMemoryVault", &path[..3]))
 }
 fn service_sid(name: &str) -> io::Result<String> {
-    let account = wide(&format!("NT SERVICE\\{name}"));
-    let mut bytes = 0;
-    let mut domain_len = 0;
-    let mut use_ = 0;
-    // SAFETY: sizing call followed by aligned allocation, outputs retained for SID conversion.
+    use windows_sys::Wdk::Storage::FileSystem::RtlCreateServiceSid;
+    require(
+        !name.is_empty()
+            && name.len() <= 80
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+        "invalid service name",
+    )?;
+    let mut name = wide(name);
+    let unicode = UNICODE_STRING {
+        Length: ((name.len() - 1) * 2) as u16,
+        MaximumLength: (name.len() * 2) as u16,
+        Buffer: name.as_mut_ptr(),
+    };
+    // Derive with Windows itself; LookupAccountName needs prior registration.
+    // Fixed aligned storage exceeds a service SID (six subauthorities, 32 bytes).
+    let mut sid = [0u32; 17];
+    let mut bytes = std::mem::size_of_val(&sid) as u32;
+    // SAFETY: validated bounded UNICODE_STRING and aligned output allocation.
+    // The API receives the allocation's actual byte capacity; all pointers live
+    // through conversion. No account/service lookup, registration or ACL writes.
     unsafe {
-        LookupAccountNameW(
-            null(),
-            account.as_ptr(),
-            null_mut(),
-            &mut bytes,
-            null_mut(),
-            &mut domain_len,
-            &mut use_,
-        );
-        require(
-            bytes > 0 && bytes <= 65536 && domain_len <= 32768,
-            "service SID lookup size",
-        )?;
-        let mut sid = vec![0usize; (bytes as usize).div_ceil(std::mem::size_of::<usize>())];
-        let mut domain = vec![0u16; domain_len as usize];
-        win(LookupAccountNameW(
-            null(),
-            account.as_ptr(),
-            sid.as_mut_ptr().cast(),
-            &mut bytes,
-            domain.as_mut_ptr(),
-            &mut domain_len,
-            &mut use_,
-        ))?;
+        let status = RtlCreateServiceSid(&unicode, sid.as_mut_ptr().cast(), &mut bytes);
+        if status < 0 {
+            return Err(io::Error::from_raw_os_error(
+                RtlNtStatusToDosError(status) as i32
+            ));
+        }
+        require(bytes == 32, "unexpected service SID extent")?;
         let text = sid_text(sid.as_mut_ptr().cast())?;
         require(
             text.starts_with("S-1-5-80-") && text.split('-').count() == 9,
@@ -783,6 +780,9 @@ fn manager(access: u32) -> io::Result<Sc> {
         Ok(Sc(raw))
     }
 }
+fn enrollment_value(p: &Plan, sid: &str) -> serde_json::Value {
+    serde_json::json!({"schema":1,"profile_root":p.legacy_root,"service_name":p.service_name,"server_sid":sid,"client_sid":p.client_sid,"pipe":p.pipe,"workspaces":[p.workspace],"scope_mode":p.scope_mode,"legacy_root_key":p.key,"release_sha256":p.release_sha256})
+}
 fn command(p: &Plan, sid: &str) -> String {
     let root = &p.install_root;
     [
@@ -798,6 +798,10 @@ fn command(p: &Plan, sid: &str) -> String {
         sid.into(),
         "--client-sid".into(),
         p.client_sid.clone(),
+        "--scope-mode".into(),
+        p.scope_mode.as_str().into(),
+        "--legacy-root-key".into(),
+        p.key.clone(),
         "--workspace".into(),
         p.workspace.clone(),
         "--service-name".into(),
@@ -972,7 +976,7 @@ pub fn prepare(inputs: &Inputs, allow: bool) -> io::Result<Receipt> {
         }
         json_readers(
             Path::new(&p.enrollment),
-            &serde_json::json!({"schema":1,"profile_root":p.legacy_root,"service_name":p.service_name,"server_sid":sid,"client_sid":p.client_sid,"pipe":p.pipe,"workspaces":[p.workspace],"release_sha256":p.release_sha256}),
+            &enrollment_value(&p, &sid),
             &[&p.client_sid],
         )?;
         json_new(
@@ -998,6 +1002,12 @@ fn protected_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<T> 
     )?)
     .map_err(io::Error::other)
 }
+fn verify_enrollment(value: &serde_json::Value, plan: &Plan, sid: &str) -> io::Result<()> {
+    require(
+        *value == enrollment_value(plan, sid),
+        "protected enrollment/receipt policy mismatch",
+    )
+}
 fn read_receipt(path: &Path) -> io::Result<Receipt> {
     let r: Receipt = protected_json(path)?;
     let planned = plan(&r.inputs)?;
@@ -1017,6 +1027,8 @@ fn read_receipt(path: &Path) -> io::Result<Receipt> {
         service_sid(&planned.service_name)? == r.server_sid && r.server_sid != planned.client_sid,
         "receipt service SID mismatch",
     )?;
+    let enrollment: serde_json::Value = protected_json(Path::new(&planned.enrollment))?;
+    verify_enrollment(&enrollment, &planned, &r.server_sid)?;
     Ok(r)
 }
 fn service_status(s: &Sc) -> io::Result<SERVICE_STATUS_PROCESS> {
@@ -1633,6 +1645,7 @@ mod tests {
             legacy_root: r"C:\Users\Fixture\memory-vault".into(),
             client_sid: "S-1-5-21-1-2-3-1001".into(),
             workspace: "one".into(),
+            scope_mode: Default::default(),
             install_root: r"C:\HermesMemoryVault".into(),
             service_name: None,
             broker_source: r"C:\release\broker.exe".into(),
@@ -1641,6 +1654,78 @@ mod tests {
             client_sha256: "b".repeat(64),
             release_sha256: "c".repeat(64),
         }
+    }
+    #[test]
+    fn service_sid_derivation_works_before_registration_and_matches_windows() {
+        // Read-only Windows controls: no service creation, mutation or elevation.
+        let mut system = vec![0u16; 32768];
+        // SAFETY: correctly sized output buffer, retained through the call.
+        let n = unsafe { GetSystemWindowsDirectoryW(system.as_mut_ptr(), system.len() as u32) }
+            as usize;
+        assert!(n > 0 && n < system.len());
+        let sc = std::path::PathBuf::from(String::from_utf16(&system[..n]).unwrap())
+            .join("System32/sc.exe");
+        for name in ["HMVReadOnlySidProbeUnregistered", "TrustedInstaller"] {
+            let output = std::process::Command::new(&sc)
+                .args(["showsid", name])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let text = String::from_utf8(output.stdout).unwrap();
+            let expected = text
+                .split_whitespace()
+                .find(|s| s.starts_with("S-1-5-80-"))
+                .unwrap();
+            assert_eq!(service_sid(name).unwrap(), expected);
+            assert_eq!(service_sid(&name.to_ascii_lowercase()).unwrap(), expected);
+        }
+        assert_eq!(
+            service_sid("TrustedInstaller").unwrap(),
+            "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+        );
+        for invalid in ["", "bad name", "bad\0name", "x/y"] {
+            assert!(service_sid(invalid).is_err());
+        }
+    }
+    #[test]
+    fn receipt_requires_exact_protected_enrollment_policy() {
+        let mut i = inputs();
+        i.scope_mode = crate::workspace_policy::ScopeMode::VaultOwner;
+        let p = plan(&i).unwrap();
+        let sid = "S-1-5-80-1-2-3-4-5";
+        let valid = enrollment_value(&p, sid);
+        assert!(verify_enrollment(&valid, &p, sid).is_ok());
+        for (field, value) in [
+            ("scope_mode", serde_json::json!("fixed")),
+            ("legacy_root_key", serde_json::json!("b".repeat(64))),
+            ("client_sid", serde_json::json!(sid)),
+            ("workspaces", serde_json::json!(["*"])),
+            ("pipe", serde_json::json!("other")),
+        ] {
+            let mut stale = valid.clone();
+            stale[field] = value;
+            assert!(verify_enrollment(&stale, &p, sid).is_err());
+        }
+        let mut absent = valid;
+        absent.as_object_mut().unwrap().remove("scope_mode");
+        assert!(verify_enrollment(&absent, &p, sid).is_err());
+    }
+    #[test]
+    fn owner_plan_pins_actual_scm_command_and_enrollment() {
+        let mut value = serde_json::to_value(inputs()).unwrap();
+        value["scope_mode"] = serde_json::json!("vault-owner");
+        let i: Inputs = serde_json::from_value(value).expect("explicit mode supported");
+        let p = plan(&i).unwrap();
+        let cmd = command(&p, "S-1-5-80-1-2-3-4-5");
+        assert!(cmd.contains("\"--scope-mode\" \"vault-owner\""));
+        assert!(cmd.contains(&format!("\"--legacy-root-key\" \"{}\"", p.key)));
+        let enrollment = enrollment_value(&p, "S-1-5-80-1-2-3-4-5");
+        assert_eq!(enrollment["scope_mode"], "vault-owner");
+        assert_eq!(enrollment["legacy_root_key"], p.key);
+        assert_eq!(enrollment["workspaces"], serde_json::json!(["one"]));
+        let mut unicode = i;
+        unicode.workspace = "🌍".repeat(128);
+        assert!(plan(&unicode).is_ok());
     }
     #[test]
     fn plan_is_lexical_and_rejects_ambiguous_or_colliding_inputs() {

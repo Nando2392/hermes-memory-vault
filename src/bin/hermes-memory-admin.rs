@@ -26,7 +26,17 @@ struct Payload {
     legacy_root: String,
     #[arg(long, help = "Canonical SID of the intended client's TokenUser")]
     client_sid: String,
-    #[arg(long, help = "Exactly one fixed allowed workspace")]
+    #[arg(
+        long,
+        value_enum,
+        default_value = "fixed",
+        help = "vault-owner explicitly authorizes this client SID for all bounded workspaces in ONE Vault; no per-profile privacy"
+    )]
+    scope_mode: hermes_memory::workspace_policy::ScopeMode,
+    #[arg(
+        long,
+        help = "Fixed allowed workspace, or initial label in explicit vault-owner mode"
+    )]
     workspace: String,
     #[arg(
         long,
@@ -82,6 +92,7 @@ impl Payload {
             legacy_root: self.legacy_root,
             client_sid: self.client_sid,
             workspace: self.workspace,
+            scope_mode: self.scope_mode,
             install_root: match self.install_root {
                 Some(p) => p,
                 None => default_install_root()?,
@@ -144,6 +155,35 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn owner_cli_requires_explicit_administrator_mode_selection() {
+        let args = [
+            "admin",
+            "plan",
+            "--legacy-root",
+            "C:/old",
+            "--client-sid",
+            "S-1-5-21-1-2-3-1001",
+            "--workspace",
+            "one",
+            "--broker-source",
+            "C:/release/broker.exe",
+            "--broker-sha256",
+            "a",
+            "--client-source",
+            "C:/release/client.exe",
+            "--client-sha256",
+            "b",
+            "--release-sha256",
+            "c",
+        ];
+        assert!(Cli::try_parse_from(args).is_ok());
+        let mut explicit = args.to_vec();
+        explicit.extend(["--scope-mode", "vault-owner"]);
+        assert!(Cli::try_parse_from(explicit.clone()).is_ok());
+        *explicit.last_mut().unwrap() = "unknown";
+        assert!(Cli::try_parse_from(explicit).is_err());
+    }
     #[test]
     fn status_requires_receipt_and_opt_in_is_never_default() {
         use clap::Parser;
