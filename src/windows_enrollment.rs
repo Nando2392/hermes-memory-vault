@@ -8,7 +8,7 @@ fn require(ok: bool, reason: &'static str) -> io::Result<()> {
         Err(io::Error::new(io::ErrorKind::PermissionDenied, reason))
     }
 }
-fn normalized(root: &Path) -> io::Result<String> {
+pub(crate) fn normalized(root: &Path) -> io::Result<String> {
     let text = root
         .to_str()
         .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?
@@ -264,23 +264,34 @@ unsafe fn audit_descriptor(sd: PSECURITY_DESCRIPTOR, directory: bool) -> io::Res
     }
 }
 
+#[cfg(test)]
 fn metadata_allowed(attributes: u32, links: u32, directory: bool, size: u64) -> bool {
+    metadata_allowed_bounded(attributes, links, directory, size, 65536)
+}
+fn metadata_allowed_bounded(
+    attributes: u32,
+    links: u32,
+    directory: bool,
+    size: u64,
+    max_bytes: u64,
+) -> bool {
     attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DEVICE) == 0
         && (attributes & FILE_ATTRIBUTE_DIRECTORY != 0) == directory
-        && (directory || (links == 1 && size <= 65536))
+        && (directory || (links == 1 && size <= max_bytes))
 }
-fn audit_handle(handle: HANDLE, path: &str, directory: bool) -> io::Result<()> {
+fn audit_handle(handle: HANDLE, path: &str, directory: bool, max_bytes: u64) -> io::Result<()> {
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: caller holds a live handle; outputs have the native structure layout.
     unsafe {
         win(GetFileInformationByHandle(handle, &mut info))?;
         require(
             GetFileType(handle) == FILE_TYPE_DISK
-                && metadata_allowed(
+                && metadata_allowed_bounded(
                     info.dwFileAttributes,
                     info.nNumberOfLinks,
                     directory,
                     (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow),
+                    max_bytes,
                 ),
             "wrong type, reparse, hardlinked or oversized enrollment",
         )?;
@@ -386,7 +397,7 @@ fn enrollment_path(root: &Path) -> io::Result<std::path::PathBuf> {
 pub fn load_for_root(root: &Path) -> io::Result<ClientEnrollment> {
     load_from_enrollment(&enrollment_path(root)?, root)
 }
-fn open_audited(path: &str, directory: bool) -> io::Result<OwnedHandle> {
+fn open_audited(path: &str, directory: bool, max_bytes: u64) -> io::Result<OwnedHandle> {
     // SAFETY: validated terminated path, noninheritable synchronous disk handle.
     // Keep every ancestor open without delete sharing; the leaf also denies writers.
     let raw = unsafe {
@@ -405,8 +416,7 @@ fn open_audited(path: &str, directory: bool) -> io::Result<OwnedHandle> {
     }
     // SAFETY: successful CreateFileW transferred unique ownership.
     let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
-    audit_handle(handle.as_raw_handle(), path, directory)
-        .map_err(|e| io::Error::new(e.kind(), format!("enrollment admission at {path}: {e}")))?;
+    audit_handle(handle.as_raw_handle(), path, directory, max_bytes)?;
     Ok(handle)
 }
 fn fixed_ntfs(handle: HANDLE, volume: &str) -> io::Result<()> {
@@ -461,10 +471,29 @@ fn fixed_ntfs(handle: HANDLE, volume: &str) -> io::Result<()> {
 /// No file, directory, ACL, service or profile database is created or modified.
 pub fn load_from_enrollment(path: &Path, root: &Path) -> io::Result<ClientEnrollment> {
     canonical_profile_key(root)?;
-    let text = normalized(path)?;
-    require(text.len() > 3, "enrollment must be a file")?;
     let user = process_user()?;
-    let mut guards = vec![open_audited(&text[..3], true)?];
+    let bytes = bounded_read(open_admin_owned_file(path, 65536)?)?;
+    parse(&bytes, root, &user)
+}
+
+/// Exact audited file plus top-down ancestor pins, with a bounded payload.
+/// Native sharing denies writers/deletion for the full reader lifetime.
+pub struct ProtectedReader {
+    file: io::Take<std::fs::File>,
+    _ancestors: Vec<OwnedHandle>,
+}
+impl io::Read for ProtectedReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        io::Read::read(&mut self.file, out)
+    }
+}
+/// Open an immutable administrator-owned source without client TokenUser matching.
+/// Trust is the native ACL/NTFS/handle-sharing contract, not the path spelling.
+/// No provisioning, environment lookup, or whole-file buffering occurs here.
+pub fn open_admin_owned_file(path: &Path, max_bytes: u64) -> io::Result<ProtectedReader> {
+    let text = normalized(path)?;
+    require(text.len() > 3, "source must be a file")?;
+    let mut guards = vec![open_audited(&text[..3], true, max_bytes)?];
     fixed_ntfs(guards[0].as_raw_handle(), &text[..3])?;
     // Top-down admission: OPEN_REPARSE_POINT protects only each current leaf.
     // Previously audited ancestors stay pinned through the final bounded read.
@@ -476,14 +505,16 @@ pub fn load_from_enrollment(path: &Path, root: &Path) -> io::Result<ClientEnroll
         }
         current.push_str(part);
         let directory = index + 1 < parts.len();
-        let handle = open_audited(&current, directory)?;
+        let handle = open_audited(&current, directory, max_bytes)?;
         if directory {
             guards.push(handle);
         } else {
             // File owns the exact audited handle, not a reopen by pathname.
             let file = std::fs::File::from(handle);
-            let bytes = bounded_read(file)?;
-            return parse(&bytes, root, &user);
+            return Ok(ProtectedReader {
+                file: io::Read::take(file, max_bytes),
+                _ancestors: guards,
+            });
         }
     }
     Err(io::ErrorKind::InvalidInput.into())
@@ -499,6 +530,35 @@ fn bounded_read(reader: impl io::Read) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn protected_reader_rejects_user_owned_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive.jsonl");
+        std::fs::write(&path, b"untrusted").unwrap();
+        assert!(open_admin_owned_file(&path, 1024).is_err());
+        assert!(open_admin_owned_file(Path::new("relative"), 1024).is_err());
+        assert!(metadata_allowed_bounded(
+            FILE_ATTRIBUTE_NORMAL,
+            1,
+            false,
+            65537,
+            1 << 30
+        ));
+        assert!(!metadata_allowed_bounded(
+            FILE_ATTRIBUTE_NORMAL,
+            1,
+            false,
+            1025,
+            1024
+        ));
+        assert!(!metadata_allowed_bounded(
+            FILE_ATTRIBUTE_NORMAL,
+            2,
+            false,
+            1,
+            1024
+        ));
+    }
     #[test]
     fn reserved_device_spellings_are_not_profile_keys() {
         for bad in ["C:/COM¹", "C:/LPT².txt", "C:/CON .txt"] {
@@ -548,6 +608,7 @@ mod tests {
             file.as_file().as_raw_handle(),
             file.path().to_str().unwrap(),
             false,
+            65536,
         );
         assert!(result.is_err(), "user-owned enrollment must fail admission");
     }

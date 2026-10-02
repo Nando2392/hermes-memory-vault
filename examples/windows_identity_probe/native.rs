@@ -379,6 +379,13 @@ mod receipt_tests {
     use super::*;
 
     #[test]
+    fn failed_proof_preserves_owned_fixture_for_vm_disposal() {
+        assert!(!remove_fixture(true, true, false));
+        assert!(!remove_fixture(true, false, true));
+        assert!(remove_fixture(true, true, true));
+    }
+
+    #[test]
     fn completed_receipt_cannot_be_replaced_by_later_stage() {
         let dir = tempfile::tempdir().unwrap();
         write_report(dir.path(), "ready.json", &json!({"stage":1})).unwrap();
@@ -830,6 +837,10 @@ fn stop(service: &ScHandle, deadline: Instant) -> Result<()> {
     }
     ensure(current.dwWin32ExitCode == 0, "service reported failure")
 }
+fn remove_fixture(created: bool, stopped: bool, proof_ok: bool) -> bool {
+    created && stopped && proof_ok
+}
+
 pub fn run() -> Result<()> {
     let admin = identity()?;
     ensure(
@@ -1035,6 +1046,7 @@ pub fn run() -> Result<()> {
             Instant::now() + Duration::from_secs(35),
         )?;
         observations["production_integrity"] = production_probe::integrity(&root)?;
+        observations["migration_integrity"] = production_probe::migration_integrity(&root)?;
         stop(&services[1], Instant::now() + Duration::from_secs(15))?;
         let final_report = read_report(
             &root.join("result-a"),
@@ -1121,7 +1133,11 @@ pub fn run() -> Result<()> {
             }
         }
     }
-    if created_root && stopped {
+    if remove_fixture(
+        created_root,
+        stopped,
+        proof.is_ok() && cleanup_errors.is_empty(),
+    ) {
         if let Err(e) = fs::remove_dir_all(&root) {
             cleanup_errors.push(e.to_string());
         }
@@ -1136,7 +1152,7 @@ pub fn run() -> Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(
-            &json!({"report":report,"observations":observations,"fixture":root,"services":names,"cleanup_errors":cleanup_errors,"full_windows_security_proof":false,"production_broker_supported":false})
+            &json!({"report":report,"observations":observations,"fixture":root,"fixture_retained":root.exists(),"failure_disposal":"owned fixture/receipts retained on failure; dispose hosted VM after evidence collection","services":names,"cleanup_errors":cleanup_errors,"full_windows_security_proof":false,"production_broker_supported":false})
         )?
     );
     ensure(success, "probe or cleanup failed; see JSON receipt")

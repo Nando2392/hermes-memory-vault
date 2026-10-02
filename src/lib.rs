@@ -34,7 +34,11 @@ mod windows_broker_store_tests;
 pub mod windows_pipe;
 
 #[cfg(all(windows, feature = "experimental-broker"))]
+pub mod windows_bootstrap;
+#[cfg(all(windows, feature = "experimental-broker"))]
 pub mod windows_enrollment;
+#[cfg(all(windows, feature = "experimental-broker"))]
+pub mod windows_provision;
 
 #[cfg(all(test, unix))]
 mod posix_open_tests;

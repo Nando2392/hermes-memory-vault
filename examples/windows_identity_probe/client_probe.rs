@@ -105,6 +105,8 @@ pub(super) fn run(root: &Path, config: &Config, before_seed: &Value) -> Result<V
         )?;
         Ok(receipt)
     };
+    let fixture = read_report(&root.join("migration"), "fixture.json", deadline())?;
+    let migration = bootstrap_probe::verify_client(&fixture, good)?;
     let duplicate = good(
         "compat-duplicate",
         "ingest",
@@ -253,7 +255,15 @@ pub(super) fn run(root: &Path, config: &Config, before_seed: &Value) -> Result<V
         "compatibility seed counts differ",
     )?;
     let mut expected = original.clone();
+    expected.extend(
+        fixture["expected_records"]
+            .as_array()
+            .ok_or("migration expected records missing")?
+            .iter()
+            .cloned(),
+    );
     expected.extend(seed_records);
+    ensure(expected.len() == 264, "expected canonical count differs")?;
     let pages = verify_pages(&expected, |index, body| {
         call(
             root,
@@ -285,8 +295,8 @@ pub(super) fn run(root: &Path, config: &Config, before_seed: &Value) -> Result<V
         b"",
     )?;
     ensure(
-        export["response"] == json!({"sessions":3}),
-        "actual export did not report three sessions",
+        export["response"] == json!({"sessions":5}),
+        "actual export did not report five sessions",
     )?;
     let markdown = verify_markdown(&vault, &expected)?;
     ensure(
@@ -294,7 +304,7 @@ pub(super) fn run(root: &Path, config: &Config, before_seed: &Value) -> Result<V
         "compatibility CLI created legacy storage root",
     )?;
     Ok(
-        json!({"duplicate":duplicate,"snapshot_overlap":overlap,"search":search,"acl":acl,"counterfeit":counterfeit_receipt,"wrong_root":root_receipt,"wrong_scope":scope_receipt,"wrong_server":server_receipt,"seed":seed,"pages":pages,"page_wrong_scope":scope_page,"export":export,"markdown":markdown,"profile_root_absent":true,"default_enrollment_path":"NOT_TESTED; explicit --enrollment uses same trust checker"}),
+        json!({"migration":migration,"duplicate":duplicate,"snapshot_overlap":overlap,"search":search,"acl":acl,"counterfeit":counterfeit_receipt,"wrong_root":root_receipt,"wrong_scope":scope_receipt,"wrong_server":server_receipt,"seed":seed,"pages":pages,"page_wrong_scope":scope_page,"export":export,"markdown":markdown,"profile_root_absent":true,"default_enrollment_path":"NOT_TESTED; explicit --enrollment uses same trust checker"}),
     )
 }
 
@@ -434,7 +444,7 @@ fn verify_pages(
             })
     });
     ensure(
-        records == expected && pages.len() >= 3,
+        records == expected && pages.len() == 3,
         "paged full records/metadata differ from admitted records",
     )?;
     Ok(json!({"records":records.len(),"high_water":high_water,"pages":pages}))
@@ -572,6 +582,14 @@ mod tests {
         .unwrap();
         assert_eq!(receipt["records"], 260);
         assert_eq!(receipt["pages"].as_array().unwrap().len(), 3);
+        assert!(verify_pages(&records, |_, mut body| {
+            body["max_records"] = json!(80);
+            let page = store
+                .export_page(&serde_json::from_value(body).unwrap(), "proof")
+                .unwrap();
+            Ok(json!({"response":{"result":page}}))
+        })
+        .is_err());
         assert!(verify_pages(&records, |_, body| {
             let mut page = serde_json::to_value(
                 store
@@ -661,6 +679,22 @@ mod tests {
         snap["session_id"] = json!("production-snapshot");
         snap["content"] = snapshot()["items"][0]["content"].clone();
         expected.push(snap);
+        let source = temp.path().join("legacy");
+        fs::create_dir(&source).unwrap();
+        let (archive, fixture) = bootstrap_probe::build_fixture(&source).unwrap();
+        store
+            .import_logical_archive_once(
+                std::io::Cursor::new(archive),
+                fixture["receipt"]["logical_sha256"].as_str().unwrap(),
+            )
+            .unwrap();
+        expected.extend(
+            fixture["expected_records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .cloned(),
+        );
         let records = expected
             .iter()
             .cloned()
@@ -675,10 +709,18 @@ mod tests {
                 .export_page(r, "test")
                 .unwrap()))
             .unwrap(),
-            3
+            5
         );
+        let pages = verify_pages(&expected, |_, body| {
+            let page = store
+                .export_page(&serde_json::from_value(body).unwrap(), "proof")
+                .unwrap();
+            Ok(json!({"response":{"result":page}}))
+        })
+        .unwrap();
+        assert_eq!(pages["records"], 264);
         let receipt = verify_markdown(&vault, &expected).unwrap();
-        assert_eq!(receipt["records"], 262);
+        assert_eq!(receipt["records"], 264);
         let index = vault.join("Index.md");
         fs::write(&index, "# Hermes Memory Vault\n\n- [[fake]]\n").unwrap();
         assert!(verify_markdown(&vault, &expected).is_err());

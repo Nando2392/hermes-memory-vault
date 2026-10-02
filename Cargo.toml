@@ -26,6 +26,11 @@ name = "hermes-memory-client"
 path = "src/bin/hermes-memory-client.rs"
 required-features = ["experimental-broker"]
 
+[[bin]]
+name = "hermes-memory-admin"
+path = "src/bin/hermes-memory-admin.rs"
+required-features = ["experimental-broker"]
+
 [[example]]
 name = "windows-identity-probe"
 path = "examples/windows_identity_probe.rs"

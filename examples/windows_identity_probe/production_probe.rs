@@ -1,5 +1,7 @@
 //! Actual executable SCM gate; never invoked by unit tests.
 use super::*;
+#[path = "bootstrap_probe.rs"]
+mod bootstrap_probe;
 #[path = "client_probe.rs"]
 mod client_probe;
 
@@ -96,6 +98,7 @@ pub(super) fn prepare(
         &root.join("runtime-store"),
         &format!("(A;OICI;FA;;;{server})"),
     )?;
+    let bootstrap = bootstrap_probe::prepare(root, &server, client)?;
     mkdir(&root.join("admin-client"), "")?;
     let audit = audit_dir(&root.join("runtime-store"), &[&server], &[], false)?;
     let source = std::env::current_exe()?
@@ -117,7 +120,7 @@ pub(super) fn prepare(
         "production-config.json",
         &serde_json::to_value(&config)?,
     )?;
-    let command = format!("\"{}\" service --root \"{}\" --pipe \"{}\" --server-sid {} --client-sid {} --workspace {} --service-name {}", target.display(), root.join("runtime-store").display(), config.pipe, server, client, WORKSPACE, name);
+    let command = bootstrap_probe::service_command(root, name, &server, client, &config.pipe);
     // SAFETY: retained owned service; all strings remain live for this synchronous configuration call.
     win(unsafe {
         ChangeServiceConfigW(
@@ -136,7 +139,7 @@ pub(super) fn prepare(
     })?;
     Ok((
         server,
-        json!({"source":source,"executable":target,"sha256":hash,"command":command,"storage_acl":audit,"compatibility":compatibility}),
+        json!({"source":source,"executable":target,"sha256":hash,"command":command,"storage_acl":audit,"compatibility":compatibility,"bootstrap":bootstrap}),
     ))
 }
 /// Files instead of pipe-backed stdio prevent child-output deadlock. Only this
@@ -278,6 +281,7 @@ pub(super) fn client(root: &Path) -> Result<()> {
         "production client not B",
     )?;
     read_report(root, "production-go.json", deadline())?;
+    let bootstrap_acl = bootstrap_probe::client_acl(root)?;
     let ping = call(root, &config, "first-ping", "ping", json!({}), None)?;
     ensure(
         ping["response"]["result"]["export_supported"] == false
@@ -350,7 +354,7 @@ pub(super) fn client(root: &Path) -> Result<()> {
     write_report(
         &root.join("result-b"),
         "production-first.json",
-        &json!({"ping":ping,"ingest":ingest,"duplicate":duplicate,"snapshot":snap,"snapshot_duplicate":snap_duplicate,"search":found,"scope":scope,"malformed":malformed,"export":export}),
+        &json!({"bootstrap_acl":bootstrap_acl,"ping":ping,"ingest":ingest,"duplicate":duplicate,"snapshot":snap,"snapshot_duplicate":snap_duplicate,"search":found,"scope":scope,"malformed":malformed,"export":export}),
     )?;
     read_report(root, "production-restarted.json", deadline())?;
     let found = search(root, &config, "restart")?;
@@ -449,6 +453,10 @@ pub(super) fn admin_denial(root: &Path) -> Result<Value> {
     )?;
     Ok(proof)
 }
+pub(super) fn migration_integrity(root: &Path) -> Result<Value> {
+    bootstrap_probe::final_proof(root)
+}
+
 pub(super) fn integrity(root: &Path) -> Result<Value> {
     let db = Connection::open_with_flags(
         root.join("runtime-store/memory.db"),
@@ -457,7 +465,7 @@ pub(super) fn integrity(root: &Path) -> Result<Value> {
     let check: String = db.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
     ensure(check == "ok", "production source integrity failed")?;
     let rows: u64 = db.query_row("SELECT count(*) FROM records", [], |r| r.get(0))?;
-    ensure(rows == 262, "production source has extra or missing rows")?;
+    ensure(rows == 264, "production source has extra or missing rows")?;
     Ok(
         json!({"integrity_check":check,"source_rows":rows,"performed":"administrator after C stopped and process exited","mode":"read-only"}),
     )
@@ -466,10 +474,10 @@ pub(super) fn integrity(root: &Path) -> Result<Value> {
 mod tests {
     use super::*;
     #[test]
-    fn final_integrity_requires_all_262_compatibility_rows() {
+    fn final_integrity_requires_all_264_compatibility_rows() {
         let root = tempfile::tempdir().unwrap();
         let store = hermes_memory::MemoryStore::open(root.path().join("runtime-store")).unwrap();
-        let records = (0..262)
+        let records = (0..264)
             .map(|i| {
                 let mut value = record();
                 value["id"] = json!(format!("proof-{i}"));
@@ -478,7 +486,7 @@ mod tests {
             .collect::<Vec<hermes_memory::MemoryRecord>>();
         store.ingest_many(&records).unwrap();
         drop(store);
-        assert_eq!(integrity(root.path()).unwrap()["source_rows"], 262);
+        assert_eq!(integrity(root.path()).unwrap()["source_rows"], 264);
     }
     #[test]
     fn snapshot_replay_matches_actual_store_overlap_semantics_across_reopen() {

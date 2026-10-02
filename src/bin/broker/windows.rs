@@ -361,6 +361,30 @@ fn status(state: u32, checkpoint: u32, exit: u32) -> SERVICE_STATUS {
     }
 }
 
+// Shared production ordering seam; callbacks isolate native gates for negative tests.
+// The returned guard must outlive store/listener. On failure locals drop in reverse order.
+#[allow(clippy::too_many_arguments)] // Explicit security gates, not optional configuration.
+fn startup_with<G, S, L>(
+    token: impl FnOnce() -> Result<(), &'static str>,
+    temp: impl FnOnce() -> Result<G, &'static str>,
+    open: impl FnOnce() -> Result<S, &'static str>,
+    verify: impl FnOnce(&G, &S) -> Result<(), &'static str>,
+    bootstrap: impl FnOnce(&S) -> Result<(), &'static str>,
+    prepare: impl FnOnce(&S) -> Result<(), &'static str>,
+    bind: impl FnOnce() -> Result<L, &'static str>,
+    ready: impl FnOnce() -> Result<(), &'static str>,
+) -> Result<(G, S, L), &'static str> {
+    token()?;
+    let guard = temp()?;
+    let store = open()?;
+    verify(&guard, &store)?;
+    bootstrap(&store)?;
+    prepare(&store)?;
+    let listener = bind()?;
+    ready()?;
+    Ok((guard, store, listener))
+}
+
 fn worker(
     config: &Config,
     stop: &AtomicBool,
@@ -370,23 +394,63 @@ fn worker(
     if stop.load(Ordering::Acquire) {
         return Ok(());
     }
-    // Pin configuration to the actual process TokenUser before any store open.
-    // Canonical numeric SID spelling is required by validate().
-    if process_sid()? != config.server_sid {
-        return Err("unauthorized");
-    }
-    // This is the only production store admission path: dedicated virtual
-    // TokenUser, privileges and preprovisioned namespace policy live in the lib.
-    let store = hermes_memory::MemoryStore::open_broker(&config.root)
-        .map_err(|_| "store_admission_failed")?;
-    store.prepare_export_index().map_err(|_| "unavailable")?;
-    if stop.load(Ordering::Acquire) {
-        return Ok(());
-    }
-    let mut listener =
-        hermes_memory::windows_pipe::bind(&config.pipe, &config.server_sid, &config.client_sid)
-            .map_err(|_| "pipe_bind_failed")?;
-    ready()?;
+    // SCM/control/this worker thread already exist. Native Windows environment
+    // setters are thread-safe; this dedicated process has no other SQLite users
+    // or environment mutators. Admission is before SQLite/database work, NOT
+    // before OS SCM threads. Never restore or mutate TEMP/TMP after admission.
+    let startup = startup_with(
+        || {
+            if process_sid()? == config.server_sid {
+                Ok(())
+            } else {
+                Err("unauthorized")
+            }
+        },
+        || hermes_memory::admit_broker_temp(&config.temp_dir).map_err(|_| "temp_admission_failed"),
+        || {
+            let store = hermes_memory::MemoryStore::open_broker(&config.root)
+                .map_err(|_| "store_admission_failed")?;
+            Ok(store)
+        },
+        |guard, store| {
+            guard
+                .verify_store(store)
+                .map_err(|_| "temp_selection_failed")
+        },
+        |store| {
+            if let Some(path) = &config.bootstrap_config {
+                hermes_memory::windows_bootstrap::bootstrap_from_config(store, path).map_err(
+                    |error| match error {
+                        hermes_memory::windows_bootstrap::BootstrapError::InvalidConfig => {
+                            "bootstrap_config_invalid"
+                        }
+                        hermes_memory::windows_bootstrap::BootstrapError::SourceAdmission => {
+                            "bootstrap_source_admission_failed"
+                        }
+                        hermes_memory::windows_bootstrap::BootstrapError::Import => {
+                            "bootstrap_import_failed"
+                        }
+                    },
+                )?;
+            }
+            Ok(())
+        },
+        |store| store.prepare_export_index().map_err(|_| "unavailable"),
+        || {
+            if stop.load(Ordering::Acquire) {
+                return Err("startup_cancelled");
+            }
+            hermes_memory::windows_pipe::bind(&config.pipe, &config.server_sid, &config.client_sid)
+                .map_err(|_| "pipe_bind_failed")
+        },
+        ready,
+    );
+    // Declaration order keeps the namespace pinned until listener and store drop.
+    let (_temp_guard, store, listener) = match startup {
+        Err("startup_cancelled") => return Ok(()),
+        other => other?,
+    };
+    let mut listener = listener;
     while !stop.load(Ordering::Acquire) {
         // The primitive fixes the absolute deadline at accept; do not shorten
         // it to a 250ms poll and accidentally leave no budget for an 8MiB frame.
@@ -481,6 +545,8 @@ fn process_sid() -> Result<String, &'static str> {
 #[derive(Clone)]
 pub struct Config {
     pub root: PathBuf,
+    pub temp_dir: PathBuf,
+    pub bootstrap_config: Option<PathBuf>,
     pub pipe: String,
     pub server_sid: String,
     pub client_sid: String,
@@ -517,6 +583,10 @@ fn endpoint(pipe: &str, sid: &str) -> Result<(), &'static str> {
 }
 fn validate(config: &Config) -> Result<(), &'static str> {
     endpoint(&config.pipe, &config.server_sid)?;
+    for path in std::iter::once(&config.temp_dir).chain(config.bootstrap_config.iter()) {
+        hermes_memory::windows_enrollment::canonical_profile_key(path)
+            .map_err(|_| "invalid_request")?;
+    }
     let root = config.root.to_str().ok_or("invalid_request")?;
     if !config.root.is_absolute()
         || root.contains('\0')
@@ -870,6 +940,68 @@ mod tests {
         assert_eq!(failed.dwServiceSpecificExitCode, 1);
     }
     #[test]
+    fn startup_order_stops_at_every_failed_gate() {
+        use std::cell::RefCell;
+        let names = [
+            "token",
+            "temp",
+            "store",
+            "vfscheck",
+            "bootstrap",
+            "prepareindex",
+            "bind",
+            "READY",
+        ];
+        for fail in 0..=8 {
+            let seen = RefCell::new(Vec::new());
+            let step = |i| {
+                seen.borrow_mut().push(names[i]);
+                if i == fail {
+                    Err("blocked")
+                } else {
+                    Ok(())
+                }
+            };
+            let result = startup_with(
+                || step(0),
+                || step(1),
+                || step(2),
+                |_, _| step(3),
+                |_| step(4),
+                |_| step(5),
+                || step(6),
+                || step(7),
+            );
+            assert_eq!(result.is_ok(), fail == 8);
+            assert_eq!(*seen.borrow(), names[..(fail + 1).min(8)]);
+        }
+    }
+    #[test]
+    fn failed_native_temp_setup_prevents_sqlite_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = startup_with(
+            || Ok(()),
+            || hermes_memory::admit_broker_temp(dir.path()).map_err(|_| "temp_admission_failed"),
+            || hermes_memory::MemoryStore::open(dir.path()).map_err(|_| "store"),
+            |guard, store| guard.verify_store(store).map_err(|_| "vfs"),
+            |_| Ok(()),
+            |_| Ok(()),
+            || Ok(()),
+            || panic!("READY after rejection"),
+        );
+        assert!(matches!(result, Err("temp_admission_failed")));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+    #[test]
+    fn startup_paths_require_explicit_strict_absolute_names() {
+        let mut c = config();
+        c.temp_dir = "relative".into();
+        assert!(validate(&c).is_err());
+        c = config();
+        c.bootstrap_config = Some("C:/admin/../config.json".into());
+        assert!(validate(&c).is_err());
+    }
+    #[test]
     fn worker_stop_before_start_never_opens_store_or_pipe() {
         let stop = AtomicBool::new(true);
         assert_eq!(
@@ -956,6 +1088,8 @@ mod tests {
     fn config() -> Config {
         Config {
             root: "C:/sandbox".into(),
+            temp_dir: "C:/private-temp".into(),
+            bootstrap_config: None,
             pipe: r"\\.\pipe\HermesMemory.test".into(),
             server_sid: "S-1-5-80-1-2-3-4-5".into(),
             client_sid: "S-1-5-21-1-2-3-1001".into(),

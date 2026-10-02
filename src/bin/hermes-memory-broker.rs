@@ -18,6 +18,10 @@ enum Command {
         #[arg(long)]
         root: PathBuf,
         #[arg(long)]
+        temp_dir: PathBuf,
+        #[arg(long)]
+        bootstrap_config: Option<PathBuf>,
+        #[arg(long)]
         pipe: String,
         #[arg(long)]
         server_sid: String,
@@ -73,6 +77,8 @@ fn run(command: Command) -> Result<(), &'static str> {
     match command {
         Command::Service {
             root,
+            temp_dir,
+            bootstrap_config,
             pipe,
             server_sid,
             client_sid,
@@ -80,6 +86,8 @@ fn run(command: Command) -> Result<(), &'static str> {
             service_name,
         } => broker::windows::service(broker::windows::Config {
             root,
+            temp_dir,
+            bootstrap_config,
             pipe,
             server_sid,
             client_sid,
@@ -102,6 +110,34 @@ fn main() {
 mod tests {
     use super::*;
     #[test]
+    fn service_requires_private_temp() {
+        let args = [
+            "broker",
+            "service",
+            "--root",
+            "C:/sandbox",
+            "--pipe",
+            r"\\.\pipe\HermesMemory.test",
+            "--server-sid",
+            "S-1-5-80-1-2-3-4-5",
+            "--client-sid",
+            "S-1-5-21-1-2-3-1001",
+            "--workspace",
+            "sandbox",
+            "--service-name",
+            "HermesMemoryTest",
+        ];
+        assert!(Cli::try_parse_from(args).is_err());
+        let mut args = args.to_vec();
+        args.extend([
+            "--temp-dir",
+            "C:/private-temp",
+            "--bootstrap-config",
+            "C:/admin/bootstrap.json",
+        ]);
+        assert!(Cli::try_parse_from(args).is_ok());
+    }
+    #[test]
     fn windows_commands_require_explicit_pinned_identity() {
         assert!(Cli::try_parse_from([
             "broker",
@@ -118,6 +154,8 @@ mod tests {
             "service",
             "--root",
             "C:/sandbox",
+            "--temp-dir",
+            "C:/private-temp",
             "--pipe",
             r"\\.\pipe\HermesMemory.test",
             "--server-sid",
@@ -144,6 +182,8 @@ mod tests {
         assert_eq!(
             run(Command::Service {
                 root: "relative".into(),
+                temp_dir: "C:/private-temp".into(),
+                bootstrap_config: None,
                 pipe: "remote".into(),
                 server_sid: "bad".into(),
                 client_sid: "bad".into(),
