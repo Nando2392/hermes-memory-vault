@@ -174,6 +174,17 @@ fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn operation_error_message(error: &(dyn Error + 'static)) -> &'static str {
+    match error.downcast_ref::<hermes_memory::MemoryError>() {
+        Some(hermes_memory::MemoryError::Io(error))
+            if error.kind() == io::ErrorKind::Unsupported =>
+        {
+            "hermes-memory: operation unsupported"
+        }
+        _ => "hermes-memory: operation failed",
+    }
+}
+
 fn main() {
     if let Err(error) = run() {
         if let Some(argument_error) = error.downcast_ref::<clap::Error>() {
@@ -186,7 +197,7 @@ fn main() {
                 return;
             }
         } else {
-            eprintln!("hermes-memory: operation failed");
+            eprintln!("{}", operation_error_message(error.as_ref()));
         }
         std::process::exit(2);
     }
@@ -194,7 +205,42 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::read_bounded_utf8;
+    use super::{operation_error_message, read_bounded_utf8};
+
+    #[test]
+    fn unsupported_memory_io_has_a_fixed_sanitized_message() {
+        let error: Box<dyn std::error::Error> =
+            hermes_memory::MemoryError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "private/root secret payload",
+            ))
+            .into();
+        assert_eq!(
+            operation_error_message(error.as_ref()),
+            "hermes-memory: operation unsupported"
+        );
+    }
+
+    #[test]
+    fn other_operation_errors_remain_sanitized() {
+        for error in [
+            Box::<dyn std::error::Error>::from(hermes_memory::MemoryError::Io(
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "unsupported private/root",
+                ),
+            )),
+            Box::<dyn std::error::Error>::from(hermes_memory::MemoryError::UnsafeExportPath(
+                "private/root".into(),
+            )),
+            Box::<dyn std::error::Error>::from("unsupported secret payload"),
+        ] {
+            assert_eq!(
+                operation_error_message(error.as_ref()),
+                "hermes-memory: operation failed"
+            );
+        }
+    }
 
     #[test]
     fn bounded_stdin_accepts_exact_limit_and_rejects_oversize_or_invalid_utf8() {

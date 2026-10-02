@@ -1,4 +1,6 @@
-use serde_json::{json, Value};
+use serde_json::json;
+#[cfg(windows)]
+use serde_json::Value;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use tempfile::tempdir;
@@ -141,11 +143,12 @@ fn direct_posix_commands_are_unsupported_without_io() {
         let root_path = temp.path().join(format!("unsupported-{index}"));
         let root = root_path.to_string_lossy().to_string();
         let output = run_with_stdin(&[command, "--root", &root], &input);
-        assert!(!output.status.success(), "{command} unexpectedly succeeded");
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("unsupported"),
-            "unexpected {command} error: {}",
-            String::from_utf8_lossy(&output.stderr)
+        assert_eq!(output.status.code(), Some(2), "{command} exit status");
+        assert!(output.stdout.is_empty(), "{command} wrote stdout");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr).trim(),
+            "hermes-memory: operation unsupported",
+            "unexpected {command} error"
         );
         assert!(!root_path.exists(), "{command} created its root");
     }

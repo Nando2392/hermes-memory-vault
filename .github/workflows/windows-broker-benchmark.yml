@@ -3,6 +3,9 @@ name: Windows broker small case (disposable only)
 # Future CI only: source preflight is NOT workflow review or dispatch approval.
 # Independently review this workflow before publishing or acknowledging below.
 on:
+  push:
+    branches: [test/posix-sqlite-hardening]
+    paths: ['.github/workflows/windows-broker-benchmark.yml']
   workflow_dispatch:
     inputs:
       reviewed:
@@ -15,6 +18,14 @@ permissions:
   contents: read
 
 jobs:
+  register:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/test/posix-sqlite-hardening'
+    runs-on: windows-2022
+    timeout-minutes: 2
+    steps:
+      - name: Register manual workflow without running the benchmark
+        shell: pwsh
+        run: Write-Output 'Registration only; benchmark requires a separate reviewed manual dispatch.'
   small:
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/test/posix-sqlite-hardening' && inputs.reviewed == true
     runs-on: windows-2022
@@ -66,9 +77,9 @@ jobs:
               provenance['source_files'] = inventory
               source_digest = hashlib.sha256(json.dumps(inventory, separators=(',', ':')).encode()).hexdigest()
               provenance['source_sha256'] = source_digest
-              # Derived from all 44 build-source files after platform-test fixes.
+              # Derived from all 44 build-source files after POSIX CLI fixes.
               # Changing this pin requires another independent source review.
-              if source_digest != 'cde4e143744cb36597a4aedabfe3cfdc501b18f4388ebd86242ec740378fd8e7':
+              if source_digest != '8b6ad8bf79d64bcb82d2c24d894da00bf04a2b954027e4baa749f2d0b2de0ee0':
                   raise RuntimeError('Build inputs differ from reviewed small-case snapshot')
               provenance['workflow_sha256'] = digest(root / '.github/workflows/windows-broker-benchmark.yml')
               provenance['gate_pass'] = True

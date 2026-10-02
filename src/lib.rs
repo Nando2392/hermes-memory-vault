@@ -18,10 +18,15 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, UNIX_EPOCH};
+#[cfg(any(
+    windows,
+    all(feature = "experimental-broker", any(target_os = "linux", test))
+))]
+use std::time::Duration;
+use std::time::UNIX_EPOCH;
 use thiserror::Error;
 
-#[cfg(test)]
+#[cfg(all(test, any(windows, feature = "experimental-broker")))]
 mod broker_store_tests;
 
 #[cfg(all(windows, feature = "experimental-broker"))]
@@ -45,8 +50,6 @@ mod posix_open_tests;
 
 #[cfg(windows)]
 use cap_std::fs::OpenOptionsExt;
-#[cfg(any(target_os = "linux", target_os = "android"))]
-use std::os::fd::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::ffi::OsStringExt;
 #[cfg(windows)]
@@ -350,11 +353,11 @@ impl MemoryStore {
         #[cfg(not(windows))]
         {
             let _ = root;
-            return Err(std::io::Error::new(
+            Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "direct POSIX memory storage is unsupported; use the separately provisioned experimental broker",
             )
-            .into());
+            .into())
         }
         #[cfg(windows)]
         {
@@ -899,6 +902,7 @@ fn validate_broker_namespace(root: &Path) -> Result<(), MemoryError> {
     Ok(())
 }
 
+#[cfg(any(windows, all(target_os = "linux", feature = "experimental-broker")))]
 fn initialize_schema(connection: &mut Connection, root_dir: &Dir) -> Result<(), MemoryError> {
     reject_future_schema(connection)?;
     if connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? < 1 {
@@ -995,6 +999,7 @@ fn reject_future_schema(connection: &Connection) -> Result<(), MemoryError> {
     Ok(())
 }
 
+#[cfg(any(windows, all(target_os = "linux", feature = "experimental-broker")))]
 fn migrate_projection_state_v2(connection: &mut Connection) -> Result<(), MemoryError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     for (column, definition) in [
@@ -1533,7 +1538,7 @@ fn capability_root_guard(directory: &Dir) -> Result<CapFile, MemoryError> {
     Ok(directory.open_with(".", &options)?)
 }
 
-#[cfg(not(windows))]
+#[cfg(all(target_os = "linux", feature = "experimental-broker"))]
 fn capability_root_guard(directory: &Dir) -> Result<CapFile, MemoryError> {
     Ok(CapFile::from_std(directory.try_clone()?.into_std_file()))
 }
@@ -1556,19 +1561,6 @@ fn stable_root_path(root_guard: &CapFile, _requested: &Path) -> Result<PathBuf, 
     }
     buffer.truncate(length as usize);
     Ok(PathBuf::from(std::ffi::OsString::from_wide(&buffer)))
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn stable_root_path(root_guard: &CapFile, _requested: &Path) -> Result<PathBuf, MemoryError> {
-    Ok(PathBuf::from(format!(
-        "/proc/self/fd/{}",
-        root_guard.as_raw_fd()
-    )))
-}
-
-#[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
-fn stable_root_path(_root_guard: &CapFile, requested: &Path) -> Result<PathBuf, MemoryError> {
-    Ok(requested.to_path_buf())
 }
 
 fn capability_atomic_write(
@@ -2109,6 +2101,7 @@ mod projection_state_tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[cfg(any(windows, all(target_os = "linux", feature = "experimental-broker")))]
     fn record() -> MemoryRecord {
         MemoryRecord {
             id: "projection-state-record".to_owned(),
