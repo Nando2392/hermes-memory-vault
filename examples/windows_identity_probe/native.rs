@@ -1028,6 +1028,12 @@ pub fn run() -> Result<()> {
         observations["production_final"] = durable;
         observations["production_final_stop"] =
             production_probe::stopped(&services[2], processes.last().ok_or("C process missing")?)?;
+        write_report(&root, "production-stopped.json", &json!({"stopped":true}))?;
+        observations["production_no_fallback"] = read_report(
+            &root.join("result-b"),
+            "production-no-fallback.json",
+            Instant::now() + Duration::from_secs(35),
+        )?;
         observations["production_integrity"] = production_probe::integrity(&root)?;
         stop(&services[1], Instant::now() + Duration::from_secs(15))?;
         let final_report = read_report(

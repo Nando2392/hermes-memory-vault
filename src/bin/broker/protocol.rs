@@ -16,6 +16,7 @@ pub struct Validated {
 #[derive(Debug)]
 pub enum Operation {
     Ping,
+    ExportPage(hermes_memory::broker_export::ExportPageRequest),
     Ingest(Vec<hermes_memory::MemoryRecord>),
     Snapshot(hermes_memory::SnapshotRequest),
     Search(hermes_memory::SearchRequest),
@@ -149,6 +150,11 @@ pub fn decode(bytes: &[u8], workspace: &str) -> Result<Validated, &'static str> 
                 limit: s.limit,
                 max_bytes: s.max_bytes,
             })
+        }
+        "export_page" => {
+            let page: hermes_memory::broker_export::ExportPageRequest = typed(r.body)?;
+            scope(&page.workspace, workspace)?;
+            Operation::ExportPage(page)
         }
         "export" => return Err("unsupported"),
         _ => return Err("invalid_request"),

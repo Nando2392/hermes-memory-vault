@@ -1,5 +1,7 @@
 //! Actual executable SCM gate; never invoked by unit tests.
 use super::*;
+#[path = "client_probe.rs"]
+mod client_probe;
 
 fn checked_response(v: &Value, id: &str, error: Option<&str>) -> Result<()> {
     ensure(
@@ -103,6 +105,13 @@ pub(super) fn prepare(
         .join("hermes-memory-broker.exe");
     let target = root.join("bin/hermes-memory-broker.exe");
     let hash = copy_new(&source, &target)?;
+    let compatibility = client_probe::prepare(
+        root,
+        &config,
+        name,
+        &hash,
+        source.parent().ok_or("missing release directory")?,
+    )?;
     write_report(
         root,
         "production-config.json",
@@ -127,7 +136,7 @@ pub(super) fn prepare(
     })?;
     Ok((
         server,
-        json!({"source":source,"executable":target,"sha256":hash,"command":command,"storage_acl":audit}),
+        json!({"source":source,"executable":target,"sha256":hash,"command":command,"storage_acl":audit,"compatibility":compatibility}),
     ))
 }
 /// Files instead of pipe-backed stdio prevent child-output deadlock. Only this
@@ -272,6 +281,7 @@ pub(super) fn client(root: &Path) -> Result<()> {
     let ping = call(root, &config, "first-ping", "ping", json!({}), None)?;
     ensure(
         ping["response"]["result"]["export_supported"] == false
+            && ping["response"]["result"]["export_page_supported"] == true
             && ping["response"]["result"]["sqlite_version"].is_string(),
         "not a production ping",
     )?;
@@ -367,10 +377,18 @@ pub(super) fn client(root: &Path) -> Result<()> {
         found["response"]["result"] == final_search["response"]["result"],
         "replay changed durable rows",
     )?;
+    let compatibility = client_probe::run(root, &config, &final_search)?;
     write_report(
         &root.join("result-b"),
         "production-final.json",
-        &json!({"search":found,"ingest_duplicate":ingest,"snapshot_duplicate":snap,"final_search":final_search}),
+        &json!({"search":found,"ingest_duplicate":ingest,"snapshot_duplicate":snap,"final_search":final_search,"compatibility":compatibility}),
+    )?;
+    read_report(root, "production-stopped.json", deadline())?;
+    let no_fallback = client_probe::after_stop(root, &config)?;
+    write_report(
+        &root.join("result-b"),
+        "production-no-fallback.json",
+        &no_fallback,
     )
 }
 pub(super) fn start(service: &ScHandle, sid: &str, processes: &mut Vec<Handle>) -> Result<Value> {
@@ -439,7 +457,7 @@ pub(super) fn integrity(root: &Path) -> Result<Value> {
     let check: String = db.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
     ensure(check == "ok", "production source integrity failed")?;
     let rows: u64 = db.query_row("SELECT count(*) FROM records", [], |r| r.get(0))?;
-    ensure(rows == 2, "production source has extra or missing rows")?;
+    ensure(rows == 262, "production source has extra or missing rows")?;
     Ok(
         json!({"integrity_check":check,"source_rows":rows,"performed":"administrator after C stopped and process exited","mode":"read-only"}),
     )
@@ -447,6 +465,21 @@ pub(super) fn integrity(root: &Path) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn final_integrity_requires_all_262_compatibility_rows() {
+        let root = tempfile::tempdir().unwrap();
+        let store = hermes_memory::MemoryStore::open(root.path().join("runtime-store")).unwrap();
+        let records = (0..262)
+            .map(|i| {
+                let mut value = record();
+                value["id"] = json!(format!("proof-{i}"));
+                serde_json::from_value(value).unwrap()
+            })
+            .collect::<Vec<hermes_memory::MemoryRecord>>();
+        store.ingest_many(&records).unwrap();
+        drop(store);
+        assert_eq!(integrity(root.path()).unwrap()["source_rows"], 262);
+    }
     #[test]
     fn snapshot_replay_matches_actual_store_overlap_semantics_across_reopen() {
         let root = tempfile::tempdir().unwrap();

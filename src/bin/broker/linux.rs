@@ -155,6 +155,7 @@ pub fn serve(
         _ => return Err("unavailable"),
     }
     let store = hermes_memory::MemoryStore::open_broker(root).map_err(|_| "unavailable")?;
+    store.prepare_export_index().map_err(|_| "unavailable")?;
     let listener = UnixListener::bind(socket).map_err(|_| "unavailable")?;
     // Never unlink supplied endpoints, including on startup failure or exit.
     fs::set_permissions(socket, fs::Permissions::from_mode(0o666)).map_err(|_| "unavailable")?;

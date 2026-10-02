@@ -26,10 +26,15 @@ mod broker_store_tests;
 
 #[cfg(all(windows, feature = "experimental-broker"))]
 mod windows_broker_store;
+#[cfg(all(windows, feature = "experimental-broker"))]
+pub use windows_broker_store::{admit_broker_temp, BrokerTempGuard};
 #[cfg(all(test, windows, feature = "experimental-broker"))]
 mod windows_broker_store_tests;
 #[cfg(all(windows, feature = "experimental-broker"))]
 pub mod windows_pipe;
+
+#[cfg(all(windows, feature = "experimental-broker"))]
+pub mod windows_enrollment;
 
 #[cfg(all(test, unix))]
 mod posix_open_tests;
@@ -182,6 +187,34 @@ pub struct MemoryStore {
     // Declared after connection: the instance lock outlives SQLite close.
     #[cfg(all(feature = "experimental-broker", any(target_os = "linux", windows)))]
     _broker_lock: Option<File>,
+}
+
+pub mod broker_export;
+pub mod client_export;
+pub mod logical_migration;
+
+impl MemoryStore {
+    /// Import a bounded logical archive into this already-open empty store.
+    /// Production callers must own the store under the service security boundary.
+    /// See [`logical_migration`] for staging, durability and recovery requirements.
+    pub fn import_logical_archive(
+        &self,
+        reader: impl BufRead,
+    ) -> Result<logical_migration::MigrationReceipt, logical_migration::MigrationError> {
+        logical_migration::import(self, reader)
+    }
+
+    /// Explicit administrator admission only; never expose as a network operation.
+    /// Pin must come from trusted external staging, not the untrusted archive itself.
+    /// Returns the original durable receipt without reading input on a same-pin retry.
+    /// Reopen after OutcomeUnknown to repair projection before retrying admission.
+    pub fn import_logical_archive_once(
+        &self,
+        reader: impl BufRead,
+        expected_logical_sha256: &str,
+    ) -> Result<logical_migration::MigrationReceipt, logical_migration::MigrationError> {
+        logical_migration::import_once(self, reader, expected_logical_sha256)
+    }
 }
 
 const PROJECTION_FORMAT: i64 = 2;

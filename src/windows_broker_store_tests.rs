@@ -1,6 +1,147 @@
 use super::windows_broker_store::*;
 use super::*;
 
+#[test]
+fn windows_private_temp_rejects_interactive_identity_without_environment_changes() {
+    let before = [std::env::var_os("TEMP"), std::env::var_os("TMP")];
+    let root = tempfile::tempdir().unwrap();
+    let result = admit_broker_temp(root.path());
+    assert!(
+        matches!(result, Err(MemoryError::Io(ref e)) if e.kind() == std::io::ErrorKind::PermissionDenied)
+    );
+    assert_eq!(before, [std::env::var_os("TEMP"), std::env::var_os("TMP")]);
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn windows_private_temp_requires_all_three_inheritable_full_control_aces() {
+    let service = "S-1-5-80-1-2-3-4-5";
+    let aces = private_aces(service);
+    assert!(acl_allowed(
+        service,
+        true,
+        &aces,
+        service,
+        ObjectKind::TempRoot
+    ));
+    for index in 0..3 {
+        for (mask, flags) in [(0x120089, 3), (0x1f01ff, 0), (0x1f01ff, 11)] {
+            let mut bad = aces.clone();
+            bad[index].mask = mask;
+            bad[index].flags = flags;
+            assert!(!acl_allowed(
+                service,
+                true,
+                &bad,
+                service,
+                ObjectKind::TempRoot
+            ));
+        }
+    }
+    assert!(!acl_allowed(
+        service,
+        false,
+        &aces,
+        service,
+        ObjectKind::TempRoot
+    ));
+}
+
+#[test]
+fn windows_private_temp_selection_requires_direct_nonaliased_child() {
+    let root = Path::new(r"C:\Private\Temp");
+    assert!(validate_temp_selection(root, r"c:\private\TEMP\etilqs_123").is_ok());
+    for proposed in [
+        r"C:\Private\Temp2\etilqs_123",
+        r"C:\Private\Temp\sub\x",
+        r"C:\Private\Temp\..\x",
+        r"C:\Private\Temp\x:ads",
+        r"C:\Private\Temp\x.",
+        r"C:\Private\Temp\",
+        r"\\?\C:\Private\Temp\x",
+        "x",
+    ] {
+        assert!(
+            validate_temp_selection(root, proposed).is_err(),
+            "{proposed}"
+        );
+    }
+}
+
+#[test]
+fn windows_private_temp_queries_real_win32_selection_without_spilling() {
+    let _api: fn(&BrokerTempGuard, &MemoryStore) -> Result<(), MemoryError> =
+        BrokerTempGuard::verify_store;
+    let root = tempfile::tempdir().unwrap();
+    let connection = Connection::open_with_flags_and_vfs(
+        root.path().join("probe.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        "win32",
+    )
+    .unwrap();
+    let selected = sqlite_temp_selection(&connection).unwrap();
+    assert!(Path::new(&selected).is_absolute());
+    assert!(
+        !Path::new(&selected).exists(),
+        "selection must not create a spill file"
+    );
+    assert!(sqlite_temp_selection(&Connection::open_in_memory().unwrap()).is_err());
+}
+
+#[test]
+fn windows_private_temp_path_allocations_are_bounded() {
+    let oversized = format!("C:\\{}", "a".repeat(32768));
+    assert!(validate_path(Path::new(&oversized)).is_err());
+}
+
+#[test]
+fn windows_private_temp_native_sddl_rejects_public_reads_and_missing_inheritance() {
+    let private = "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;S-1-5-80-1-2-3-4-5)";
+    assert!(descriptor_kind_admitted(private, ObjectKind::TempRoot));
+    for sddl in [
+        format!("{private}(A;;FR;;;WD)"),
+        format!("{private}(A;;FW;;;BU)"),
+        private.replace("O:BAG", "O:WDG"),
+        private.replace("D:P", "D:"),
+        private.replace("(A;OICI;FA;;;SY)", ""),
+        private.replace("(A;OICI;FA;;;BA)", "(A;;FA;;;BA)"),
+        "O:BAG:BAD:NO_ACCESS_CONTROL".to_owned(),
+    ] {
+        assert!(
+            !descriptor_kind_admitted(&sddl, ObjectKind::TempRoot),
+            "{sddl}"
+        );
+    }
+}
+
+#[test]
+fn windows_private_temp_same_directory_requires_volume_and_full_file_id() {
+    use windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION;
+    let original = BY_HANDLE_FILE_INFORMATION {
+        dwVolumeSerialNumber: 7,
+        nFileIndexHigh: 8,
+        nFileIndexLow: 9,
+        ..Default::default()
+    };
+    assert!(same_directory(&original, &original));
+    for changed in [
+        BY_HANDLE_FILE_INFORMATION {
+            dwVolumeSerialNumber: 1,
+            ..original
+        },
+        BY_HANDLE_FILE_INFORMATION {
+            nFileIndexHigh: 1,
+            ..original
+        },
+        BY_HANDLE_FILE_INFORMATION {
+            nFileIndexLow: 1,
+            ..original
+        },
+    ] {
+        assert!(!same_directory(&original, &changed));
+    }
+}
+
 fn private_aces(service: &str) -> Vec<Ace> {
     ["S-1-5-18", "S-1-5-32-544", service]
         .into_iter()
@@ -149,6 +290,10 @@ fn windows_broker_metadata_rejects_reparse_hardlinks_and_wrong_types() {
 }
 
 fn descriptor_admitted(sddl: &str) -> bool {
+    descriptor_kind_admitted(sddl, ObjectKind::Root)
+}
+
+fn descriptor_kind_admitted(sddl: &str, kind: ObjectKind) -> bool {
     use windows_sys::Win32::{Foundation::LocalFree, Security::Authorization::*};
     let wide: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
     let mut sd = std::ptr::null_mut();
@@ -163,7 +308,7 @@ fn descriptor_admitted(sddl: &str) -> bool {
             ),
             0
         );
-        let result = audit_descriptor(sd, "S-1-5-80-1-2-3-4-5", ObjectKind::Root).is_ok();
+        let result = audit_descriptor(sd, "S-1-5-80-1-2-3-4-5", kind).is_ok();
         LocalFree(sd);
         result
     }

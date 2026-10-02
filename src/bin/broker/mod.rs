@@ -79,9 +79,14 @@ fn dispatch(store: &hermes_memory::MemoryStore, request: protocol::Validated) ->
     use protocol::Operation;
     use serde_json::json;
     let result = match request.operation {
-        Operation::Ping => Ok(json!({"sqlite_version":rusqlite::version(),"sqlite_version_number":rusqlite::version_number(),"export_supported":false})),
+        Operation::Ping => Ok(json!({"sqlite_version":rusqlite::version(),"sqlite_version_number":rusqlite::version_number(),"export_supported":false,"export_page_supported":true})),
         Operation::Ingest(records) => store.ingest_many(&records).map(|(inserted,duplicates)|json!({"inserted":inserted,"duplicates":duplicates,"durable":true,"projection_ready":true})).map_err(|_| "outcome_unknown"),
         Operation::Snapshot(snapshot) => store.ingest_snapshot(&snapshot).map(|(inserted,duplicates)|json!({"inserted":inserted,"duplicates":duplicates,"durable":true,"projection_ready":true})).map_err(|_| "outcome_unknown"),
+        Operation::ExportPage(page) => store.export_page(&page, &request.request_id).map_err(|error| match error {
+            hermes_memory::broker_export::ExportError::InvalidRequest => "invalid_request",
+            hermes_memory::broker_export::ExportError::ResourceLimit => "resource_limit",
+            _ => "unavailable",
+        }).and_then(|page| serde_json::to_value(page).map_err(|_| "unavailable")),
         Operation::Search(search) => store.search(&search).map(|hits|json!({"hits":hits,"trust":"untrusted"})).map_err(|_| "unavailable"),
     };
     match result {
@@ -209,6 +214,203 @@ mod tests {
         assert_eq!(
             call("ping", serde_json::json!({}))["result"]["sqlite_version"],
             rusqlite::version()
+        );
+    }
+    #[test]
+    fn export_page_dispatch_exact_envelope_and_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fixture_store(dir.path());
+        store.prepare_export_index().unwrap();
+        for (id, workspace) in [("a", "sandbox"), ("b", "other")] {
+            store
+                .ingest(&hermes_memory::MemoryRecord {
+                    id: id.into(),
+                    session_id: "s".into(),
+                    workspace: workspace.into(),
+                    kind: "event".into(),
+                    content: "雪\nquoted".into(),
+                    timestamp: 1.0,
+                    metadata: serde_json::json!({"nested":[true, 1]}),
+                })
+                .unwrap();
+        }
+        let id = "\"\n雪";
+        let mut body =
+            serde_json::json!({"workspace":"sandbox","max_records":256,"max_bytes":MAX_FRAME});
+        let call = |body: serde_json::Value| {
+            let bytes = serde_json::to_vec(
+                &serde_json::json!({"protocol":1,"request_id":id,"op":"export_page","body":body}),
+            )
+            .unwrap();
+            match protocol::decode(&bytes, "sandbox") {
+                Ok(request) => dispatch(&store, request),
+                Err(code) => rejection(&bytes, code),
+            }
+        };
+        let response = call(body.clone());
+        assert!(response.ok, "{response:?}");
+        let wire = serde_json::to_vec(&response).unwrap();
+        let result = response.result.unwrap();
+        assert_eq!(result["records"].as_array().unwrap().len(), 1);
+        assert_eq!(result["records"][0]["id"], "a");
+        body["max_bytes"] = wire.len().into();
+        assert_eq!(serde_json::to_vec(&call(body.clone())).unwrap(), wire);
+        body["max_bytes"] = (wire.len() - 1).into();
+        assert_eq!(
+            serde_json::to_value(call(body.clone())).unwrap()["error"]["code"],
+            "resource_limit"
+        );
+        body["workspace"] = "other".into();
+        assert_eq!(
+            serde_json::to_value(call(body)).unwrap()["error"]["code"],
+            "unauthorized"
+        );
+    }
+    #[test]
+    fn export_page_dispatch_large_records_continuations_and_physical_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fixture_store(dir.path());
+        store.prepare_export_index().unwrap();
+        let records: Vec<_> = (0..3)
+            .map(|i| hermes_memory::MemoryRecord {
+                id: format!("large{i}"),
+                session_id: "s".into(),
+                workspace: "sandbox".into(),
+                kind: "event".into(),
+                content: "x".repeat(1024 * 1024 + 1),
+                timestamp: i as f64,
+                metadata: serde_json::json!({"payload":"y".repeat(1024 * 1024 + 1)}),
+            })
+            .collect();
+        store.ingest_many(&records).unwrap();
+        let mut body =
+            serde_json::json!({"workspace":"sandbox","max_records":256,"max_bytes":3*1024*1024});
+        let call = |body: &serde_json::Value| {
+            let bytes = serde_json::to_vec(&serde_json::json!({"protocol":1,"request_id":"large","op":"export_page","body":body})).unwrap();
+            dispatch(&store, protocol::decode(&bytes, "sandbox").unwrap())
+        };
+        let projection = std::fs::read(dir.path().join("events.jsonl")).unwrap();
+        let mut actual = Vec::new();
+        loop {
+            let response = call(&body);
+            assert!(response.ok, "{response:?}");
+            let bytes = serde_json::to_vec(&response).unwrap();
+            assert!(bytes.len() <= body["max_bytes"].as_u64().unwrap() as usize);
+            let mut frame = Vec::new();
+            write_frame(&mut frame, &bytes).unwrap();
+            let decoded: Response =
+                serde_json::from_slice(&read_frame(&mut &frame[..]).unwrap()).unwrap();
+            let page: hermes_memory::broker_export::ExportPage =
+                serde_json::from_value(decoded.result.unwrap()).unwrap();
+            assert_eq!(page.records.len(), 1);
+            actual.extend(page.records);
+            body["high_water"] = page.high_water.into();
+            body["after"] = serde_json::to_value(&page.next).unwrap();
+            if page.next.is_none() {
+                break;
+            }
+        }
+        assert_eq!(actual, records);
+        assert_eq!(
+            std::fs::read(dir.path().join("events.jsonl")).unwrap(),
+            projection
+        );
+        body["after"] = serde_json::json!({"session_id":"other","timestamp":0,"rowid":1});
+        assert_eq!(
+            serde_json::to_value(call(&body)).unwrap()["error"]["code"],
+            "invalid_request"
+        );
+        // A legacy-admitted row can fit raw storage but not its escaped wire envelope.
+        let mut oversized = records[0].clone();
+        oversized.id = "oversized".into();
+        oversized.workspace = "oversized".into();
+        oversized.content = "\n".repeat(MAX_FRAME / 2);
+        oversized.metadata = serde_json::Value::Null;
+        store.ingest(&oversized).unwrap();
+        let bytes = serde_json::to_vec(&serde_json::json!({"protocol":1,"request_id":"r","op":"export_page","body":{"workspace":"oversized","max_records":256,"max_bytes":MAX_FRAME}})).unwrap();
+        let response = dispatch(&store, protocol::decode(&bytes, "oversized").unwrap());
+        assert_eq!(
+            serde_json::to_value(response).unwrap()["error"]["code"],
+            "resource_limit"
+        );
+    }
+    #[test]
+    fn export_page_capability_and_startup_preparation_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fixture_store(dir.path());
+        let ping = protocol::decode(
+            br#"{"protocol":1,"request_id":"p","op":"ping","body":{}}"#,
+            "sandbox",
+        )
+        .unwrap();
+        let response = serde_json::to_value(dispatch(&store, ping)).unwrap();
+        assert_eq!(response["result"]["export_supported"], false);
+        assert_eq!(response["result"]["export_page_supported"], true);
+        // Static startup ordering check complements CI real-service readiness proof.
+        for (source, listener) in [
+            (include_str!("windows.rs"), "let mut listener ="),
+            (
+                include_str!("linux.rs"),
+                "let listener = UnixListener::bind",
+            ),
+        ] {
+            let admission = source
+                .find("let store = hermes_memory::MemoryStore::open_broker")
+                .unwrap();
+            let startup = &source[admission..];
+            let prepare = startup
+                .find("store.prepare_export_index()")
+                .expect("startup must prepare before binding");
+            assert!(prepare < startup.find(listener).unwrap());
+            assert_eq!(source.matches("store.prepare_export_index()").count(), 1);
+        }
+    }
+    #[test]
+    fn export_page_rejects_malformed_and_never_prepares_on_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fixture_store(dir.path());
+        let valid =
+            serde_json::json!({"workspace":"sandbox","max_records":1,"max_bytes":MAX_FRAME});
+        let mut cases = vec![(valid.clone(), "unavailable")];
+        for field in ["sql", "path", "root", "output"] {
+            let mut body = valid.clone();
+            body[field] = "forbidden".into();
+            cases.push((body, "invalid_request"));
+        }
+        let mut body = valid.clone();
+        body["workspace"] = "other".into();
+        cases.push((body, "unauthorized"));
+        let mut body = valid.clone();
+        body["max_bytes"] = (MAX_FRAME + 1).into();
+        cases.push((body, "resource_limit"));
+        let mut body = valid.clone();
+        body["max_records"] = 257.into();
+        cases.push((body, "resource_limit"));
+        let mut body = valid;
+        body["after"] = serde_json::json!({"session_id":"s","timestamp":1,"rowid":1,"sql":"x"});
+        cases.push((body, "invalid_request"));
+        for (body, code) in cases {
+            let bytes = serde_json::to_vec(
+                &serde_json::json!({"protocol":1,"request_id":"r","op":"export_page","body":body}),
+            )
+            .unwrap();
+            let response = match protocol::decode(&bytes, "sandbox") {
+                Ok(request) => dispatch(&store, request),
+                Err(code) => rejection(&bytes, code),
+            };
+            let response = serde_json::to_value(response).unwrap();
+            assert_eq!(response["error"]["code"], code);
+            assert!(response.get("result").is_none());
+        }
+        let db = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name='records_export_order'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
         );
     }
     #[test]

@@ -379,6 +379,7 @@ fn worker(
     // TokenUser, privileges and preprovisioned namespace policy live in the lib.
     let store = hermes_memory::MemoryStore::open_broker(&config.root)
         .map_err(|_| "store_admission_failed")?;
+    store.prepare_export_index().map_err(|_| "unavailable")?;
     if stop.load(Ordering::Acquire) {
         return Ok(());
     }

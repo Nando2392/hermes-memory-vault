@@ -142,6 +142,7 @@ pub(super) struct Ace {
 pub(super) enum ObjectKind {
     Ancestor,
     Root,
+    TempRoot,
     File,
 }
 
@@ -159,6 +160,12 @@ pub(super) fn acl_allowed(
                 && sid == "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464")
     };
     trusted(owner)
+        && (kind != ObjectKind::TempRoot
+            || (protected
+                && [service, "S-1-5-18", "S-1-5-32-544"].iter().all(|sid| {
+                    aces.iter()
+                        .any(|ace| ace.sid == *sid && ace.mask == 0x1f01ff && ace.flags & 0xf == 3)
+                })))
         && (kind != ObjectKind::Root
             || (protected
                 && aces
@@ -270,17 +277,32 @@ fn wide(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain(Some(0)).collect()
 }
 
+#[cfg(test)]
 pub(super) fn audit_path(
     path: &Path,
     service: &str,
     kind: ObjectKind,
+) -> Result<OwnedHandle, MemoryError> {
+    audit_path_shared(
+        path,
+        service,
+        kind,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    )
+}
+
+fn audit_path_shared(
+    path: &Path,
+    service: &str,
+    kind: ObjectKind,
+    sharing: u32,
 ) -> Result<OwnedHandle, MemoryError> {
     // SAFETY: NUL-terminated path; no inheritable handle, no reparse traversal at the leaf.
     let raw = unsafe {
         CreateFileW(
             wide(path).as_ptr(),
             READ_CONTROL | FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            sharing,
             null(),
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
@@ -384,6 +406,14 @@ pub(super) fn volume_allowed(drive_type: u32, filesystem: &str) -> bool {
 }
 
 pub(super) fn validate_namespace(root: &Path, service: &str) -> Result<(), MemoryError> {
+    admit_namespace(root, service, false).map(drop)
+}
+
+fn admit_namespace(
+    root: &Path,
+    service: &str,
+    temp: bool,
+) -> Result<Vec<OwnedHandle>, MemoryError> {
     validate_path(root)?;
     let text = root
         .to_str()
@@ -417,26 +447,237 @@ pub(super) fn validate_namespace(root: &Path, service: &str) -> Result<(), Memor
     // Audit top-down: OPEN_REPARSE_POINT only protects the final component.
     // Earlier components are safe only after their ownership and mutation ACLs pass.
     let mut current = volume.to_path_buf();
-    let mut guards = vec![audit_path(&current, service, ObjectKind::Ancestor)?];
+    let sharing = if temp {
+        FILE_SHARE_READ
+    } else {
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+    };
+    let mut guards = vec![audit_path_shared(
+        &current,
+        service,
+        ObjectKind::Ancestor,
+        sharing,
+    )?];
     for part in text[3..].split('\\') {
         current.push(part);
-        let kind = if current == root {
+        let kind = if current == root && temp {
+            ObjectKind::TempRoot
+        } else if current == root {
             ObjectKind::Root
         } else {
             ObjectKind::Ancestor
         };
-        guards.push(audit_path(&current, service, kind)?);
+        guards.push(audit_path_shared(&current, service, kind, sharing)?);
     }
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
         require(
-            entry.file_name().to_str().is_some_and(store_entry_allowed),
+            temp || entry.file_name().to_str().is_some_and(store_entry_allowed),
             "unknown or legacy broker entry",
         )?;
-        // Never retain SQLite file handles: native VFS owns sidecar lifetimes.
-        drop(audit_path(&entry.path(), service, ObjectKind::File)?);
+        // Streaming inventory: the pinned private root excludes hostile mutation.
+        // Service/SYSTEM/admin are trusted; audit each existing single-linked regular
+        // file under a no-write/no-delete-share TEMP handle, then release it. Keep
+        // O(depth), not O(file count), handles; never delete stale TEMP files.
+        validate_path(&entry.path())?;
+        drop(audit_path_shared(
+            &entry.path(),
+            service,
+            ObjectKind::File,
+            sharing,
+        )?);
     }
-    Ok(())
+    Ok(guards)
+}
+
+/// Pins the preprovisioned private TEMP namespace for the entire service lifetime.
+/// Dropping it releases handles, but deliberately does not restore process environment.
+#[derive(Debug)]
+pub struct BrokerTempGuard {
+    root: std::path::PathBuf,
+    service: String,
+    _handles: Vec<OwnedHandle>,
+}
+
+/// Admit private SQLite TEMP before opening ANY SQLite connection, including migration.
+///
+/// Dedicated service process startup ONLY, before starting worker threads. The caller
+/// must keep the guard alive for the entire service lifetime and must not subsequently
+/// change TEMP/TMP, SQLite's temp-directory override, or VFS registration. No host
+/// configuration or ACL is changed; existing files are audited, never deleted.
+/// On a post-admission environment/verification failure, abort service startup.
+pub fn admit_broker_temp(root: &Path) -> Result<BrokerTempGuard, MemoryError> {
+    let service = service_identity()?;
+    let handles = admit_namespace(root, &service, true)?;
+    let guard = BrokerTempGuard {
+        root: root.to_owned(),
+        service,
+        _handles: handles,
+    };
+    for name in ["TEMP", "TMP"] {
+        // SAFETY: valid terminated UTF-16 buffers; native process-only environment API.
+        win(unsafe {
+            windows_sys::Win32::System::Environment::SetEnvironmentVariableW(
+                wide(Path::new(name)).as_ptr(),
+                wide(root).as_ptr(),
+            )
+        })?;
+    }
+    let mut buffer = vec![0u16; 32768];
+    // SAFETY: output buffer has the declared capacity, bounded to the NT path limit.
+    let len = unsafe { GetTempPathW(buffer.len() as u32, buffer.as_mut_ptr()) } as usize;
+    require(len > 0 && len < buffer.len(), "cannot resolve native TEMP")?;
+    let resolved = String::from_utf16(&buffer[..len])
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+    let resolved = Path::new(resolved.trim_end_matches('\\'));
+    require(
+        resolved
+            .to_str()
+            .is_some_and(|p| p.eq_ignore_ascii_case(root.to_str().unwrap_or_default())),
+        "native TEMP differs from admitted root",
+    )?;
+    guard.verify_root_handle(resolved)?;
+    Ok(guard)
+}
+
+impl BrokerTempGuard {
+    /// Verify the actual store connection before readiness (and before migration/index work).
+    /// This observes the stock Win32 VFS's proposed TEMP filename, NOT an actual spill.
+    pub fn verify_store(&self, store: &crate::MemoryStore) -> Result<(), MemoryError> {
+        let connection = store
+            .connection
+            .lock()
+            .map_err(|_| MemoryError::LockPoisoned)?;
+        self.verify_sqlite_temp_path(&connection)
+    }
+
+    /// Verify a connection's native VFS selection without creating a TEMP file.
+    pub fn verify_sqlite_temp_path(
+        &self,
+        connection: &rusqlite::Connection,
+    ) -> Result<(), MemoryError> {
+        require(
+            service_identity()? == self.service,
+            "TEMP verification identity changed",
+        )?;
+        let selected = sqlite_temp_selection(connection)?;
+        validate_temp_selection(&self.root, &selected)?;
+        // The lexical comparison rejects aliases; the native handle audit additionally
+        // resolves the existing parent via GetFinalPathNameByHandleW under pinned ancestors.
+        let parent = Path::new(&selected)
+            .parent()
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+        self.verify_root_handle(parent)
+    }
+
+    fn verify_root_handle(&self, path: &Path) -> Result<(), MemoryError> {
+        let selected =
+            audit_path_shared(path, &self.service, ObjectKind::TempRoot, FILE_SHARE_READ)?;
+        let pinned = self
+            ._handles
+            .last()
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+        let mut original = BY_HANDLE_FILE_INFORMATION::default();
+        let mut actual = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: both handles are live audited directories; fixed output structures.
+        unsafe {
+            win(GetFileInformationByHandle(
+                pinned.as_raw_handle(),
+                &mut original,
+            ))?;
+            win(GetFileInformationByHandle(
+                selected.as_raw_handle(),
+                &mut actual,
+            ))?;
+        }
+        require(
+            same_directory(&original, &actual),
+            "TEMP resolved to a different directory identity",
+        )
+    }
+}
+
+pub(super) fn same_directory(
+    a: &BY_HANDLE_FILE_INFORMATION,
+    b: &BY_HANDLE_FILE_INFORMATION,
+) -> bool {
+    a.dwVolumeSerialNumber == b.dwVolumeSerialNumber
+        && a.nFileIndexHigh == b.nFileIndexHigh
+        && a.nFileIndexLow == b.nFileIndexLow
+}
+
+struct SqliteAllocation(*mut std::ffi::c_char);
+impl Drop for SqliteAllocation {
+    fn drop(&mut self) {
+        // SAFETY: owned sqlite3_malloc allocation from TEMPFILENAME, or null.
+        unsafe { rusqlite::ffi::sqlite3_free(self.0.cast()) };
+    }
+}
+
+pub(super) fn sqlite_temp_selection(
+    connection: &rusqlite::Connection,
+) -> Result<String, MemoryError> {
+    use rusqlite::ffi;
+    let mut vfs: *mut ffi::sqlite3_vfs = null_mut();
+    // SAFETY: connection is borrowed exclusively by its owner/thread (or store mutex);
+    // file_control output type matches VFS_POINTER. No VFS/global state is modified.
+    let rc = unsafe {
+        ffi::sqlite3_file_control(
+            connection.handle(),
+            c"main".as_ptr(),
+            ffi::SQLITE_FCNTL_VFS_POINTER,
+            (&mut vfs as *mut *mut ffi::sqlite3_vfs).cast(),
+        )
+    };
+    require(
+        rc == ffi::SQLITE_OK && !vfs.is_null(),
+        "SQLite main has no native VFS",
+    )?;
+    // SAFETY: registered VFS lookup is borrowed and stable; service prohibits replacement.
+    let stock = unsafe { ffi::sqlite3_vfs_find(c"win32".as_ptr()) };
+    require(
+        vfs == stock && !stock.is_null(),
+        "SQLite connection is not bound to win32",
+    )?;
+    let mut allocation = SqliteAllocation(null_mut());
+    // SAFETY: Win32 TEMPFILENAME takes char** and transfers a sqlite3_malloc allocation
+    // on success. RAII frees it on every subsequent branch, including decoding errors.
+    let rc = unsafe {
+        ffi::sqlite3_file_control(
+            connection.handle(),
+            c"main".as_ptr(),
+            ffi::SQLITE_FCNTL_TEMPFILENAME,
+            (&mut allocation.0 as *mut *mut std::ffi::c_char).cast(),
+        )
+    };
+    require(
+        rc == ffi::SQLITE_OK && !allocation.0.is_null(),
+        "SQLite TEMP filename control failed",
+    )?;
+    // SAFETY: inspected bundled Win32 VFS returns sqlite3_malloc memory. Bound all
+    // scanning/copying to that allocation and the maximum UTF-8 NT path budget.
+    let size = unsafe { ffi::sqlite3_msize(allocation.0.cast()) };
+    require(
+        size > 0 && size <= 131072,
+        "SQLite TEMP allocation exceeds bound",
+    )?;
+    let bytes = unsafe { std::slice::from_raw_parts(allocation.0.cast::<u8>(), size as usize) };
+    let end = bytes
+        .iter()
+        .position(|b| *b == 0)
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+    let path = std::str::from_utf8(&bytes[..end])
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+    Ok(path.to_owned())
+}
+
+pub(super) fn validate_temp_selection(root: &Path, proposed: &str) -> Result<(), MemoryError> {
+    validate_path(Path::new(proposed))?;
+    let parent = Path::new(proposed).parent().and_then(Path::to_str);
+    require(
+        parent.is_some_and(|p| p.eq_ignore_ascii_case(root.to_str().unwrap_or_default())),
+        "SQLite TEMP selection escapes admitted root",
+    )
 }
 
 pub(super) const NATIVE_VFS: &str = "win32";
@@ -503,6 +744,10 @@ fn require(ok: bool, reason: &str) -> Result<(), MemoryError> {
 }
 
 pub(super) fn validate_path(path: &Path) -> Result<(), MemoryError> {
+    require(
+        path.as_os_str().encode_wide().take(32768).count() < 32768,
+        "broker path exceeds native bound",
+    )?;
     let text = path.to_str().unwrap_or_default();
     let b = text.as_bytes();
     require(
