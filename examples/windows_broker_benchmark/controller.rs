@@ -120,18 +120,13 @@ fn small(broker: &Path, client: &Path, admin_source: &Path, report: &mut Value) 
         report["generation"] = generation.clone();
         let manifest = json!({"kind":"benchmark-generated-executable-pins-not-a-vendor-release", "broker_sha256":report["executable_sha256"]["broker"],"client_sha256":report["executable_sha256"]["client"],"admin_sha256":report["executable_sha256"]["admin"]});
         contract::json_new(&root.join("release-manifest.json"), &manifest)?;
-        let case = crate::commands::Case {
-            legacy_root: root.join("small/source"),
-            install_root: install.clone(),
-            service_name: fixture.broker_name("small")?,
-            client_sid: fixture.client_sid().into(),
-            broker_source: broker.into(),
-            client_source: client.into(),
-            broker_sha256: data::hash_file(broker)?,
-            client_sha256: data::hash_file(client)?,
-            release_sha256: data::hash_file(&root.join("release-manifest.json"))?,
-            default_enrollment: false,
-        };
+        let case = small_case(
+            &root,
+            broker,
+            client,
+            fixture.broker_name("small")?,
+            fixture.client_sid(),
+        )?;
         ensure(
             case.broker_sha256 == report["executable_sha256"]["broker"]
                 && case.client_sha256 == report["executable_sha256"]["client"],
@@ -323,10 +318,120 @@ fn admin_call(
     contract::output(&value)
 }
 
+#[cfg(all(windows, feature = "experimental-broker"))]
+fn small_case(
+    root: &Path,
+    broker: &Path,
+    client: &Path,
+    service_name: String,
+    client_sid: &str,
+) -> Result<crate::commands::Case> {
+    let broker_copy = root.join("bin/hermes-memory-broker.exe");
+    let client_copy = root.join("bin/hermes-memory-client.exe");
+    // Build outputs can have hardlink aliases. Fresh files inherit the fixture's
+    // protected bin policy, not the source ACLs or build-cache link identity.
+    for (source, destination) in [(broker, &broker_copy), (client, &client_copy)] {
+        let mut input = File::open(source)?;
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)?;
+        std::io::copy(&mut input, &mut output)?;
+        output.sync_all()?;
+    }
+    Ok(crate::commands::Case {
+        legacy_root: root.join("small/source"),
+        install_root: root.join("install-small"),
+        service_name,
+        client_sid: client_sid.into(),
+        broker_sha256: data::hash_file(&broker_copy)?,
+        client_sha256: data::hash_file(&client_copy)?,
+        broker_source: broker_copy,
+        client_source: client_copy,
+        release_sha256: data::hash_file(&root.join("release-manifest.json"))?,
+        default_enrollment: false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[cfg(all(windows, feature = "experimental-broker"))]
+    #[test]
+    fn small_plan_owns_single_link_payloads_from_hardlinked_build_outputs() {
+        use hermes_memory::windows_provision::{checked_plan, Inputs};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("fixture");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("release-manifest.json"), b"synthetic manifest").unwrap();
+        let broker = temp.path().join("broker.exe");
+        let client = temp.path().join("client.exe");
+        for path in [&broker, &client] {
+            fs::write(path, b"synthetic payload, never executed").unwrap();
+            fs::hard_link(path, path.with_extension("alias")).unwrap();
+        }
+        let case = small_case(
+            &root,
+            &broker,
+            &client,
+            "HMVBenchmark-synthetic".into(),
+            "S-1-5-80-1-2-3-4-5",
+        )
+        .unwrap();
+        let args = case.prepare_args().unwrap();
+        let value = |key: &str| args[args.iter().position(|v| v == key).unwrap() + 1].clone();
+        let inputs = Inputs {
+            legacy_root: value("--legacy-root"),
+            client_sid: value("--client-sid"),
+            workspace: value("--workspace"),
+            scope_mode: Default::default(),
+            install_root: value("--install-root"),
+            service_name: Some(value("--service-name")),
+            broker_source: value("--broker-source"),
+            broker_sha256: value("--broker-sha256"),
+            client_source: value("--client-source"),
+            client_sha256: value("--client-sha256"),
+            release_sha256: value("--release-sha256"),
+        };
+        let mut original = inputs.clone();
+        original.broker_source = contract::text(&broker).unwrap();
+        original.client_source = contract::text(&client).unwrap();
+        assert_eq!(
+            checked_plan(&original).unwrap_err().to_string(),
+            "source must be bounded regular non-reparse single-link disk file"
+        );
+        checked_plan(&inputs).expect("fixture-owned copies must pass strict source admission");
+        assert_eq!(
+            case.broker_source,
+            root.join("bin/hermes-memory-broker.exe")
+        );
+        assert_eq!(
+            case.client_source,
+            root.join("bin/hermes-memory-client.exe")
+        );
+        for (source, copy) in [
+            (&broker, &case.broker_source),
+            (&client, &case.client_source),
+        ] {
+            assert_eq!(
+                data::hash_file(source).unwrap(),
+                data::hash_file(copy).unwrap()
+            );
+        }
+        assert!(!root.join("install-small").exists());
+        // A second attempt must not overwrite any fixture payload.
+        assert!(small_case(
+            &root,
+            &broker,
+            &client,
+            "HMVBenchmark-synthetic".into(),
+            "S-1-5-80-1-2-3-4-5"
+        )
+        .is_err());
+    }
+
     #[test]
     fn small_case_requires_every_opt_in_and_rejects_large() {
         let args = [

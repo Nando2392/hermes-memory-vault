@@ -42,6 +42,7 @@ fn link_directory(target: &std::path::Path, link: &std::path::Path) {
     );
 }
 
+#[cfg(windows)]
 fn link_file(target: &std::path::Path, link: &std::path::Path) {
     std::fs::hard_link(target, link).expect("create file hardlink");
 }
