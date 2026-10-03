@@ -368,6 +368,16 @@ fn service_exit_code(label: &str) -> u32 {
     match label {
         "unauthorized" => 1001,
         "temp_admission_failed" => 1002,
+        // TEMP subreasons are additive; retain the original catch-all code.
+        "temp_identity_failed" => 1101,
+        "temp_path_failed" => 1102,
+        "temp_volume_failed" => 1103,
+        "temp_ancestor_failed" => 1104,
+        "temp_root_failed" => 1105,
+        "temp_inventory_failed" => 1106,
+        "temp_environment_failed" => 1107,
+        "temp_native_path_failed" => 1108,
+        "temp_root_recheck_failed" => 1109,
         "store_admission_failed" => 1003,
         "temp_selection_failed" => 1004,
         "bootstrap_config_invalid" => 1005,
@@ -469,7 +479,10 @@ fn worker(
                 Err("unauthorized")
             }
         },
-        || hermes_memory::admit_broker_temp(&config.temp_dir).map_err(|_| "temp_admission_failed"),
+        || {
+            hermes_memory::admit_broker_temp(&config.temp_dir)
+                .map_err(|error| hermes_memory::BrokerTempGuard::admission_failure_label(&error))
+        },
         || {
             let store = hermes_memory::MemoryStore::open_broker(&config.root)
                 .map_err(|_| "store_admission_failed")?;
@@ -691,6 +704,59 @@ fn validate(config: &Config) -> Result<(), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn scm_temp_admission_subreasons_are_bounded_and_stop_before_store() {
+        let labels = [
+            "temp_identity_failed",
+            "temp_path_failed",
+            "temp_volume_failed",
+            "temp_ancestor_failed",
+            "temp_root_failed",
+            "temp_inventory_failed",
+            "temp_environment_failed",
+            "temp_native_path_failed",
+            "temp_root_recheck_failed",
+        ];
+        for (index, label) in labels.into_iter().enumerate() {
+            let result = startup_with(
+                || Ok(()),
+                || Err::<(), _>(label),
+                || -> Result<(), &'static str> { panic!("store must not open") },
+                |_, _| panic!("TEMP selection must not run"),
+                |_| panic!("bootstrap must not run"),
+                |_| panic!("prepare must not run"),
+                || -> Result<(), &'static str> { panic!("pipe must not bind") },
+                || panic!("must not report ready"),
+            );
+            assert_eq!(result, Err(label));
+            let mut exit = 0;
+            assert_eq!(
+                supervise(
+                    || Event::Done(Err(label)),
+                    &AtomicBool::new(false),
+                    |state, _, code| {
+                        if state == SERVICE_STOPPED {
+                            exit = code;
+                        }
+                        Ok(())
+                    },
+                    Duration::from_secs(30),
+                    Duration::from_secs(15),
+                ),
+                Err(label)
+            );
+            assert_eq!(exit, 1101 + index as u32);
+            let stopped = status(SERVICE_STOPPED, 0, exit);
+            assert_eq!(
+                stopped.dwWin32ExitCode,
+                windows_sys::Win32::Foundation::ERROR_SERVICE_SPECIFIC_ERROR
+            );
+            assert_eq!(stopped.dwServiceSpecificExitCode, exit);
+        }
+        assert_eq!(service_exit_code("temp_admission_failed"), 1002);
+        assert_eq!(service_exit_code(r"C:\private\secret"), 1);
+    }
+
     #[test]
     fn scm_diagnostics_reporting_failure_preserves_worker_failure() {
         let result = supervise(
@@ -1250,7 +1316,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = startup_with(
             || Ok(()),
-            || hermes_memory::admit_broker_temp(dir.path()).map_err(|_| "temp_admission_failed"),
+            || {
+                hermes_memory::admit_broker_temp(dir.path()).map_err(|error| {
+                    hermes_memory::BrokerTempGuard::admission_failure_label(&error)
+                })
+            },
             || hermes_memory::MemoryStore::open(dir.path()).map_err(|_| "store"),
             |guard, store| guard.verify_store(store).map_err(|_| "vfs"),
             |_| Ok(()),
@@ -1258,7 +1328,8 @@ mod tests {
             || Ok(()),
             || panic!("READY after rejection"),
         );
-        assert!(matches!(result, Err("temp_admission_failed")));
+        assert!(matches!(result, Err("temp_identity_failed")));
+        assert_eq!(result.err().map(service_exit_code), Some(1101));
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
     #[test]

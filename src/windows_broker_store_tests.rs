@@ -9,6 +9,11 @@ fn windows_private_temp_rejects_interactive_identity_without_environment_changes
     assert!(
         matches!(result, Err(MemoryError::Io(ref e)) if e.kind() == std::io::ErrorKind::PermissionDenied)
     );
+    let error = result.unwrap_err();
+    assert!(error.to_string().contains("temp_identity_failed"));
+    assert!(!error
+        .to_string()
+        .contains(&root.path().display().to_string()));
     assert_eq!(before, [std::env::var_os("TEMP"), std::env::var_os("TMP")]);
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
 }

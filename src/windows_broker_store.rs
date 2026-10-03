@@ -414,10 +414,26 @@ fn admit_namespace(
     service: &str,
     temp: bool,
 ) -> Result<Vec<OwnedHandle>, MemoryError> {
+    let mut stage = TempAdmissionStage::Path;
+    let result = admit_namespace_inner(root, service, temp, &mut stage);
+    if temp {
+        temp_stage(stage, result)
+    } else {
+        result
+    }
+}
+
+fn admit_namespace_inner(
+    root: &Path,
+    service: &str,
+    temp: bool,
+    stage: &mut TempAdmissionStage,
+) -> Result<Vec<OwnedHandle>, MemoryError> {
     validate_path(root)?;
     let text = root
         .to_str()
         .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    *stage = TempAdmissionStage::Volume;
     let volume = Path::new(&text[..3]);
     let mut filesystem = [0u16; 32];
     // SAFETY: terminated validated drive-root path and fixed output buffers.
@@ -452,6 +468,7 @@ fn admit_namespace(
     } else {
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
     };
+    *stage = TempAdmissionStage::Ancestor;
     let mut guards = vec![audit_path_shared(
         &current,
         service,
@@ -467,8 +484,14 @@ fn admit_namespace(
         } else {
             ObjectKind::Ancestor
         };
+        *stage = if kind == ObjectKind::TempRoot {
+            TempAdmissionStage::Root
+        } else {
+            TempAdmissionStage::Ancestor
+        };
         guards.push(audit_path_shared(&current, service, kind, sharing)?);
     }
+    *stage = TempAdmissionStage::Inventory;
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
         require(
@@ -490,6 +513,125 @@ fn admit_namespace(
     Ok(guards)
 }
 
+#[derive(Clone, Copy, Debug)]
+enum TempAdmissionStage {
+    Identity,
+    Path,
+    Volume,
+    Ancestor,
+    Root,
+    Inventory,
+    Environment,
+    NativePath,
+    RootRecheck,
+}
+
+impl TempAdmissionStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Identity => "temp_identity_failed",
+            Self::Path => "temp_path_failed",
+            Self::Volume => "temp_volume_failed",
+            Self::Ancestor => "temp_ancestor_failed",
+            Self::Root => "temp_root_failed",
+            Self::Inventory => "temp_inventory_failed",
+            Self::Environment => "temp_environment_failed",
+            Self::NativePath => "temp_native_path_failed",
+            Self::RootRecheck => "temp_root_recheck_failed",
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{label}")]
+struct TempAdmissionFailure {
+    label: &'static str,
+    #[source]
+    source: MemoryError,
+}
+
+fn temp_stage<T>(
+    stage: TempAdmissionStage,
+    result: Result<T, MemoryError>,
+) -> Result<T, MemoryError> {
+    result.map_err(|source| {
+        let kind = match &source {
+            MemoryError::Io(error) => error.kind(),
+            _ => std::io::ErrorKind::Other,
+        };
+        std::io::Error::new(
+            kind,
+            TempAdmissionFailure {
+                label: stage.label(),
+                source,
+            },
+        )
+        .into()
+    })
+}
+
+#[cfg(test)]
+mod temp_diagnostics_tests {
+    use super::*;
+
+    #[test]
+    fn temp_subreasons_use_typed_errors_not_private_error_text() {
+        use TempAdmissionStage::*;
+        for (stage, expected) in [
+            (Identity, "temp_identity_failed"),
+            (Path, "temp_path_failed"),
+            (Volume, "temp_volume_failed"),
+            (Ancestor, "temp_ancestor_failed"),
+            (Root, "temp_root_failed"),
+            (Inventory, "temp_inventory_failed"),
+            (Environment, "temp_environment_failed"),
+            (NativePath, "temp_native_path_failed"),
+            (RootRecheck, "temp_root_recheck_failed"),
+        ] {
+            let private = r"C:\private\secret S-1-5-21-123 temp_root_failed";
+            let error = temp_stage::<()>(
+                stage,
+                Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, private).into()),
+            )
+            .unwrap_err();
+            assert_eq!(BrokerTempGuard::admission_failure_label(&error), expected);
+            assert!(
+                matches!(&error, MemoryError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied)
+            );
+            assert!(!error.to_string().contains(private));
+            assert_eq!(temp_stage(stage, Ok(7)).unwrap(), 7);
+        }
+        for source in [
+            "temp_identity_failed",
+            "temp_root_failed",
+            r"C:\private\secret",
+        ] {
+            let error = std::io::Error::other(source).into();
+            assert_eq!(
+                BrokerTempGuard::admission_failure_label(&error),
+                "temp_admission_failed"
+            );
+        }
+        assert_eq!(
+            BrokerTempGuard::admission_failure_label(&MemoryError::LockPoisoned),
+            "temp_admission_failed"
+        );
+    }
+
+    #[test]
+    fn temp_invalid_namespace_has_bounded_subreason_without_changing_store_errors() {
+        let root = Path::new("private-relative-path");
+        let service = "S-1-5-80-1-2-3-4-5";
+        let error = admit_namespace(root, service, true).unwrap_err();
+        assert!(error.to_string().contains("temp_path_failed"));
+        assert!(!error.to_string().contains("private-relative-path"));
+        let store_error = admit_namespace(root, service, false).unwrap_err();
+        assert!(store_error
+            .to_string()
+            .contains("absolute local drive path"));
+    }
+}
+
 /// Pins the preprovisioned private TEMP namespace for the entire service lifetime.
 /// Dropping it releases handles, but deliberately does not restore process environment.
 #[derive(Debug)]
@@ -507,7 +649,7 @@ pub struct BrokerTempGuard {
 /// configuration or ACL is changed; existing files are audited, never deleted.
 /// On a post-admission environment/verification failure, abort service startup.
 pub fn admit_broker_temp(root: &Path) -> Result<BrokerTempGuard, MemoryError> {
-    let service = service_identity()?;
+    let service = temp_stage(TempAdmissionStage::Identity, service_identity())?;
     let handles = admit_namespace(root, &service, true)?;
     let guard = BrokerTempGuard {
         root: root.to_owned(),
@@ -516,31 +658,61 @@ pub fn admit_broker_temp(root: &Path) -> Result<BrokerTempGuard, MemoryError> {
     };
     for name in ["TEMP", "TMP"] {
         // SAFETY: valid terminated UTF-16 buffers; native process-only environment API.
-        win(unsafe {
-            windows_sys::Win32::System::Environment::SetEnvironmentVariableW(
-                wide(Path::new(name)).as_ptr(),
-                wide(root).as_ptr(),
-            )
-        })?;
+        temp_stage(
+            TempAdmissionStage::Environment,
+            win(unsafe {
+                windows_sys::Win32::System::Environment::SetEnvironmentVariableW(
+                    wide(Path::new(name)).as_ptr(),
+                    wide(root).as_ptr(),
+                )
+            }),
+        )?;
     }
     let mut buffer = vec![0u16; 32768];
     // SAFETY: output buffer has the declared capacity, bounded to the NT path limit.
     let len = unsafe { GetTempPathW(buffer.len() as u32, buffer.as_mut_ptr()) } as usize;
-    require(len > 0 && len < buffer.len(), "cannot resolve native TEMP")?;
-    let resolved = String::from_utf16(&buffer[..len])
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
-    let resolved = Path::new(resolved.trim_end_matches('\\'));
-    require(
-        resolved
-            .to_str()
-            .is_some_and(|p| p.eq_ignore_ascii_case(root.to_str().unwrap_or_default())),
-        "native TEMP differs from admitted root",
+    temp_stage(
+        TempAdmissionStage::NativePath,
+        require(len > 0 && len < buffer.len(), "cannot resolve native TEMP"),
     )?;
-    guard.verify_root_handle(resolved)?;
+    let resolved = temp_stage(
+        TempAdmissionStage::NativePath,
+        String::from_utf16(&buffer[..len])
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData).into()),
+    )?;
+    let resolved = Path::new(resolved.trim_end_matches('\\'));
+    temp_stage(
+        TempAdmissionStage::NativePath,
+        require(
+            resolved
+                .to_str()
+                .is_some_and(|p| p.eq_ignore_ascii_case(root.to_str().unwrap_or_default())),
+            "native TEMP differs from admitted root",
+        ),
+    )?;
+    temp_stage(
+        TempAdmissionStage::RootRecheck,
+        guard.verify_root_handle(resolved),
+    )?;
     Ok(guard)
 }
 
 impl BrokerTempGuard {
+    /// Bounded startup diagnostic for errors returned by `admit_broker_temp`.
+    /// Only typed internal stages are exposed: never paths, SIDs, ACLs, or error text.
+    /// Unrelated errors retain the original catch-all label; the admission API is unchanged.
+    pub fn admission_failure_label(error: &MemoryError) -> &'static str {
+        if let MemoryError::Io(error) = error {
+            if let Some(failure) = error
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<TempAdmissionFailure>())
+            {
+                return failure.label;
+            }
+        }
+        "temp_admission_failed"
+    }
+
     /// Verify the actual store connection before readiness (and before migration/index work).
     /// This observes the stock Win32 VFS's proposed TEMP filename, NOT an actual spill.
     pub fn verify_store(&self, store: &crate::MemoryStore) -> Result<(), MemoryError> {
