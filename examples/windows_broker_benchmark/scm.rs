@@ -249,7 +249,8 @@ fn root_grants(client_sid: &str, broker_sid: &str) -> Result<String> {
     ensure(client_sid != broker_sid, "service and client overlap")?;
     // C only needs to inspect this ancestor and traverse it; do not inherit this
     // grant onto B/controller artifacts. Production owns the install-small ACLs.
-    let audit = READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_TRAVERSE;
+    // CreateFileW adds SYNCHRONIZE to the explicit ancestor-audit access request.
+    let audit = READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_TRAVERSE | SYNCHRONIZE;
     Ok(format!(
         "(A;OICI;FRFX;;;{client_sid})(A;;0x{audit:x};;;{broker_sid})"
     ))
@@ -1204,6 +1205,63 @@ mod tests {
     }
 
     #[test]
+    fn createfile_ancestor_open_adds_synchronize_access() {
+        #[repr(C)]
+        #[derive(Default)]
+        struct ObjectBasicInformation {
+            attributes: u32,
+            granted_access: u32,
+            handle_count: u32,
+            pointer_count: u32,
+            reserved: [u32; 10],
+        }
+        #[link(name = "ntdll")]
+        extern "system" {
+            fn NtQueryObject(
+                handle: HANDLE,
+                class: i32,
+                information: *mut c_void,
+                length: u32,
+                returned: *mut u32,
+            ) -> i32;
+        }
+        // Read-only existing directory, same access/flags as ancestor admission:
+        // no fixture creation, service operations, or filesystem ACL mutation.
+        let path = std::env::current_dir().unwrap();
+        let requested = READ_CONTROL | FILE_READ_ATTRIBUTES;
+        for extra_flags in [0, FILE_FLAG_OVERLAPPED] {
+            // SAFETY: live terminated path, no output buffer, owned returned handle.
+            let h = handle(unsafe {
+                CreateFileW(
+                    wide(&path).as_ptr(),
+                    requested,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT | extra_flags,
+                    null_mut(),
+                )
+            })
+            .unwrap();
+            let mut info = ObjectBasicInformation::default();
+            let mut returned = 0;
+            // SAFETY: live handle, documented PUBLIC_OBJECT_BASIC_INFORMATION
+            // layout for ObjectBasicInformation (0), correctly sized output.
+            let status = unsafe {
+                NtQueryObject(
+                    h.0,
+                    0,
+                    (&mut info as *mut ObjectBasicInformation).cast(),
+                    size_of::<ObjectBasicInformation>() as u32,
+                    &mut returned,
+                )
+            };
+            assert_eq!(status, 0);
+            assert_eq!(info.granted_access, requested | SYNCHRONIZE);
+        }
+    }
+
+    #[test]
     fn small_c_planned_ancestor_chain_has_native_audit_rights() {
         let nonce = "123-456";
         let b = planned_sid(&format!("HMVBenchmark-{nonce}-B"));
@@ -1231,7 +1289,7 @@ mod tests {
         for invalid in ["", "../small", "small-C", "longerthan12chars"] {
             assert!(fixture.broker_name(invalid).is_err());
         }
-        let needed = READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_TRAVERSE;
+        let needed = READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_TRAVERSE | SYNCHRONIZE;
         // Pure plan for every fixture-owned ancestor of production temp/store.
         // Volume-root access and actual C token admission remain the hosted CI gate.
         for (path, grants) in [
