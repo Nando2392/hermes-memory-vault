@@ -18,6 +18,291 @@ pub struct Job {
     pub enrollment: PathBuf,
     pub client: PathBuf,
     pub seed_records: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pilot: Option<PilotJob>,
+}
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PilotJob {
+    pub schema: u8,
+    pub fixture_spec: crate::data::FixtureSpec,
+    pub epoch: String,
+}
+impl PilotJob {
+    pub fn validate(&self) -> Result<()> {
+        ensure(
+            self.schema == 1
+                && self.fixture_spec == crate::data::FixtureSpec::representative_6_mib(),
+            "only representative 6 MiB pilot admitted",
+        )?;
+        ensure(
+            !self.epoch.is_empty() && self.epoch.len() <= 256,
+            "pilot epoch bound",
+        )
+    }
+}
+/// Single-operation protocol. Publication uses a fully synced, create-new staging
+/// file and a no-replace hard link, so readers never observe partial JSON.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PilotPhase {
+    Ready,
+    Release,
+    Done,
+    Acknowledged,
+}
+impl PilotPhase {
+    fn index(self) -> usize {
+        self as usize
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Release => "release",
+            Self::Done => "done",
+            Self::Acknowledged => "acknowledged",
+        }
+    }
+}
+const PILOT_PHASES: [PilotPhase; 4] = [
+    PilotPhase::Ready,
+    PilotPhase::Release,
+    PilotPhase::Done,
+    PilotPhase::Acknowledged,
+];
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PilotMessage {
+    schema: u8,
+    epoch: String,
+    operation_id: u32,
+    phase: PilotPhase,
+}
+pub struct PilotBarrier {
+    root: PathBuf,
+    epoch: String,
+    next: usize,
+}
+impl PilotBarrier {
+    pub fn new(root: &Path, epoch: &str) -> Result<Self> {
+        ensure(!epoch.is_empty() && epoch.len() <= 256, "pilot epoch bound")?;
+        Ok(Self {
+            root: root.into(),
+            epoch: epoch.into(),
+            next: 0,
+        })
+    }
+    fn path(&self, phase: PilotPhase) -> PathBuf {
+        let dir = match phase {
+            PilotPhase::Ready | PilotPhase::Done => "scratch",
+            _ => "controller",
+        };
+        self.root
+            .join(dir)
+            .join(format!("pilot-{}.json", phase.name()))
+    }
+    fn validate_files(&self, phase: PilotPhase) -> Result<()> {
+        ensure(self.next == phase.index(), "pilot phase out of order")?;
+        for future in &PILOT_PHASES[self.next + 1..] {
+            ensure(
+                !self.path(*future).try_exists()?,
+                "pilot future phase already exists",
+            )?;
+        }
+        Ok(())
+    }
+    pub fn publish(&mut self, phase: PilotPhase) -> Result<()> {
+        self.validate_files(phase)?;
+        let destination = self.path(phase);
+        let staging = destination.with_extension("pending");
+        json_new(
+            &staging,
+            &PilotMessage {
+                schema: 1,
+                epoch: self.epoch.clone(),
+                operation_id: 0,
+                phase,
+            },
+        )?;
+        std::fs::hard_link(&staging, &destination)?;
+        self.next += 1;
+        Ok(())
+    }
+    pub fn wait(
+        &mut self,
+        phase: PilotPhase,
+        timeout: Duration,
+        cancelled: fn() -> bool,
+    ) -> Result<()> {
+        ensure(
+            !timeout.is_zero() && timeout <= Duration::from_secs(60),
+            "pilot deadline bound",
+        )?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            ensure(
+                !cancelled() && Instant::now() < deadline,
+                "pilot barrier cancelled or timed out",
+            )?;
+            self.validate_files(phase)?;
+            match File::open(self.path(phase)) {
+                Ok(file) => {
+                    ensure(
+                        file.metadata()?.is_file() && file.metadata()?.len() <= 1024,
+                        "pilot message size/type bound",
+                    )?;
+                    let mut bytes = Vec::new();
+                    file.take(1025).read_to_end(&mut bytes)?;
+                    ensure(bytes.len() <= 1024, "pilot message grew")?;
+                    let message: PilotMessage = serde_json::from_slice(&bytes)?;
+                    ensure(
+                        message.schema == 1
+                            && message.epoch == self.epoch
+                            && message.operation_id == 0
+                            && message.phase == phase,
+                        "stale or invalid pilot message",
+                    )?;
+                    self.next += 1;
+                    return Ok(());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    thread::sleep(Duration::from_millis(2))
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+}
+#[cfg(test)]
+mod pilot_tests {
+    use super::*;
+    #[test]
+    fn pilot_two_peers_release_exactly_one_operation_before_ack() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let root = tempfile::tempdir().unwrap();
+        for dir in ["scratch", "controller"] {
+            std::fs::create_dir(root.path().join(dir)).unwrap();
+        }
+        let operations = Arc::new(AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            let ops = operations.clone();
+            let path = root.path();
+            scope.spawn(move || {
+                let mut b = PilotBarrier::new(path, "owned-epoch").unwrap();
+                b.publish(PilotPhase::Ready).unwrap();
+                b.wait(PilotPhase::Release, Duration::from_secs(2), never_cancel)
+                    .unwrap();
+                ops.fetch_add(1, Ordering::SeqCst);
+                b.publish(PilotPhase::Done).unwrap();
+                b.wait(
+                    PilotPhase::Acknowledged,
+                    Duration::from_secs(2),
+                    never_cancel,
+                )
+                .unwrap();
+            });
+            let mut c = PilotBarrier::new(path, "owned-epoch").unwrap();
+            c.wait(PilotPhase::Ready, Duration::from_secs(2), never_cancel)
+                .unwrap();
+            assert_eq!(operations.load(Ordering::SeqCst), 0);
+            c.publish(PilotPhase::Release).unwrap();
+            c.wait(PilotPhase::Done, Duration::from_secs(2), never_cancel)
+                .unwrap();
+            assert_eq!(operations.load(Ordering::SeqCst), 1);
+            c.publish(PilotPhase::Acknowledged).unwrap();
+        });
+        assert_eq!(
+            std::fs::read_dir(root.path().join("scratch"))
+                .unwrap()
+                .count(),
+            4
+        );
+        assert_eq!(
+            std::fs::read_dir(root.path().join("controller"))
+                .unwrap()
+                .count(),
+            4
+        );
+    }
+    #[test]
+    fn pilot_job_rejects_schema_large_unknown_and_unbounded_epoch() {
+        let valid = PilotJob {
+            schema: 1,
+            fixture_spec: crate::data::FixtureSpec::representative_6_mib(),
+            epoch: "nonce".into(),
+        };
+        valid.validate().unwrap();
+        let original = serde_json::to_value(&valid).unwrap();
+        for (field, value) in [
+            ("schema", json!(2)),
+            ("epoch", json!("")),
+            ("epoch", json!("x".repeat(257))),
+        ] {
+            let mut bad = original.clone();
+            bad[field] = value;
+            assert!(serde_json::from_value::<PilotJob>(bad)
+                .unwrap()
+                .validate()
+                .is_err());
+        }
+        let mut bad = original.clone();
+        bad["fixture_spec"]["target_jsonl_bytes"] = json!(629145600);
+        assert!(serde_json::from_value::<PilotJob>(bad)
+            .unwrap()
+            .validate()
+            .is_err());
+        let mut bad = original;
+        bad["unrecognized"] = json!(true);
+        assert!(serde_json::from_value::<PilotJob>(bad).is_err());
+    }
+
+    #[test]
+    fn pilot_barrier_is_bounded_ordered_and_no_clobber() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("scratch")).unwrap();
+        std::fs::create_dir(temp.path().join("controller")).unwrap();
+        let mut barrier = PilotBarrier::new(temp.path(), "test-epoch").unwrap();
+        assert!(barrier
+            .wait(PilotPhase::Ready, Duration::from_millis(1), never_cancel)
+            .is_err());
+        assert!(barrier.publish(PilotPhase::Done).is_err());
+        barrier.publish(PilotPhase::Ready).unwrap();
+        let original = std::fs::read(temp.path().join("scratch/pilot-ready.json")).unwrap();
+        assert!(barrier.publish(PilotPhase::Ready).is_err());
+        assert_eq!(
+            std::fs::read(temp.path().join("scratch/pilot-ready.json")).unwrap(),
+            original
+        );
+        let mut stale = PilotBarrier::new(temp.path(), "stale-epoch").unwrap();
+        assert!(stale
+            .wait(PilotPhase::Ready, Duration::from_millis(20), never_cancel)
+            .is_err());
+        for phase in [
+            PilotPhase::Release,
+            PilotPhase::Done,
+            PilotPhase::Acknowledged,
+        ] {
+            barrier.publish(phase).unwrap();
+        }
+        let mut reader = PilotBarrier::new(temp.path(), "test-epoch").unwrap();
+        assert!(reader
+            .wait(PilotPhase::Ready, Duration::from_millis(20), never_cancel)
+            .is_err());
+        let other = tempfile::tempdir().unwrap();
+        std::fs::create_dir(other.path().join("scratch")).unwrap();
+        std::fs::write(
+            other.path().join("scratch/pilot-ready.json"),
+            vec![b' '; 1025],
+        )
+        .unwrap();
+        assert!(PilotBarrier::new(other.path(), "test-epoch")
+            .unwrap()
+            .wait(PilotPhase::Ready, Duration::from_millis(20), never_cancel)
+            .is_err());
+    }
 }
 pub fn ensure(ok: bool, message: &str) -> Result<()> {
     if ok {
@@ -106,6 +391,77 @@ pub fn command(
     timeout: Duration,
     cancelled: fn() -> bool,
 ) -> Result<Value> {
+    command_inner(
+        &CommandRequest {
+            exe,
+            args,
+            input,
+            directory,
+            label,
+            timeout,
+            cancelled,
+        },
+        None,
+    )
+}
+
+pub struct CommandRequest<'a> {
+    pub exe: &'a Path,
+    pub args: &'a [String],
+    pub input: &'a [u8],
+    pub directory: &'a Path,
+    pub label: &'a str,
+    pub timeout: Duration,
+    pub cancelled: fn() -> bool,
+}
+
+/// Instrument one direct CLI child; representative admission belongs to the controller.
+#[allow(dead_code)]
+pub fn command_measured(
+    request: &CommandRequest<'_>,
+    policy: &crate::measure::SamplePolicy,
+) -> Result<Value> {
+    policy.validate()?;
+    let argument_bytes = request
+        .args
+        .iter()
+        .try_fold(0usize, |sum, arg| sum.checked_add(arg.len()))
+        .ok_or("argument size overflow")?;
+    ensure(
+        request.args.len() <= 128 && argument_bytes <= 65536,
+        "measured argument bound",
+    )?;
+    ensure(
+        !request.timeout.is_zero() && request.timeout <= Duration::from_secs(45),
+        "measured timeout bound",
+    )?;
+    ensure(
+        request.input.len() <= 2 * 1024 * 1024,
+        "representative stdin bound",
+    )?;
+    #[cfg(not(all(windows, feature = "experimental-broker")))]
+    return Err("measured command requires Windows and experimental-broker".into());
+    #[cfg(all(windows, feature = "experimental-broker"))]
+    command_inner(request, Some(policy))
+}
+
+fn command_inner(
+    request: &CommandRequest<'_>,
+    policy: Option<&crate::measure::SamplePolicy>,
+) -> Result<Value> {
+    let CommandRequest {
+        exe,
+        args,
+        input,
+        directory,
+        label,
+        timeout,
+        cancelled,
+    } = *request;
+    #[cfg(all(windows, feature = "experimental-broker"))]
+    let mut sampler = policy.map(|p| crate::measure::ChildSampler::new(p, input.len() as u64));
+    #[cfg(not(all(windows, feature = "experimental-broker")))]
+    ensure(policy.is_none(), "unsupported measurement")?;
     ensure(
         !label.is_empty()
             && label
@@ -115,10 +471,15 @@ pub fn command(
     )?;
     ensure(input.len() <= 8 * 1024 * 1024, "stdin bound")?;
     let prefix = directory.join(label);
-    json_new(
-        &prefix.with_extension("intent.json"),
-        &json!({"exe":exe,"args":args,"deadline_ms":timeout.as_millis()}),
-    )?;
+    let mut intent = json!({"exe":exe,"args":args,"deadline_ms":timeout.as_millis()});
+    if let Some(policy) = policy {
+        intent["measurement_policy"] = serde_json::to_value(policy)?;
+        ensure(
+            serde_json::to_vec_pretty(&intent)?.len() < 65536,
+            "measured intent bound",
+        )?;
+    }
+    json_new(&prefix.with_extension("intent.json"), &intent)?;
     let stdin = prefix.with_extension("stdin");
     let stdout = prefix.with_extension("stdout");
     let stderr = prefix.with_extension("stderr");
@@ -162,6 +523,12 @@ pub fn command(
         let mut shutdown = None;
         let mut drain_started = None;
         loop {
+            #[cfg(all(windows, feature = "experimental-broker"))]
+            if status.is_none() {
+                if let Some(sampler) = &mut sampler {
+                    sampler.poll(&child, started);
+                }
+            }
             let mut progress = false;
             if capture_error.is_none()
                 && drain_started.is_none_or(|t: Instant| t.elapsed() < Duration::from_millis(250))
@@ -177,7 +544,15 @@ pub fn command(
             }
             if status.is_none() && wait_error.is_none() {
                 match child.try_wait() {
-                    Ok(value) => status = value,
+                    Ok(value) => {
+                        status = value;
+                        #[cfg(all(windows, feature = "experimental-broker"))]
+                        if status.is_some() {
+                            if let Some(sampler) = &mut sampler {
+                                sampler.exited(&child, started);
+                            }
+                        }
+                    }
                     Err(error) => wait_error = Some(error.to_string()),
                 }
             }
@@ -241,6 +616,15 @@ pub fn command(
         "timed_out":timed_out,"stop_requested":stopped,"elapsed_us":started.elapsed().as_micros(),
         "stdout":String::from_utf8_lossy(&stdout_capture.bytes),"stderr":String::from_utf8_lossy(&stderr_capture.bytes),
         "stdout_file":stdout,"stderr_file":stderr});
+    #[cfg(all(windows, feature = "experimental-broker"))]
+    let value = if let Some(mut sampler) = sampler {
+        let mut value = value;
+        sampler.evidence.command_success = success;
+        value["measurement"] = serde_json::to_value(sampler.evidence)?;
+        value
+    } else {
+        value
+    };
     json_new(&prefix.with_extension("result.json"), &value)?;
     Ok(value)
 }
@@ -337,6 +721,221 @@ mod tests {
                 .unwrap();
         assert_eq!(result, persisted);
         (dir, result)
+    }
+
+    #[test]
+    fn measured_policy_and_platform_refuse_before_any_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let args = vec!["--help".into()];
+        let request = CommandRequest {
+            exe: &exe,
+            args: &args,
+            input: b"",
+            directory: dir.path(),
+            label: "rejected",
+            timeout: Duration::from_secs(1),
+            cancelled: never_cancel,
+        };
+        for variant in 0..7 {
+            let mut policy = crate::measure::SamplePolicy::cli(1, 0);
+            match variant {
+                0 => policy.schema = 1,
+                1 => policy.identity.epoch = 0,
+                2 => policy.identity.role = crate::measure::ProcessRole::BrokerC,
+                3 => policy.identity.role = crate::measure::ProcessRole::SupervisorB,
+                4 => policy.operation_id = 80,
+                5 => policy.max_timepoints = 0,
+                _ => policy.max_timepoints = 13,
+            }
+            assert!(command_measured(&request, &policy).is_err());
+        }
+        let policy = crate::measure::SamplePolicy::cli(1, 0);
+        for timeout in [Duration::ZERO, Duration::from_secs(46)] {
+            assert!(command_measured(&CommandRequest { timeout, ..request }, &policy).is_err());
+        }
+        let oversized = vec![b'x'; 2 * 1024 * 1024 + 1];
+        assert!(command_measured(
+            &CommandRequest {
+                input: &oversized,
+                ..request
+            },
+            &policy
+        )
+        .is_err());
+        #[cfg(not(all(windows, feature = "experimental-broker")))]
+        assert!(command_measured(&request, &policy)
+            .unwrap_err()
+            .to_string()
+            .contains("requires Windows"));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(all(windows, feature = "experimental-broker"))]
+    #[test]
+    fn measured_capture_failures_keep_final_io_and_never_become_success() {
+        for (n, mode) in [
+            "nonzero",
+            "timeout",
+            "live-stdout",
+            "live-stderr",
+            "descendant",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let exe = std::env::current_exe().unwrap();
+            let args = vec![
+                "--ignored".into(),
+                "--exact".into(),
+                "contract::tests::capture_fixture".into(),
+                "--nocapture".into(),
+            ];
+            let result = command_measured(
+                &CommandRequest {
+                    exe: &exe,
+                    args: &args,
+                    input: mode.as_bytes(),
+                    directory: dir.path(),
+                    label: "failure",
+                    timeout: if *mode == "timeout" {
+                        Duration::from_millis(100)
+                    } else {
+                        Duration::from_secs(5)
+                    },
+                    cancelled: never_cancel,
+                },
+                &crate::measure::SamplePolicy::cli(n as u64 + 1, 0),
+            )
+            .unwrap();
+            if *mode == "descendant" {
+                thread::sleep(Duration::from_millis(2200));
+                assert!(dir.path().join("descendant-completed").exists());
+            }
+            assert_eq!(result["success"], false, "{mode}");
+            let evidence: crate::measure::CommandMeasurement =
+                serde_json::from_value(result["measurement"].clone()).unwrap();
+            evidence.validate().unwrap();
+            assert!(!evidence.command_success);
+            assert!(evidence.child_exit_us.is_some());
+            assert!(evidence.final_lifetime_logical_io.is_some());
+            assert!(evidence.timepoints.len() <= 12);
+            for stream in ["stdout", "stderr"] {
+                assert!(
+                    fs::metadata(dir.path().join(format!("failure.{stream}")))
+                        .unwrap()
+                        .len()
+                        <= OUTPUT_LIMIT as u64
+                );
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let result = command_measured(
+            &CommandRequest {
+                exe: &dir.path().join("missing.exe"),
+                args: &[],
+                input: b"",
+                directory: dir.path(),
+                label: "spawn",
+                timeout: Duration::from_secs(1),
+                cancelled: never_cancel,
+            },
+            &crate::measure::SamplePolicy::cli(1, 0),
+        )
+        .unwrap();
+        assert_eq!(result["success"], false);
+        assert!(result["measurement"]["memory"].is_null());
+        assert!(result["measurement"]["final_lifetime_logical_io"].is_null());
+    }
+
+    #[cfg(all(windows, feature = "experimental-broker"))]
+    #[test]
+    fn measured_metadata_admission_precedes_writes_and_intent_pins_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let too_large = vec!["x".repeat(65537)];
+        let mut request = CommandRequest {
+            exe: &exe,
+            args: &too_large,
+            input: b"",
+            directory: dir.path(),
+            label: "admission",
+            timeout: Duration::from_secs(2),
+            cancelled: never_cancel,
+        };
+        let policy = crate::measure::SamplePolicy::cli(1, 0);
+        assert!(command_measured(&request, &policy).is_err());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+        let args = vec!["--help".into()];
+        request.args = &args;
+        command_measured(&request, &policy).unwrap();
+        let intent: Value =
+            serde_json::from_reader(File::open(dir.path().join("admission.intent.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            intent["measurement_policy"],
+            serde_json::to_value(&policy).unwrap()
+        );
+        let before = fs::read(dir.path().join("admission.result.json")).unwrap();
+        assert!(command_measured(&request, &policy).is_err());
+        assert_eq!(
+            before,
+            fs::read(dir.path().join("admission.result.json")).unwrap()
+        );
+    }
+
+    #[cfg(all(windows, feature = "experimental-broker"))]
+    #[test]
+    fn measured_command_retains_real_child_io_and_memory_without_changing_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let args = vec![
+            "--ignored".into(),
+            "--exact".into(),
+            "contract::tests::capture_sleeper".into(),
+            "--nocapture".into(),
+        ];
+        let policy = crate::measure::SamplePolicy::cli(7, 0);
+        let result = command_measured(
+            &CommandRequest {
+                exe: &exe,
+                args: &args,
+                input: b"",
+                directory: dir.path(),
+                label: "measured",
+                timeout: Duration::from_secs(5),
+                cancelled: never_cancel,
+            },
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(result["success"], true);
+        let evidence: crate::measure::CommandMeasurement =
+            serde_json::from_value(result["measurement"].clone()).unwrap();
+        assert_eq!(
+            evidence.identity.role,
+            crate::measure::ProcessRole::CliChild
+        );
+        assert_eq!(evidence.identity.epoch, 7);
+        assert!(evidence.live_samples > 0);
+        assert!(evidence.memory.as_ref().unwrap().sampled_private_bytes > 0);
+        assert!(
+            evidence
+                .final_lifetime_logical_io
+                .as_ref()
+                .unwrap()
+                .write_bytes
+                > 0
+        );
+        assert!(evidence.child_exit_us.is_some());
+        assert!(evidence.final_io_error.is_none());
+        let persisted: Value =
+            serde_json::from_reader(File::open(dir.path().join("measured.result.json")).unwrap())
+                .unwrap();
+        assert_eq!(persisted, result);
+        let (_, legacy) = fixture("nonzero", Duration::from_secs(5));
+        assert!(legacy.get("measurement").is_none());
     }
 
     #[cfg(windows)]

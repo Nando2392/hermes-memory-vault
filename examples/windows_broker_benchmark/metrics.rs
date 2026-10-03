@@ -165,6 +165,10 @@ impl LogicalIoCounters {
     }
 }
 
+/// Memory values are individual-process observations, not simultaneous totals.
+/// A stage maximum of current samples is only a sampled lower bound; lifetime
+/// peaks include earlier startup and live child samples can miss terminal peaks.
+/// Never sum independent peaks or substitute B supervisor memory for CLI memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcessSnapshot {
     pub logical_io: LogicalIoCounters,
@@ -253,6 +257,57 @@ pub unsafe fn sample_process(
         peak_private_bytes: memory.PeakPagefileUsage as u64,
         working_set_bytes: memory.WorkingSetSize as u64,
         peak_working_set_bytes: memory.PeakWorkingSetSize as u64,
+    })
+}
+
+/// Query final lifetime logical process IO only after a retained direct child exits.
+/// Includes files/devices/pipes, NOT physical disk traffic. No memory is returned:
+/// absent live samples remain missing coverage, never fabricated zero memory.
+///
+/// # Safety
+/// `handle` must be the caller's retained direct-child process handle (or a
+/// duplicate), valid throughout this call, with PROCESS_QUERY_INFORMATION and
+/// SYNCHRONIZE access. No PID reopen, ownership transfer, close or termination.
+/// Direct-child provenance is the caller's obligation, not inferable from HANDLE.
+#[cfg(windows)]
+pub unsafe fn sample_exited_child_logical_io(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+) -> io::Result<LogicalIoCounters> {
+    use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessIoCounters, WaitForSingleObject, IO_COUNTERS,
+    };
+    if handle.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "null child process handle",
+        ));
+    }
+    // SAFETY: caller pins a valid process handle with synchronization access.
+    match unsafe { WaitForSingleObject(handle, 0) } {
+        WAIT_OBJECT_0 => (),
+        WAIT_TIMEOUT => {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "retained child is still running",
+            ))
+        }
+        WAIT_FAILED => return Err(io::Error::last_os_error()),
+        _ => return Err(io::Error::other("unexpected child process wait result")),
+    }
+    // SAFETY: IO_COUNTERS has only integer fields and the output buffer is valid.
+    let mut counters: IO_COUNTERS = unsafe { std::mem::zeroed() };
+    // SAFETY: retained exited process handle still pins the kernel process object.
+    if unsafe { GetProcessIoCounters(handle, &mut counters) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(LogicalIoCounters {
+        read_operations: counters.ReadOperationCount,
+        write_operations: counters.WriteOperationCount,
+        other_operations: counters.OtherOperationCount,
+        read_bytes: counters.ReadTransferCount,
+        write_bytes: counters.WriteTransferCount,
+        other_bytes: counters.OtherTransferCount,
     })
 }
 

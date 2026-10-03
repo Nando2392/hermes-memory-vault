@@ -36,7 +36,13 @@ mod policy {
 #[cfg(all(windows, feature = "experimental-broker"))]
 #[path = "windows_broker_benchmark/scm.rs"]
 mod scm;
+// Historical small mode remains unmeasured; the explicit pilot uses this seam.
+#[path = "windows_broker_benchmark/measure.rs"]
+#[allow(dead_code)]
+mod measure;
 use clap::Parser;
+#[cfg(all(windows, feature = "experimental-broker"))]
+use scm::metrics;
 #[derive(Debug, Parser)]
 #[command(
     about = "6 MiB real broker case; hosted disposable Windows CI only. No default execution."
@@ -60,6 +66,9 @@ pub struct Options {
     client_exe: Option<std::path::PathBuf>,
     #[arg(long)]
     admin_exe: Option<std::path::PathBuf>,
+    /// One measured representative-v2 insert; incomplete pilot, not steady-state evidence.
+    #[arg(long)]
+    representative_small_pilot: bool,
     /// Unsupported by this small-case controller; never silently ignored.
     #[arg(long)]
     large_mib: Option<u64>,

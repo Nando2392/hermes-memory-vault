@@ -8,6 +8,12 @@ on:
     paths: ['.github/workflows/windows-broker-benchmark.yml']
   workflow_dispatch:
     inputs:
+      case:
+        description: 'Disposable 6 MiB only; pilot correctness is not performance acceptance'
+        type: choice
+        required: true
+        default: small
+        options: [small, representative-small-pilot]
       reviewed:
         description: 'Independent source AND workflow review completed; disposable 6 MiB only'
         type: boolean
@@ -28,6 +34,8 @@ jobs:
         run: Write-Output 'Registration only; benchmark requires a separate reviewed manual dispatch.'
   small:
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/test/posix-sqlite-hardening' && inputs.reviewed == true
+    env:
+      BENCHMARK_CASE: ${{ inputs.case }}
     runs-on: windows-2022
     timeout-minutes: 35
     steps:
@@ -43,10 +51,12 @@ jobs:
           root = pathlib.Path.cwd()
           evidence = root / 'target/ci-small-raw'
           evidence.mkdir(parents=True, exist_ok=False)
-          provenance = {'schema': 1, 'case': 'small-6MiB', 'gate_pass': False}
+          provenance = {'schema': 1, 'requested_case': os.environ.get('BENCHMARK_CASE'), 'gate_pass': False}
           def digest(path):
               return hashlib.sha256(path.read_bytes()).hexdigest()
           try:
+              if os.environ.get('BENCHMARK_CASE') not in ('small', 'representative-small-pilot'):
+                  raise RuntimeError('Unsupported benchmark case; only disposable 6 MiB allowed')
               expected = {
                   'GITHUB_ACTIONS': 'true', 'RUNNER_ENVIRONMENT': 'github-hosted',
                   'RUNNER_OS': 'Windows', 'ImageOS': 'win22',
@@ -77,10 +87,10 @@ jobs:
               provenance['source_files'] = inventory
               source_digest = hashlib.sha256(json.dumps(inventory, separators=(',', ':')).encode()).hexdigest()
               provenance['source_sha256'] = source_digest
-              # Derived from all 44 build-source files after POSIX CLI fixes.
-              # Changing this pin requires another independent source review.
-              if source_digest != '4f3719d26ec0de80c69cb1804eea71346725919192a6d1e8c5737a26236a3386':
-                  raise RuntimeError('Build inputs differ from reviewed small-case snapshot')
+              # Frozen 44-file pilot snapshot; NOT inherited approval.
+              # This exact combined source/workflow requires independent review.
+              if len(inventory) != 44 or source_digest != '5069d5f8ad384e10f2157d3d6512d30a5b03d751ad19e5ea04c47e750f1832db':
+                  raise RuntimeError('Build inputs differ from frozen small/pilot snapshot')
               provenance['workflow_sha256'] = digest(root / '.github/workflows/windows-broker-benchmark.yml')
               provenance['gate_pass'] = True
           except Exception as error:
@@ -107,18 +117,18 @@ jobs:
           }
           exit $originalExit
 
-      - name: Run only synthetic small case with bounded direct-child supervision
+      - name: Run selected disposable 6 MiB case with bounded direct-child supervision
         timeout-minutes: 12
         shell: python
         run: |
-          import hashlib, json, pathlib, subprocess, sys, threading, time
+          import hashlib, json, os, pathlib, subprocess, sys, threading, time
           root = pathlib.Path.cwd()
           evidence = root / 'target/ci-small-raw'
           result_path = evidence / 'result.json'
           stream_limit = 1024 * 1024
           result_limit = 16 * 1024 * 1024
           deadline_seconds = 600
-          status = {'schema': 1, 'case': 'small-6MiB', 'child_exit_code': None,
+          status = {'schema': 1, 'requested_case': os.environ.get('BENCHMARK_CASE'), 'child_exit_code': None,
                     'timed_out': False, 'validated': False, 'deadline_seconds': deadline_seconds,
                     'cleanup': 'Harness-owned services only; fixtures retained for hosted VM disposal'}
           code = 1
@@ -128,6 +138,155 @@ jobs:
                       for name in ('stdout', 'stderr')}
           lock = threading.Lock()
           bad_capture = threading.Event()
+          def require(condition, message):
+              if not condition:
+                  raise RuntimeError(message)
+          def selected_case(value):
+              require(value in ('small', 'representative-small-pilot'), 'Unsupported 6 MiB case')
+              return value == 'representative-small-pilot'
+          def uint(value):
+              return type(value) is int and 0 <= value <= 18446744073709551615
+          def sha(value):
+              return isinstance(value, str) and len(value) == 64 and all(c in '0123456789abcdef' for c in value)
+          def logical_io(value):
+              keys = {'read_operations', 'write_operations', 'other_operations', 'read_bytes', 'write_bytes', 'other_bytes'}
+              require(isinstance(value, dict) and set(value) == keys and all(uint(v) for v in value.values()), 'Logical IO schema')
+          def process_sample(value):
+              logical_io(value['logical_io'])
+              for key in ('private_bytes', 'working_set_bytes', 'lifetime_peak_private_bytes', 'lifetime_peak_working_set_bytes'):
+                  require(uint(value[key]), 'Process memory schema')
+          def validate_measurement(m, payload_bytes):
+              # Mirrors the current Rust schema, including explicitly missing coverage.
+              fields = 'schema identity operation_id payload_bytes command_success child_exit_us live_attempts live_samples exit_races live_errors first_live_error first_sample_us last_sample_us max_sample_gap_us memory timepoints omitted_timepoints final_lifetime_logical_io final_io_error'.split()
+              require(isinstance(m, dict) and set(m) == set(fields), 'CLI measurement fields')
+              require(type(m['schema']) is int and m['schema'] == 2 and type(m['operation_id']) is int and m['operation_id'] == 0, 'CLI schema/operation')
+              require(m['identity'] == {'role': 'cli-child', 'epoch': 3} and type(m['identity']['epoch']) is int, 'CLI retained epoch')
+              require(uint(m['payload_bytes']) and m['payload_bytes'] == payload_bytes and m['command_success'] is True, 'CLI payload/success')
+              for key in ('child_exit_us', 'live_attempts', 'live_samples', 'exit_races', 'live_errors', 'max_sample_gap_us', 'omitted_timepoints'):
+                  require(uint(m[key]), 'CLI numeric metadata')
+              require(m['live_attempts'] == m['live_samples'] + m['exit_races'] + m['live_errors'], 'CLI attempt accounting')
+              points = m['timepoints']
+              require(isinstance(points, list) and len(points) <= 12 and len(points) + m['omitted_timepoints'] == m['live_samples'], 'CLI retained point accounting')
+              has_samples = m['live_samples'] > 0
+              for key in ('memory', 'first_sample_us', 'last_sample_us'):
+                  require((m[key] is not None) == has_samples, 'CLI missing coverage must remain null')
+              require((m['first_live_error'] is not None) == (m['live_errors'] > 0), 'CLI live error accounting')
+              for key in ('first_live_error', 'final_io_error'):
+                  require(m[key] is None or (isinstance(m[key], str) and len(m[key].encode()) <= 2048), 'CLI error bound')
+              final_io = m['final_lifetime_logical_io']
+              if final_io is not None:
+                  logical_io(final_io)
+                  require(m['final_io_error'] is None, 'CLI final IO with error')
+              if has_samples:
+                  require(uint(m['first_sample_us']) and uint(m['last_sample_us']) and m['first_sample_us'] <= m['last_sample_us'] <= m['child_exit_us'], 'CLI sample times')
+                  memory_keys = ('sampled_private_bytes', 'sampled_working_set_bytes', 'observed_lifetime_peak_private_bytes', 'observed_lifetime_peak_working_set_bytes')
+                  require(isinstance(m['memory'], dict) and set(m['memory']) == set(memory_keys) and all(uint(v) for v in m['memory'].values()), 'CLI memory schema')
+              previous = None
+              for point in points:
+                  require(isinstance(point, dict) and set(point) == {'since_spawn_start_us', 'logical_io', 'private_bytes', 'working_set_bytes', 'lifetime_peak_private_bytes', 'lifetime_peak_working_set_bytes'}, 'CLI timepoint fields')
+                  process_sample(point)
+                  t = point['since_spawn_start_us']
+                  require(uint(t) and m['first_sample_us'] <= t <= m['last_sample_us'], 'CLI timepoint coverage')
+                  if previous is not None:
+                      require(t >= previous['since_spawn_start_us'] and all(point['logical_io'][k] >= previous['logical_io'][k] for k in point['logical_io']), 'CLI counter/time regression')
+                  if final_io is not None:
+                      require(all(final_io[k] >= point['logical_io'][k] for k in final_io), 'CLI final counter regression')
+                  for maximum, field in zip(memory_keys, ('private_bytes', 'working_set_bytes', 'lifetime_peak_private_bytes', 'lifetime_peak_working_set_bytes')):
+                      require(m['memory'][maximum] >= point[field], 'CLI sampled maximum regression')
+                  previous = point
+          def command_group(group, expected):
+              require(isinstance(group, list) and len(group) == len(expected), 'Missing/extra command evidence')
+              for command, label in zip(group, expected):
+                  # Current wire format carries the label through stdout_file, not a label field.
+                  filename = command['stdout_file'].replace('\\', '/').rsplit('/', 1)[-1]
+                  require(filename == label + '.stdout', 'Command order/identity')
+                  require(all(command.get(k) is True for k in ('capture_complete', 'child_exited')), 'Incomplete nested capture')
+                  require(all(command.get(k) is False for k in ('timed_out', 'stop_requested', 'stdout_overflow', 'stderr_overflow')), 'Nested deadline/capture exceeded')
+                  require(all(k in command and command[k] is None for k in ('spawn_error', 'capture_error', 'kill_error', 'wait_error')), 'Nested infrastructure error')
+                  require(type(command.get('exit_code')) is int, 'Missing command exit')
+                  if label in ('wrong-workspace', 'wrong-root', 'wrong-server-pin'):
+                      require(command['exit_code'] != 0 and command.get('success') is False and 'unauthorized' in command['stderr'], 'Missing explicit denial')
+                  else:
+                      require(command['exit_code'] == 0 and command.get('success') is True, 'Command failed')
+              return dict(zip(expected, group))
+          def validate_report(report, case, pins):
+              pilot = selected_case(case)
+              require(type(report.get('schema')) is int and report['schema'] == (2 if pilot else 1) and report.get('case') == ('representative-6MiB-pilot' if pilot else 'small-6MiB'), 'Controller schema/case mismatch')
+              require(report.get('pass') is True and 'error' not in report, 'Controller correctness failure')
+              require(report.get('source_unchanged') is True and report.get('client_registration_deleted') is True, 'Controller source/cleanup failure')
+              require(report.get('executable_sha256') == {role: pins[role] for role in ('admin', 'broker', 'client')}, 'Executable pin mismatch')
+              client = report['client']
+              require(type(client.get('schema')) is int and client['schema'] == 1 and client.get('pass') is True and 'error' not in client, 'Client correctness failure')
+              for key in ('source_unchanged', 'local_sqlite_write_denied', 'wrong_server_enrollment_admitted_but_pipe_peer_denied'):
+                  require(client.get(key) is True, 'Missing client source/authorization check')
+              command_group(report['commands'], ['plan', 'prepare', 'activate', 'status', 'stop'])
+              insert = 'pilot-insert' if pilot else 'ingest'
+              commands = command_group(client['commands'], ['scoped-search', insert, 'duplicate', 'unchanged-snapshot', 'known-search', 'wrong-workspace', 'wrong-root', 'wrong-server-pin', 'export'])
+              for label, expected in ((insert, {'inserted': 1, 'duplicates': 0}), ('duplicate', {'inserted': 0, 'duplicates': 1}), ('unchanged-snapshot', {'inserted': 0, 'duplicates': 0}), ('export', {'sessions': 18 if pilot else 3})):
+                  require(json.loads(commands[label]['stdout']) == expected, 'CLI acknowledgement mismatch')
+              record = {'id': 'benchmark-000009000000', 'session_id': 'benchmark-client', 'workspace': 'disposable-benchmark', 'kind': 'user', 'content': 'hmvsmallcanary actual broker client durable record', 'timestamp': 1709000000.0, 'metadata': {'fixture': True, 'index': 9000000}}
+              require(json.loads(commands['known-search']['stdout']) == [record], 'Exact known search')
+              hits = json.loads(commands['scoped-search']['stdout'])
+              require(isinstance(hits, list) and len(hits) > 0 and all(h.get('workspace') == 'disposable-benchmark' for h in hits), 'Scoped search')
+              generation = report['generation']
+              seeds = generation['seed_records']
+              require(uint(seeds) and 0 < seeds <= (400000 if pilot else 100000) and generation['records'] == seeds + 1, 'Generation counts')
+              require(sha(generation['logical_sha256']) and generation['snapshot_states'] == 1 and generation['snapshot_counters'] == 1, 'Generation receipt')
+              require(bool(generation['source_before']) and generation['source_before'] == generation['source_after'], 'Generation source inventory')
+              startup = report['startup_import']
+              for key in ('records', 'snapshot_states', 'snapshot_counters', 'logical_sha256'):
+                  require(startup['persisted_startup_receipt'][key] == generation[key], 'Persisted startup receipt mismatch')
+              final = startup['final_read_only_export']
+              require(final['records'] == seeds + 2 and final['snapshot_states'] == 1 and final['snapshot_counters'] == 1 and sha(final['logical_sha256']), 'Stopped database receipt')
+              export = client['export']
+              require(export['records'] == seeds + 2 and export['sessions'] == (18 if pilot else 3) and len(export['files']) == export['sessions'] and sha(export['index_sha256']), 'Export counts')
+              require(export.get('snapshot_payload_verified') is True and export.get('exact_payloads_verified' if pilot else 'known_payload_verified') is True, 'Export payload checks')
+              require(report['client_stop']['process']['exited'] is True and report['client_stop']['process']['exit_code'] == 0 and report['client_stop']['scm_exit_code'] == 0, 'Client clean stop')
+              require(report['broker_exit']['exited'] is True and report['broker_exit']['exit_code'] == 0, 'Broker clean stop')
+              before, after = report['broker_before'], report['broker_after']
+              require(bool(before['initial_identity']) and before['initial_identity'] == after['initial_identity'] and before['name'] == after['name'], 'Retained C identity changed')
+              require(before['pinned_process']['exited'] is False and after['pinned_process']['exited'] is True and after['pinned_process']['exit_code'] == 0, 'Retained C lifecycle')
+              metrics = report['metrics']
+              require(all(obj.get('performance_complete', False) is False for obj in (report, metrics, client)), 'Unapproved performance claim')
+              if not pilot:
+                  # Legacy emits byte/inventory evidence, not a representative fixture_spec.
+                  # Bound retained JSONL; do not infer an exact 6 MiB legacy corpus.
+                  source_jsonl = generation['source_before'].get('events.jsonl')
+                  require(uint(generation.get('jsonl_bytes')) and 0 < generation['jsonl_bytes'] <= 8388608 and isinstance(source_jsonl, dict) and uint(source_jsonl.get('bytes')) and source_jsonl['bytes'] == generation['jsonl_bytes'] and sha(source_jsonl.get('sha256')), 'Legacy fixture byte evidence')
+                  require(metrics.get('measured') is False and 'pilot' not in client and all('measurement' not in c for c in client['commands']), 'Legacy small must remain unmeasured')
+                  return {'correctness_pass': True, 'measurement_status': 'not-measured', 'performance_complete': False}
+              require(generation['fixture_spec'] == {'shape': 'representative-v2', 'target_jsonl_bytes': 6291456}, 'Pilot fixture spec; no large case')
+              require(metrics.get('measured') is True and metrics.get('sampling_complete') is False and metrics.get('performance_policy_status') == 'unapproved', 'Pilot is incomplete/unapproved')
+              interval = metrics['pilot_interval']
+              for key, value in (('schema', 1), ('operation_id', 0), ('broker_epoch', 1), ('supervisor_epoch', 2), ('cli_epoch', 3)):
+                  require(type(interval[key]) is int and interval[key] == value, 'Pilot schema/retained epochs')
+              require(interval['stage'] == 'pilot-first-warmup-only' and interval['case_epoch'] == report['fixture']['client_service'] and isinstance(interval['case_epoch'], str) and 1 <= len(interval['case_epoch'].encode()) <= 256, 'Pilot case epoch/stage')
+              require(interval['coverage'] == 'two boundary samples only; no cadence or interval peak claim', 'Pilot coverage claim')
+              require(interval['hashing'] == 'outside measured interval; warm-cache evidence' and interval['logical_io_semantics'] == 'process logical IO, not physical disk or broker-store-only IO' and interval['memory_semantics'] == 'sampled lower bounds; lifetime peaks include startup; no sum of peaks', 'Pilot measurement scope')
+              require(uint(interval['handshake_span_us']), 'Pilot interval timing')
+              for role in ('broker', 'supervisor'):
+                  a, b = interval[role + '_before'], interval[role + '_after']
+                  process_sample(a)
+                  process_sample(b)
+                  delta = interval[role + '_logical_io_delta']
+                  logical_io(delta)
+                  require(all(b['logical_io'][k] >= a['logical_io'][k] and delta[k] == b['logical_io'][k] - a['logical_io'][k] for k in delta), 'Pilot counter delta/epoch regression')
+              payload_bytes = len(json.dumps(record, separators=(',', ':')).encode())
+              projection = interval['projection']
+              require(projection.get('same_identity') is True and projection.get('exact_append_verified') is True, 'Pilot projection identity/payload')
+              require(uint(projection['before_bytes']) and uint(projection['after_bytes']) and projection['before_bytes'] >= 6291456 and projection['after_bytes'] - projection['before_bytes'] == payload_bytes + 1, 'Pilot exact append size')
+              require(sha(projection['before_sha256']) and sha(projection['after_sha256']) and uint(projection['volume_serial_number']), 'Pilot projection metadata')
+              require(isinstance(projection['file_id'], list) and len(projection['file_id']) == 16 and all(uint(b) and b <= 255 for b in projection['file_id']), 'Pilot FILE_ID_128 bytes')
+              final_payloads = report['final_payloads']
+              require(final_payloads.get('exact_records_including_metadata_verified') is True and final_payloads['records'] == seeds + 2 and uint(final_payloads['bytes']) and final_payloads['bytes'] == projection['after_bytes'] and final_payloads['bytes'] <= 8388608, 'Final persisted payload checks')
+              measured = [c for c in client['commands'] if 'measurement' in c]
+              require(len(measured) == 1 and measured[0] is commands[insert], 'Exactly one actual measured CLI')
+              m = measured[0]['measurement']
+              validate_measurement(m, payload_bytes)
+              p = client['pilot']
+              require(type(p['schema']) is int and p['schema'] == 1 and type(p['operation_id']) is int and p['operation_id'] == 0 and p['stage'] == interval['stage'] and p['expected_additions'] == 1 and p['sampling_complete'] is False and p['performance_policy_status'] == 'unapproved' and p['measurement'] == m, 'Client pilot receipt')
+              require(all(obj.get('performance_complete', False) is False for obj in (report, metrics, client, p)), 'Unapproved performance claim')
+              return {'correctness_pass': True, 'measurement_status': 'incomplete-pilot', 'sampling_complete': False, 'performance_policy_status': 'unapproved', 'performance_complete': False}
           def read_stream(pipe, name):
               state = captures[name]
               try:
@@ -148,6 +307,7 @@ jobs:
                       state['error'] = str(error)[:4096]
                   bad_capture.set()
           try:
+              pilot = selected_case(os.environ.get('BENCHMARK_CASE'))
               binaries = {
                   'harness': root / 'target/release/examples/windows_broker_benchmark.exe',
                   'admin': root / 'target/release/hermes-memory-admin.exe',
@@ -170,6 +330,8 @@ jobs:
                       '--allow-virtual-accounts', '--allow-acl-mutation', '--reviewed',
                       '--result', str(result_path), '--broker-exe', str(binaries['broker']),
                       '--client-exe', str(binaries['client']), '--admin-exe', str(binaries['admin'])]
+              if pilot:
+                  args.append('--representative-small-pilot')
               status['argv'] = args
               # No shell, PID search, tree kill, service cleanup or ACL repair.
               # On Windows Popen.kill uses ONLY this retained direct-child handle.
@@ -212,26 +374,8 @@ jobs:
               if len(raw) > result_limit:
                   raise RuntimeError('Controller result exceeds 16 MiB evidence/validation cap')
               report = json.loads(raw)
-              if (report.get('schema') != 1 or report.get('case') != 'small-6MiB'
-                      or report.get('pass') is not True or 'error' in report
-                      or report.get('source_unchanged') is not True
-                      or report.get('client_registration_deleted') is not True
-                      or report.get('client', {}).get('pass') is not True):
-                  raise RuntimeError('Controller did not prove a completed small case')
-              if report.get('executable_sha256') != {role: pins[role] for role in ('admin', 'broker', 'client')}:
-                  raise RuntimeError('Controller executable pins differ from built executables')
-              # Expected denial commands may exit nonzero, but may NEVER have
-              # incomplete/overflow/error captures mistaken for authorization denial.
-              for group in (report.get('commands'), report['client'].get('commands')):
-                  if not isinstance(group, list) or not group:
-                      raise RuntimeError('Missing actual command evidence')
-                  for command in group:
-                      if any(command.get(k) is not True for k in ('capture_complete', 'child_exited')):
-                          raise RuntimeError('Incomplete nested command capture')
-                      if any(command.get(k) is not False for k in ('timed_out', 'stop_requested', 'stdout_overflow', 'stderr_overflow')):
-                          raise RuntimeError('Nested command exceeded capture/deadline policy')
-                      if any(command.get(k) is not None for k in ('spawn_error', 'capture_error', 'kill_error', 'wait_error')):
-                          raise RuntimeError('Nested command infrastructure error')
+              status.update(validate_report(report, os.environ.get('BENCHMARK_CASE'), pins))
+              status['case'] = report['case']
               status['validated'] = True
               code = 0
           except Exception as error:

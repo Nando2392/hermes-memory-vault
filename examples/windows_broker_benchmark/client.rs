@@ -7,10 +7,526 @@ use serde_json::{json, Value};
 use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read},
     path::Path,
     time::Duration,
 };
+#[cfg(test)]
+mod pilot_tests {
+    use super::*;
+    #[cfg(windows)]
+    fn pilot_export_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let store = hermes_memory::MemoryStore::open(&source).unwrap();
+        store.ingest_snapshot(&data::snapshot()).unwrap();
+        for n in 0..16 {
+            store
+                .ingest(&data::representative_record(n).unwrap())
+                .unwrap();
+        }
+        store.ingest(&known_record()).unwrap();
+        let vault = temp.path().join("vault");
+        store.export_markdown(&vault, Some(WORKSPACE)).unwrap();
+        verify_pilot_export(&vault, &source.join("events.jsonl"), 16).unwrap();
+        (temp, source, vault)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pilot_index_rejects_missing_link() {
+        let (_temp, source, vault) = pilot_export_fixture();
+        let index = fs::read_to_string(vault.join("Index.md")).unwrap();
+        let missing = index
+            .lines()
+            .take(19)
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        fs::write(vault.join("Index.md"), missing).unwrap();
+        assert!(verify_pilot_export(&vault, &source.join("events.jsonl"), 16).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pilot_index_rejects_extra_link_and_garbage() {
+        let (_temp, source, vault) = pilot_export_fixture();
+        let index = fs::read_to_string(vault.join("Index.md")).unwrap();
+        for extra in ["- [[Sessions/extra/unique]]\n", "garbage\n", "\n"] {
+            fs::write(vault.join("Index.md"), format!("{index}{extra}")).unwrap();
+            assert!(verify_pilot_export(&vault, &source.join("events.jsonl"), 16).is_err());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pilot_export_rejects_root_extra() {
+        let (_temp, source, vault) = pilot_export_fixture();
+        for directory in [false, true] {
+            let extra = vault.join("extra");
+            if directory {
+                fs::create_dir(&extra).unwrap();
+            } else {
+                fs::write(&extra, "extra").unwrap();
+            }
+            assert!(verify_pilot_export(&vault, &source.join("events.jsonl"), 16).is_err());
+            if directory {
+                fs::remove_dir(&extra).unwrap();
+            } else {
+                fs::remove_file(&extra).unwrap();
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pilot_export_rejects_noncanonical_paths() {
+        let (_temp, source, vault) = pilot_export_fixture();
+        let workspace = fs::read_dir(vault.join("Sessions"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let renamed = workspace.with_file_name("wrong-workspace");
+        fs::rename(&workspace, &renamed).unwrap();
+        assert!(verify_pilot_export(&vault, &source.join("events.jsonl"), 16).is_err());
+        fs::rename(&renamed, &workspace).unwrap();
+        let note = fs::read_dir(&workspace)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        fs::rename(&note, workspace.join("wrong-note.md")).unwrap();
+        assert!(verify_pilot_export(&vault, &source.join("events.jsonl"), 16).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pilot_final_jsonl_rejects_extra_unique_record() {
+        let (temp, source, _vault) = pilot_export_fixture();
+        let original = fs::read_to_string(source.join("events.jsonl")).unwrap();
+        let extra = data::representative_record(16).unwrap();
+        assert!(original
+            .lines()
+            .all(|line| serde_json::from_str::<Value>(line).unwrap()["id"] != extra.id));
+        let final_path = temp.path().join("final.jsonl");
+        fs::write(&final_path, &original).unwrap();
+        verify_pilot_projection(&final_path, &source.join("events.jsonl"), 16).unwrap();
+        fs::write(
+            &final_path,
+            format!("{original}{}\n", serde_json::to_string(&extra).unwrap()),
+        )
+        .unwrap();
+        assert!(verify_pilot_projection(&final_path, &source.join("events.jsonl"), 16).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pilot_final_jsonl_rejects_same_count_unique_replacement() {
+        let (temp, source, _vault) = pilot_export_fixture();
+        let original = fs::read_to_string(source.join("events.jsonl")).unwrap();
+        let extra = data::representative_record(16).unwrap();
+        let mut records: Vec<Value> = original
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(records.iter().all(|record| record["id"] != extra.id));
+        records[1] = serde_json::to_value(extra).unwrap();
+        let replacement = records
+            .iter()
+            .map(|record| format!("{record}\n"))
+            .collect::<String>();
+        assert_eq!(replacement.lines().count(), original.lines().count());
+        let final_path = temp.path().join("final.jsonl");
+        fs::write(&final_path, &original).unwrap();
+        verify_pilot_projection(&final_path, &source.join("events.jsonl"), 16).unwrap();
+        fs::write(&final_path, replacement).unwrap();
+        assert!(verify_pilot_projection(&final_path, &source.join("events.jsonl"), 16).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ordinary_legacy_export_retains_permissive_index_and_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = hermes_memory::MemoryStore::open(&temp.path().join("source")).unwrap();
+        store.ingest_snapshot(&data::snapshot()).unwrap();
+        for n in 0..16 {
+            store.ingest(&data::record(n)).unwrap();
+        }
+        store.ingest(&known_record()).unwrap();
+        let vault = temp.path().join("vault");
+        store.export_markdown(&vault, Some(WORKSPACE)).unwrap();
+        fs::write(
+            vault.join("Index.md"),
+            "# Hermes Memory Vault\nlegacy index\n",
+        )
+        .unwrap();
+        fs::write(vault.join("legacy-extra"), "legacy").unwrap();
+        assert_eq!(verify_export(&vault, 16).unwrap()["records"], 18);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pilot_final_jsonl_checks_metadata_missing_duplicate_and_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let store = hermes_memory::MemoryStore::open(&source).unwrap();
+        store.ingest_snapshot(&data::snapshot()).unwrap();
+        for n in 0..16 {
+            store
+                .ingest(&data::representative_record(n).unwrap())
+                .unwrap();
+        }
+        store.ingest(&known_record()).unwrap();
+        drop(store);
+        let original = fs::read(source.join("events.jsonl")).unwrap();
+        let final_path = temp.path().join("final.jsonl");
+        fs::write(&final_path, &original).unwrap();
+        verify_pilot_projection(&final_path, &source.join("events.jsonl"), 16).unwrap();
+        let text = String::from_utf8(original).unwrap();
+        let mut records: Vec<Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        records[1]["metadata"] = json!({"tampered":true});
+        let altered = records.iter().map(|v| format!("{v}\n")).collect::<String>();
+        let missing = text
+            .lines()
+            .skip(1)
+            .map(|l| format!("{l}\n"))
+            .collect::<String>();
+        for bad in [
+            altered,
+            missing,
+            format!("{text}{text}"),
+            text.replace("ordinary", "tampered"),
+        ] {
+            fs::write(&final_path, bad).unwrap();
+            assert!(
+                verify_pilot_projection(&final_path, &source.join("events.jsonl"), 16).is_err()
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn representative_six_mib_ordinary_roundtrip_not_scm_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let generation = data::generate_with_spec(
+            &dir.path().join("staged"),
+            &data::FixtureSpec::representative_6_mib(),
+        )
+        .unwrap();
+        let source = dir.path().join("staged/source");
+        let imported = dir.path().join("imported");
+        let store = hermes_memory::MemoryStore::open(&imported).unwrap();
+        let receipt = store
+            .import_logical_archive_once(
+                BufReader::new(File::open(dir.path().join("staged/archive.jsonl")).unwrap()),
+                generation["logical_sha256"].as_str().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(receipt.records, generation["records"].as_u64().unwrap());
+        assert!(fs::metadata(imported.join("events.jsonl")).unwrap().len() >= 6 * 1024 * 1024);
+        assert_eq!(store.ingest_many(&[known_record()]).unwrap(), (1, 0));
+        assert_eq!(store.ingest_many(&[known_record()]).unwrap(), (0, 1));
+        assert_eq!(store.ingest_snapshot(&data::snapshot()).unwrap(), (0, 0));
+        store.prepare_export_index().unwrap();
+        let vault = dir.path().join("vault");
+        let sessions = hermes_memory::client_export::render_markdown(&vault, WORKSPACE, |r| {
+            store
+                .export_page(r, "pilot-test")
+                .map_err(|e| hermes_memory::MemoryError::Io(std::io::Error::other(e.to_string())))
+        })
+        .unwrap();
+        assert_eq!(sessions, 18);
+        let export = verify_pilot_export(
+            &vault,
+            &source.join("events.jsonl"),
+            generation["seed_records"].as_u64().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(export["records"], receipt.records + 1);
+        drop(store);
+        verify_pilot_projection(
+            &imported.join("events.jsonl"),
+            &source.join("events.jsonl"),
+            generation["seed_records"].as_u64().unwrap(),
+        )
+        .unwrap();
+        let stopped = crate::fixtures::verify_stopped_import_with_expected(
+            &imported.join("memory.db"),
+            &generation,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            stopped["persisted_startup_receipt"]["logical_sha256"],
+            generation["logical_sha256"]
+        );
+        assert_eq!(
+            data::inventory(&source).unwrap(),
+            generation["source_before"]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pilot_verifier_exact_payload_missing_duplicate_and_extra() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let store = hermes_memory::MemoryStore::open(&source).unwrap();
+        store.ingest_snapshot(&data::snapshot()).unwrap();
+        for n in 0..16 {
+            store
+                .ingest(&data::representative_record(n).unwrap())
+                .unwrap();
+        }
+        store.ingest(&known_record()).unwrap();
+        let vault = temp.path().join("vault");
+        store.export_markdown(&vault, Some(WORKSPACE)).unwrap();
+        assert_eq!(
+            verify_pilot_export(&vault, &source.join("events.jsonl"), 16).unwrap()["records"],
+            18
+        );
+        let notes: Vec<_> = fs::read_dir(vault.join("Sessions"))
+            .unwrap()
+            .flat_map(|w| fs::read_dir(w.unwrap().path()).unwrap())
+            .map(|n| n.unwrap().path())
+            .collect();
+        let note = notes
+            .iter()
+            .find(|p| {
+                fs::read_to_string(p)
+                    .unwrap()
+                    .contains("session_id: benchmark-seed-00\n")
+            })
+            .unwrap();
+        let original = fs::read_to_string(note).unwrap();
+        for bad in [
+            original.replace("ordinary", "tampered"),
+            original.split("## user").next().unwrap().to_owned(),
+            format!("{original}{original}"),
+        ] {
+            fs::write(note, bad).unwrap();
+            assert!(verify_pilot_export(&vault, &source.join("events.jsonl"), 16).is_err());
+        }
+        fs::write(note, original).unwrap();
+        fs::copy(note, note.with_extension("extra.md")).unwrap();
+        assert!(verify_pilot_export(&vault, &source.join("events.jsonl"), 16).is_err());
+    }
+}
+// Exact fixture-v2 oracle: one bounded record/block at a time, no corpus strings
+// or set of IDs. Seed sessions have a deterministic ascending index sequence.
+fn pilot_snapshot(source: &Path) -> Result<hermes_memory::MemoryRecord> {
+    let mut line = String::new();
+    BufReader::new(File::open(source)?)
+        .take(4097)
+        .read_line(&mut line)?;
+    ensure(
+        line.len() <= 4096 && line.ends_with('\n'),
+        "snapshot line bound",
+    )?;
+    let record: hermes_memory::MemoryRecord = serde_json::from_str(&line)?;
+    let request = data::snapshot();
+    let item = &request.items[0];
+    ensure(
+        record.session_id == request.session_id
+            && record.workspace == request.workspace
+            && record.kind == item.kind
+            && record.content == item.content
+            && record.timestamp == item.timestamp
+            && record.metadata == item.metadata,
+        "source snapshot payload mismatch",
+    )?;
+    Ok(record)
+}
+fn exact_bytes(reader: &mut impl Read, expected: &str) -> Result<()> {
+    ensure(expected.len() <= 8192, "expected block bound")?;
+    let mut actual = vec![0; expected.len()];
+    reader.read_exact(&mut actual)?;
+    ensure(
+        actual == expected.as_bytes(),
+        "exact export payload mismatch",
+    )
+}
+fn exact_record(reader: &mut impl Read, record: &hermes_memory::MemoryRecord) -> Result<()> {
+    exact_bytes(
+        reader,
+        &format!(
+            "## {} · {}\n\n- id: {}\n- timestamp: {}\n\n### Content\n\n> {}\n\n",
+            record.kind, record.id, record.id, record.timestamp, record.content
+        ),
+    )
+}
+/// Final stopped projection oracle includes metadata, which Markdown omits.
+/// Canonical timestamp order lets us compare one record at a time without an ID set.
+pub fn verify_pilot_projection(path: &Path, source: &Path, seeds: u64) -> Result<Value> {
+    ensure(
+        (16..=data::MAX_SEED_RECORDS).contains(&seeds),
+        "pilot seed count bound",
+    )?;
+    let file = File::open(path)?;
+    let bytes = file.metadata()?.len();
+    ensure(
+        file.metadata()?.is_file() && bytes <= 8 * 1024 * 1024,
+        "6 MiB pilot final projection bound",
+    )?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(45);
+    let mut reader = BufReader::new(file);
+    let mut record = |r: &hermes_memory::MemoryRecord| -> Result<()> {
+        ensure(
+            std::time::Instant::now() < deadline,
+            "pilot final verification deadline",
+        )?;
+        let mut expected = serde_json::to_string(r)?;
+        expected.push('\n');
+        exact_bytes(&mut reader, &expected)
+    };
+    record(&pilot_snapshot(source)?)?;
+    for n in 0..seeds {
+        record(&data::representative_record(n)?)?;
+    }
+    record(&known_record())?;
+    ensure(
+        reader.read(&mut [0; 1])? == 0,
+        "extra final projection record",
+    )?;
+    Ok(
+        json!({"records":seeds+2,"bytes":bytes,"exact_records_including_metadata_verified":true,"verification":"post-stop, sequential streaming, outside measurement"}),
+    )
+}
+// Fixture identifiers are already safe ASCII; match the renderer's SHA-256
+// suffix without accepting arbitrary note paths supplied by the artifact.
+fn pilot_segment(identifier: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(identifier.as_bytes());
+    let suffix = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{identifier}-{suffix}")
+}
+fn pilot_sessions() -> Vec<String> {
+    let mut sessions = vec!["benchmark-client".to_owned()];
+    sessions.extend((0..16).map(|n| format!("benchmark-seed-{n:02}")));
+    sessions.push("benchmark-snapshot".to_owned());
+    sessions
+}
+pub fn verify_pilot_export(vault: &Path, source: &Path, seeds: u64) -> Result<Value> {
+    ensure(
+        (16..=data::MAX_SEED_RECORDS).contains(&seeds),
+        "pilot seed count bound",
+    )?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(45);
+    let mut root_entries = 0;
+    for entry in fs::read_dir(vault)? {
+        let entry = entry?;
+        root_entries += 1;
+        let allowed = (entry.file_name() == "Index.md" && entry.file_type()?.is_file())
+            || (entry.file_name() == "Sessions" && entry.file_type()?.is_dir());
+        ensure(root_entries <= 2 && allowed, "pilot root membership/type")?;
+    }
+    ensure(root_entries == 2, "missing pilot root entry")?;
+    let snapshot = pilot_snapshot(source)?;
+    let index = File::open(vault.join("Index.md"))?;
+    ensure(index.metadata()?.len() <= 16384, "pilot index bound")?;
+    let workspace_segment = pilot_segment(WORKSPACE);
+    let mut index = BufReader::new(index);
+    exact_bytes(&mut index, "# Hermes Memory Vault\n\n")?;
+    for session in pilot_sessions() {
+        exact_bytes(
+            &mut index,
+            &format!(
+                "- [[Sessions/{workspace_segment}/{}]]\n",
+                pilot_segment(&session)
+            ),
+        )?;
+    }
+    ensure(index.read(&mut [0; 1])? == 0, "extra pilot index data")?;
+    let mut seen = [false; 18];
+    let mut files = Vec::new();
+    let mut workspaces = 0;
+    for workspace in fs::read_dir(vault.join("Sessions"))? {
+        workspaces += 1;
+        let workspace = workspace?;
+        ensure(
+            workspaces == 1
+                && workspace.file_type()?.is_dir()
+                && workspace.file_name() == workspace_segment.as_str(),
+            "pilot workspace count/type",
+        )?;
+        for entry in fs::read_dir(workspace.path())? {
+            let entry = entry?;
+            ensure(
+                files.len() < 18
+                    && entry.file_type()?.is_file()
+                    && entry.metadata()?.len() <= 128 * 1024 * 1024,
+                "pilot note count/type/size",
+            )?;
+            let mut reader = BufReader::new(File::open(entry.path())?);
+            exact_bytes(
+                &mut reader,
+                &format!("---\nworkspace: {WORKSPACE}\nsession_id: "),
+            )?;
+            let mut session = String::new();
+            reader.by_ref().take(129).read_line(&mut session)?;
+            ensure(
+                session.len() <= 128 && session.ends_with('\n'),
+                "pilot session bound",
+            )?;
+            let session = session.trim_end_matches('\n');
+            let slot = if session == "benchmark-client" {
+                16
+            } else if session == "benchmark-snapshot" {
+                17
+            } else {
+                let n: usize = session
+                    .strip_prefix("benchmark-seed-")
+                    .ok_or("unknown pilot session")?
+                    .parse()?;
+                ensure(
+                    n < 16 && session == format!("benchmark-seed-{n:02}"),
+                    "pilot session shape",
+                )?;
+                n
+            };
+            ensure(
+                entry.file_name() == format!("{}.md", pilot_segment(session)).as_str(),
+                "pilot note canonical path",
+            )?;
+            ensure(!seen[slot], "duplicate pilot session")?;
+            seen[slot] = true;
+            exact_bytes(
+                &mut reader,
+                &format!("generated_by: hermes-memory\n---\n\n# Session {session}\n\n"),
+            )?;
+            if slot < 16 {
+                for n in (slot as u64..seeds).step_by(16) {
+                    ensure(
+                        std::time::Instant::now() < deadline,
+                        "pilot verification deadline",
+                    )?;
+                    exact_record(&mut reader, &data::representative_record(n)?)?;
+                }
+            } else if slot == 16 {
+                exact_record(&mut reader, &known_record())?;
+            } else {
+                exact_record(&mut reader, &snapshot)?;
+            }
+            ensure(
+                reader.read(&mut [0; 1])? == 0,
+                "extra pilot export record/data",
+            )?;
+            files.push(json!({"path":entry.path(),"bytes":entry.metadata()?.len(),"sha256":data::hash_file(&entry.path())?}));
+        }
+    }
+    ensure(seen.iter().all(|v| *v), "missing pilot session")?;
+    Ok(
+        json!({"records":seeds+2,"sessions":18,"files":files,"exact_payloads_verified":true,"snapshot_payload_verified":true,"index_sha256":data::hash_file(&vault.join("Index.md"))?}),
+    )
+}
 fn snapshot_bytes() -> Result<Vec<u8>> {
     let s = data::snapshot();
     let items: Vec<_> = s.items.iter().map(|i| json!({"kind":i.kind,"content":i.content,"timestamp":i.timestamp,"metadata":i.metadata})).collect();
@@ -90,6 +606,10 @@ fn execute(root: &Path, report: &mut Value) -> Result<()> {
     let reader =
         hermes_memory::windows_enrollment::open_admin_owned_file(&root.join("job.json"), 65536)?;
     let job: Job = serde_json::from_reader(reader)?;
+    if let Some(pilot) = &job.pilot {
+        pilot.validate()?;
+    }
+    let insert_record = known_record();
     ensure(
         job.case.install_root == root.join("install-small")
             && job.case.legacy_root == root.join("small/source"),
@@ -165,17 +685,61 @@ fn execute(root: &Path, report: &mut Value) -> Result<()> {
         }),
         "scoped search failed",
     )?;
-    let ingest = call(
-        "ingest",
-        "ingest",
-        &[],
-        serde_json::to_vec(&known_record())?,
-        report,
-    )?;
+    let mut barrier = job
+        .pilot
+        .as_ref()
+        .map(|pilot| contract::PilotBarrier::new(root, &pilot.epoch))
+        .transpose()?;
+    let ingest = if let Some(barrier) = &mut barrier {
+        use contract::PilotPhase;
+        // No source scans, export or subsequent broker command until C end sample.
+        barrier.publish(PilotPhase::Ready)?;
+        barrier.wait(
+            PilotPhase::Release,
+            Duration::from_secs(60),
+            crate::scm::stop_requested,
+        )?;
+        let args = job.case.client_args("ingest", &enroll)?;
+        let input = serde_json::to_vec(&insert_record)?;
+        let observation = contract::command_measured(
+            &contract::CommandRequest {
+                exe: &job.client,
+                args: &args,
+                input: &input,
+                directory: &scratch,
+                label: "pilot-insert",
+                timeout: Duration::from_secs(45),
+                cancelled: crate::scm::stop_requested,
+            },
+            &crate::measure::SamplePolicy::cli(3, 0),
+        )?;
+        report["commands"]
+            .as_array_mut()
+            .ok_or("commands array")?
+            .push(observation.clone());
+        observation
+    } else {
+        call(
+            "ingest",
+            "ingest",
+            &[],
+            serde_json::to_vec(&insert_record)?,
+            report,
+        )?
+    };
     ensure(
         contract::output(&ingest)? == json!({"inserted":1,"duplicates":0}),
         "known ingest acknowledgement",
     )?;
+    if let Some(barrier) = &mut barrier {
+        barrier.publish(contract::PilotPhase::Done)?;
+        barrier.wait(
+            contract::PilotPhase::Acknowledged,
+            Duration::from_secs(60),
+            crate::scm::stop_requested,
+        )?;
+        report["pilot"] = json!({"schema":1,"operation_id":0,"stage":"pilot-first-warmup-only","expected_additions":1,"sampling_complete":false,"performance_policy_status":"unapproved","measurement":ingest["measurement"]});
+    }
     let duplicate = call(
         "duplicate",
         "ingest",
@@ -292,10 +856,18 @@ fn execute(root: &Path, report: &mut Value) -> Result<()> {
         report,
     )?;
     ensure(
-        contract::output(&export)? == json!({"sessions":3}),
+        contract::output(&export)? == json!({"sessions":if job.pilot.is_some() {18} else {3}}),
         "export session count",
     )?;
-    report["export"] = verify_export(&vault, job.seed_records)?;
+    report["export"] = if job.pilot.is_some() {
+        verify_pilot_export(
+            &vault,
+            &job.case.legacy_root.join("events.jsonl"),
+            job.seed_records,
+        )?
+    } else {
+        verify_export(&vault, job.seed_records)?
+    };
     ensure(
         before == data::inventory(&job.case.legacy_root)?,
         "client altered local source",

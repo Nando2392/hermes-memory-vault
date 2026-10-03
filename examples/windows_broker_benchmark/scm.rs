@@ -2,6 +2,13 @@
 //! authority: production provisioning admits C receipts before read-only tracking.
 //! All mutation requires the hosted consent gate plus a nonimpersonating native
 //! administrator token. Failed fixtures remain for disposable-VM evidence.
+// Kept here so this prerequisite compiles without changing the entrypoint.
+// The small controller does not invoke measurement. Future callers can re-export
+// scm::metrics rather than declaring a second, incompatible copy of these types.
+#[allow(dead_code)]
+#[path = "metrics.rs"]
+pub mod metrics;
+
 pub fn valid_name(name: &str) -> bool {
     name.starts_with("HMVBenchmark-")
         && !name.ends_with('-')
@@ -441,7 +448,7 @@ fn track(service: &ScHandle, sid: &str) -> Result<(Handle, Value)> {
     // SAFETY: query/wait only, never terminate or authorize IPC using this PID. Handle pins object.
     let process = handle(unsafe {
         OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | 0x00100000,
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | SYNCHRONIZE,
             0,
             before.dwProcessId,
         )
@@ -770,6 +777,17 @@ impl Fixture {
         client_identity(&observation["token"], &self.sid)?;
         Ok(observation)
     }
+    /// Sample the retained B supervisor, NOT its installed CLI children.
+    /// Call after successful start/admission; no lifecycle action or PID reopen.
+    #[allow(dead_code)] // Bounded prerequisite; small mode does not sample.
+    pub fn sample_client(&self) -> Result<metrics::ProcessSnapshot> {
+        let process = self
+            .process
+            .as_ref()
+            .ok_or("no B supervisor process was pinned")?;
+        // SAFETY: self retains the track-admitted handle with query/memory/wait rights.
+        Ok(unsafe { metrics::sample_process(process.0) }?)
+    }
     pub fn observe_client(&self) -> Result<Value> {
         let s = query(self.service()?)?;
         Ok(
@@ -900,6 +918,17 @@ pub struct ObservedService {
     _receipt: Box<dyn io::Read>,
 }
 impl ObservedService {
+    /// Sample only this receipt-admitted C broker epoch, never the B supervisor.
+    /// A stopped/unpinned observation is missing evidence, not zero counters.
+    #[allow(dead_code)] // Bounded prerequisite; small mode does not sample.
+    pub fn sample(&self) -> Result<metrics::ProcessSnapshot> {
+        let process = self
+            .process
+            .as_ref()
+            .ok_or("no running C process was pinned")?;
+        // SAFETY: self retains the admitted query/memory/wait handle until drop.
+        Ok(unsafe { metrics::sample_process(process.0) }?)
+    }
     pub fn observation(&self) -> Result<Value> {
         let state = query(&self.service)?;
         Ok(
@@ -1202,6 +1231,55 @@ mod tests {
                 })
                 .collect()
         }
+    }
+
+    #[test]
+    fn retained_sampling_access_is_query_memory_and_wait_only() {
+        let source = include_str!("scm.rs");
+        let track = source
+            .split("fn track(")
+            .nth(1)
+            .unwrap()
+            .split("fn stop(")
+            .next()
+            .unwrap();
+        assert!(track.contains("PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | SYNCHRONIZE"));
+        assert!(!track.contains("PROCESS_QUERY_LIMITED_INFORMATION"));
+    }
+
+    #[test]
+    fn retained_sampling_wrappers_do_not_require_service_queries() {
+        let mut fixture = Fixture {
+            root: PathBuf::new(),
+            nonce: String::new(),
+            name: String::new(),
+            sid: String::new(),
+            service: None,
+            process: None,
+            _pins: vec![],
+            audits: vec![],
+        };
+        assert!(fixture.sample_client().is_err());
+        // Ordinary current-process pin only: no service is opened or fabricated.
+        // SAFETY: opens our process with observation rights; Handle owns the result.
+        fixture.process = Some(
+            handle(unsafe {
+                OpenProcess(
+                    PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | SYNCHRONIZE,
+                    0,
+                    GetCurrentProcessId(),
+                )
+            })
+            .unwrap(),
+        );
+        let before = fixture.sample_client().unwrap();
+        let after = fixture.sample_client().unwrap();
+        assert!(before.private_bytes > 0);
+        after.logical_io.checked_delta(&before.logical_io).unwrap();
+        // C's method is compiled, but receipt admission requires the hosted gate;
+        // do not fabricate an admitted C or execute local SCM for this unit test.
+        let _c_api: fn(&ObservedService) -> Result<metrics::ProcessSnapshot> =
+            ObservedService::sample;
     }
 
     #[test]

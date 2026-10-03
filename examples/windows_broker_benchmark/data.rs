@@ -1,5 +1,129 @@
 use hermes_memory::MemoryRecord;
 pub const WORKSPACE: &str = "disposable-benchmark";
+pub const MAX_SEED_RECORDS: u64 = 400_000;
+pub const MAX_SEED_LINE_BYTES: usize = 4096;
+pub const MAX_SEED_BATCH_BYTES: u64 = 1_048_576;
+const MAX_SEED_BATCH_RECORDS: u64 = 256;
+const MAX_SEED_FRAME_BYTES: u64 = 2_097_152;
+
+#[allow(dead_code)]
+fn validate_seed_batch(batch: &[MemoryRecord], prior: u64) -> Result<u64> {
+    let end = prior
+        .checked_add(batch.len() as u64)
+        .ok_or("seed count overflow")?;
+    if batch.is_empty() || batch.len() > MAX_SEED_BATCH_RECORDS as usize || end > MAX_SEED_RECORDS {
+        return Err("seed row/batch bound".into());
+    }
+    let mut bytes = 0u64;
+    for record in batch {
+        record.validate()?;
+        if [
+            &record.id,
+            &record.session_id,
+            &record.kind,
+            &record.workspace,
+        ]
+        .iter()
+        .any(|s| s.len() > 256)
+            || record.content.len() > 1024 * 1024
+        {
+            return Err("seed protocol field bound".into());
+        }
+        let mut line = LimitedWriter::new(std::io::sink(), MAX_SEED_LINE_BYTES as u64);
+        serde_json::to_writer(&mut line, record)?;
+        line.write_all(b"\n")?;
+        bytes = bytes
+            .checked_add(line.written)
+            .ok_or("seed batch byte overflow")?;
+        if bytes > MAX_SEED_BATCH_BYTES {
+            return Err("seed batch byte bound".into());
+        }
+    }
+    seed_frame_bytes(batch)?;
+    Ok(bytes)
+}
+
+fn seed_frame_bytes(batch: &[MemoryRecord]) -> Result<u64> {
+    // Include the fixed-workspace enrollment policy and maximum request ID.
+    // Counting into a sink avoids a second serialized batch allocation.
+    #[derive(serde::Serialize)]
+    struct Body<'a> {
+        records: &'a [MemoryRecord],
+    }
+    #[derive(serde::Serialize)]
+    struct Frame<'a> {
+        protocol: u32,
+        request_id: &'a str,
+        op: &'a str,
+        body: Body<'a>,
+        policy: hermes_memory::workspace_policy::Policy,
+    }
+    let request_id = "r".repeat(128);
+    let frame = Frame {
+        protocol: 1,
+        request_id: &request_id,
+        op: "ingest",
+        body: Body { records: batch },
+        policy: hermes_memory::workspace_policy::Policy {
+            scope_mode: hermes_memory::workspace_policy::ScopeMode::Fixed,
+            legacy_root_key: "a".repeat(64),
+        },
+    };
+    let mut writer = LimitedWriter::new(std::io::sink(), MAX_SEED_FRAME_BYTES);
+    serde_json::to_writer(&mut writer, &frame)?;
+    Ok(writer.written)
+}
+
+/// Fixed representative-v2 shape. Smaller targets exercise the same bounded writer
+/// in ordinary-file tests; the eventual CLI must separately admit case sizes.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixtureSpec {
+    pub shape: FixtureShape,
+    pub target_jsonl_bytes: u64,
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FixtureShape {
+    #[serde(rename = "representative-v2")]
+    RepresentativeV2,
+}
+#[allow(dead_code)] // Prerequisite API; not wired into the small controller.
+impl FixtureSpec {
+    pub fn representative_6_mib() -> Self {
+        Self {
+            shape: FixtureShape::RepresentativeV2,
+            target_jsonl_bytes: 6 * 1024 * 1024,
+        }
+    }
+    pub fn representative_600_mib() -> Self {
+        Self {
+            shape: FixtureShape::RepresentativeV2,
+            target_jsonl_bytes: 600 * 1024 * 1024,
+        }
+    }
+    pub fn validate(&self) -> Result<()> {
+        if self.target_jsonl_bytes == 0 || self.target_jsonl_bytes > 600 * 1024 * 1024 {
+            return Err("representative target must be 1..600 MiB in bytes".into());
+        }
+        Ok(())
+    }
+}
+#[allow(dead_code)]
+pub fn representative_record(index: u64) -> Result<MemoryRecord> {
+    if index >= MAX_SEED_RECORDS {
+        return Err("representative seed index exceeds row bound".into());
+    }
+    let mut r = record(index);
+    r.session_id = format!("benchmark-seed-{:02}", index % 16);
+    let text = format!(
+        "ordinary benchmark seed {index:012} session {:02} ",
+        index % 16
+    );
+    r.content = text.repeat(2048 / text.len() + 1);
+    r.content.truncate(2048);
+    r.metadata = serde_json::json!({"fixture": "representative-v2", "index": index});
+    Ok(r)
+}
 pub fn record(index: u64) -> MemoryRecord {
     MemoryRecord {
         id: format!("benchmark-{index:012}"),
@@ -22,6 +146,36 @@ use std::{
     io::{Read, Write},
     path::Path,
 };
+/// Refuse an entire excess write before forwarding any of its bytes.
+struct LimitedWriter<W> {
+    inner: W,
+    limit: u64,
+    written: u64,
+}
+impl<W: Write> LimitedWriter<W> {
+    fn new(inner: W, limit: u64) -> Self {
+        Self {
+            inner,
+            limit,
+            written: 0,
+        }
+    }
+}
+impl<W: Write> Write for LimitedWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let next = self
+            .written
+            .checked_add(bytes.len() as u64)
+            .filter(|n| *n <= self.limit)
+            .ok_or_else(|| std::io::Error::other("fixture writer byte limit"))?;
+        let n = self.inner.write(bytes)?;
+        self.written = next - (bytes.len() - n) as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
 pub fn hash_file(path: &Path) -> Result<String> {
     let mut input = File::open(path)?;
     let mut hash = Sha256::new();
@@ -62,6 +216,34 @@ pub fn generate(root: &Path, bytes: u64) -> Result<serde_json::Value> {
     if bytes == 0 || bytes > 900 * 1024 * 1024 {
         return Err("fixture target must be 1..900 MiB in bytes".into());
     }
+    generate_inner(
+        root,
+        bytes,
+        None,
+        hermes_memory::logical_migration::MAX_ARCHIVE_BYTES,
+    )
+}
+
+#[allow(dead_code)] // Deliberately not admitted by the current CLI.
+pub fn generate_with_spec(root: &Path, spec: &FixtureSpec) -> Result<serde_json::Value> {
+    spec.validate()?;
+    generate_inner(
+        root,
+        spec.target_jsonl_bytes,
+        Some(spec),
+        hermes_memory::logical_migration::MAX_ARCHIVE_BYTES,
+    )
+}
+
+fn generate_inner(
+    root: &Path,
+    bytes: u64,
+    spec: Option<&FixtureSpec>,
+    archive_limit: u64,
+) -> Result<serde_json::Value> {
+    let maximum_jsonl = bytes
+        .checked_add(MAX_SEED_BATCH_BYTES)
+        .ok_or("target byte overflow")?;
     fs::create_dir(root)?; // CreateNew: refuse any previously existing namespace.
     let source = root.join("source");
     let store = hermes_memory::MemoryStore::open(&source)?;
@@ -70,12 +252,48 @@ pub fn generate(root: &Path, bytes: u64) -> Result<serde_json::Value> {
     while fs::metadata(source.join("events.jsonl"))?.len() < bytes {
         // A bounded batch, never a corpus-sized Vec. Keep tiny pure tests tiny.
         let batch_len = if bytes < 1024 * 1024 { 4 } else { 256 };
-        let batch: Vec<_> = (count..count + batch_len).map(record).collect();
+        let end = count.checked_add(batch_len).ok_or("seed count overflow")?;
+        if spec.is_some()
+            && (end > MAX_SEED_RECORDS
+                || end.checked_add(1).ok_or("snapshot row overflow")?
+                    > hermes_memory::logical_migration::MAX_ROWS)
+        {
+            return Err("fixture seed row bound".into());
+        }
+        let batch: Vec<_> = (count..end)
+            .map(|index| {
+                if spec.is_some() {
+                    representative_record(index)
+                } else {
+                    Ok(record(index))
+                }
+            })
+            .collect::<Result<_>>()?;
+        let expected_jsonl = if spec.is_some() {
+            let addition = validate_seed_batch(&batch, count)?;
+            let current = fs::metadata(source.join("events.jsonl"))?.len();
+            let next = current
+                .checked_add(addition)
+                .ok_or("projection byte overflow")?;
+            if next >= maximum_jsonl {
+                return Err("fixture projection bound before ingest".into());
+            }
+            Some(next)
+        } else {
+            None
+        };
         let (inserted, duplicates) = store.ingest_many(&batch)?;
         if inserted != batch.len() || duplicates != 0 {
             return Err("seed ingest acknowledgement mismatch".into());
         }
-        count += inserted as u64;
+        count = count
+            .checked_add(inserted as u64)
+            .ok_or("seed count overflow")?;
+        if let Some(expected) = expected_jsonl {
+            if fs::metadata(source.join("events.jsonl"))?.len() != expected {
+                return Err("actual projection differs from validated seed serialization".into());
+            }
+        }
     }
     drop(store); // Close SQLite before immutable/read-only logical export.
     let before = inventory(&source)?;
@@ -86,7 +304,7 @@ pub fn generate(root: &Path, bytes: u64) -> Result<serde_json::Value> {
         .open(&archive)?;
     let receipt = hermes_memory::logical_migration::export_from_staged_sqlite_copy(
         source.join("memory.db"),
-        &mut output,
+        LimitedWriter::new(&mut output, archive_limit),
     )?;
     output.flush()?;
     output.sync_all()?;
@@ -105,13 +323,16 @@ pub fn generate(root: &Path, bytes: u64) -> Result<serde_json::Value> {
     {
         return Err("logical receipt fixture count mismatch".into());
     }
-    let report = serde_json::json!({"source": source, "archive": archive,
+    let mut report = serde_json::json!({"source": source, "archive": archive,
         "archive_sha256": hash_file(&archive)?, "archive_bytes": archive_bytes,
         "logical_sha256": receipt.logical_sha256, "seed_records": count,
         "records": receipt.records, "snapshot_states": receipt.snapshot_states,
         "snapshot_counters": receipt.snapshot_counters,
         "jsonl_bytes": fs::metadata(source.join("events.jsonl"))?.len(),
         "source_before": before, "source_after": after});
+    if let Some(spec) = spec {
+        report["fixture_spec"] = serde_json::to_value(spec)?;
+    }
     let report_file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -139,6 +360,145 @@ mod tests {
         );
     }
     use super::*;
+
+    #[test]
+    fn bounded_archive_writer_refuses_excess_before_forwarding() {
+        let mut output = Vec::new();
+        {
+            let mut writer = LimitedWriter::new(&mut output, 3);
+            writer.write_all(b"abc").unwrap();
+            assert!(writer.write_all(b"d").is_err());
+            assert_eq!(writer.written, 3);
+        }
+        assert_eq!(output, b"abc");
+        let mut writer = LimitedWriter::new(Vec::new(), u64::MAX);
+        writer.written = u64::MAX;
+        assert!(writer.write_all(b"x").is_err());
+        assert!(writer.inner.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn representative_generation_crosses_actual_jsonl_target_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("representative");
+        let spec = FixtureSpec {
+            shape: FixtureShape::RepresentativeV2,
+            target_jsonl_bytes: 8192,
+        };
+        let generated = generate_with_spec(&root, &spec).unwrap();
+        let actual = generated["jsonl_bytes"].as_u64().unwrap();
+        assert!(actual >= spec.target_jsonl_bytes);
+        assert!(actual < spec.target_jsonl_bytes + MAX_SEED_BATCH_BYTES);
+        assert_eq!(
+            generated["fixture_spec"],
+            serde_json::to_value(&spec).unwrap()
+        );
+        assert_eq!(generated["seed_records"], 4);
+        assert_eq!(generated["records"], 5);
+        assert_eq!(generated["source_before"], generated["source_after"]);
+        let lines = std::io::BufRead::lines(std::io::BufReader::new(
+            File::open(root.join("source/events.jsonl")).unwrap(),
+        ));
+        for (index, line) in lines.skip(1).enumerate() {
+            let actual: MemoryRecord = serde_json::from_str(&line.unwrap()).unwrap();
+            assert_eq!(actual, representative_record(index as u64).unwrap());
+        }
+        assert!(generate_with_spec(&root, &spec).is_err());
+        let invalid_root = temp.path().join("invalid");
+        let mut invalid = spec;
+        invalid.target_jsonl_bytes = 0;
+        assert!(generate_with_spec(&invalid_root, &invalid).is_err());
+        assert!(!invalid_root.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn representative_archive_cap_keeps_partial_file_bounded_without_success_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("capped");
+        let spec = FixtureSpec {
+            shape: FixtureShape::RepresentativeV2,
+            target_jsonl_bytes: 8192,
+        };
+        assert!(generate_inner(&root, spec.target_jsonl_bytes, Some(&spec), 100).is_err());
+        assert!(fs::metadata(root.join("archive.jsonl")).unwrap().len() <= 100);
+        assert!(!root.join("generation.json").exists());
+        assert!(generate_with_spec(&root, &spec).is_err());
+    }
+
+    #[test]
+    fn seed_frame_bound_counts_enrolled_policy_and_full_envelope() {
+        let records = [representative_record(0).unwrap()];
+        let expected = serde_json::to_vec(&serde_json::json!({
+            "protocol": 1, "request_id": "r".repeat(128), "op": "ingest",
+            "body": {"records": records},
+            "policy": {"scope_mode": "fixed", "legacy_root_key": "a".repeat(64)}
+        }))
+        .unwrap();
+        assert_eq!(seed_frame_bytes(&records).unwrap(), expected.len() as u64);
+        assert!(expected.len() < MAX_SEED_FRAME_BYTES as usize);
+    }
+
+    #[test]
+    fn seed_batch_bounds_admit_exact_sizes_and_refuse_before_ingest() {
+        let batch: Vec<_> = (0..256)
+            .map(|n| representative_record(n).unwrap())
+            .collect();
+        let bytes = validate_seed_batch(&batch, MAX_SEED_RECORDS - 256).unwrap();
+        assert!(bytes < MAX_SEED_BATCH_BYTES);
+        assert!(validate_seed_batch(&batch, MAX_SEED_RECORDS - 255).is_err());
+        assert!(validate_seed_batch(&batch, u64::MAX).is_err());
+        let mut excess = batch.clone();
+        excess.push(representative_record(256).unwrap());
+        assert!(validate_seed_batch(&excess, 0).is_err());
+        assert!(validate_seed_batch(&[], 0).is_err());
+        let mut r = representative_record(0).unwrap();
+        let base = serde_json::to_vec(&r).unwrap().len() + 1;
+        r.content.push_str(&"a".repeat(MAX_SEED_LINE_BYTES - base));
+        assert_eq!(
+            validate_seed_batch(std::slice::from_ref(&r), 0).unwrap(),
+            4096
+        );
+        let exact = vec![r.clone(); 256];
+        assert_eq!(validate_seed_batch(&exact, 0).unwrap(), 1_048_576);
+        r.content.push('a');
+        assert!(validate_seed_batch(&[r], 0).is_err());
+    }
+
+    #[test]
+    fn representative_spec_and_records_are_closed_and_deterministic() {
+        let small = FixtureSpec::representative_6_mib();
+        let large = FixtureSpec::representative_600_mib();
+        assert_eq!(small.target_jsonl_bytes, 6 * 1024 * 1024);
+        assert_eq!(large.target_jsonl_bytes, 600 * 1024 * 1024);
+        small.validate().unwrap();
+        large.validate().unwrap();
+        let mut value = serde_json::to_value(&small).unwrap();
+        value["unknown"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<FixtureSpec>(value).is_err());
+        for index in 0..32 {
+            let r = representative_record(index).unwrap();
+            assert_eq!(r, representative_record(index).unwrap());
+            assert_eq!(r.content.len(), 2048);
+            assert!(r
+                .content
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b' '));
+            assert!(r.content.contains("ordinary benchmark"));
+            assert_eq!(r.session_id, format!("benchmark-seed-{:02}", index % 16));
+            assert_eq!(r.timestamp, 1_700_000_000.0 + index as f64);
+            r.validate().unwrap();
+        }
+        assert_ne!(
+            representative_record(0).unwrap().content,
+            representative_record(1).unwrap().content
+        );
+        assert!(representative_record(MAX_SEED_RECORDS).is_err());
+        let mut invalid = small;
+        invalid.target_jsonl_bytes = u64::MAX;
+        assert!(invalid.validate().is_err());
+    }
 
     #[cfg(not(windows))]
     #[test]

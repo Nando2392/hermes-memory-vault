@@ -2,6 +2,160 @@ use super::*;
 use std::io::Write;
 
 #[test]
+#[ignore = "ordinary subprocess payload; invoked explicitly by parent test"]
+fn logical_io_child_payload() {
+    let root = std::path::PathBuf::from(std::env::var_os("HMV_METRICS_CHILD_DIR").unwrap());
+    let mut file = File::create(root.join("payload.bin")).unwrap();
+    file.write_all(&[b'x'; 65536]).unwrap();
+    file.sync_all().unwrap();
+    std::fs::write(root.join("ready"), b"ready").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !root.join("release").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "parent release deadline"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    file.write_all(&[b'y'; 65536]).unwrap();
+    file.sync_all().unwrap();
+}
+
+#[test]
+fn retained_ordinary_child_final_logical_io_includes_terminal_writes() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle};
+    use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+    use windows_sys::Win32::System::Threading::*;
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill(); // Retained direct child only, on test failure.
+            }
+            let _ = self.0.wait();
+        }
+    }
+    struct Pin(windows_sys::Win32::Foundation::HANDLE);
+    impl Drop for Pin {
+        fn drop(&mut self) {
+            // SAFETY: exclusively owns the duplicated handle.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let test_name = format!(
+        "{}::logical_io_child_payload",
+        module_path!().split_once("::").unwrap().1
+    );
+    let mut child = ChildGuard(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", &test_name])
+            .env("HMV_METRICS_CHILD_DIR", root.path())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !root.path().join("ready").exists() {
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "payload exited before handshake"
+        );
+        assert!(std::time::Instant::now() < deadline, "child ready deadline");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let duplicate = |rights| {
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: source Child and current process handles remain valid; output is owned.
+        assert_ne!(
+            unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    child.0.as_raw_handle(),
+                    GetCurrentProcess(),
+                    &mut raw,
+                    rights,
+                    0,
+                    0,
+                )
+            },
+            0
+        );
+        Pin(raw)
+    };
+    let pin = duplicate(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | SYNCHRONIZE);
+    let final_only = duplicate(PROCESS_QUERY_INFORMATION | SYNCHRONIZE);
+    let no_query = duplicate(SYNCHRONIZE);
+    let no_wait = duplicate(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ);
+    // SAFETY: all duplicated handles remain owned through every sample.
+    let before = unsafe { sample_process(pin.0) }.unwrap();
+    assert!(before.private_bytes > 0);
+    assert_eq!(
+        unsafe { sample_exited_child_logical_io(pin.0) }
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        unsafe { sample_exited_child_logical_io(std::ptr::null_mut()) }
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+    assert!(unsafe { sample_process(no_query.0) }.is_err());
+    assert!(unsafe { sample_process(no_wait.0) }.is_err());
+    std::fs::write(root.path().join("release"), b"release").unwrap();
+    while child.0.try_wait().unwrap().is_none() {
+        assert!(std::time::Instant::now() < deadline, "child exit deadline");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(child.0.wait().unwrap().success());
+    assert_eq!(
+        unsafe { sample_process(pin.0) }.unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    let final_io = unsafe { sample_exited_child_logical_io(pin.0) }.unwrap();
+    assert!(
+        final_io
+            .checked_delta(&before.logical_io)
+            .unwrap()
+            .write_bytes
+            >= 65536
+    );
+    assert!(final_io.write_bytes >= 131072);
+    assert_eq!(
+        unsafe { sample_exited_child_logical_io(final_only.0) }.unwrap(),
+        final_io
+    );
+    // Independent native query verifies every returned field, not just write bytes.
+    let mut native = IO_COUNTERS::default();
+    // SAFETY: pin still owns the exited process handle and native is writable.
+    assert_ne!(unsafe { GetProcessIoCounters(pin.0, &mut native) }, 0);
+    assert_eq!(
+        final_io,
+        LogicalIoCounters {
+            read_operations: native.ReadOperationCount,
+            write_operations: native.WriteOperationCount,
+            other_operations: native.OtherOperationCount,
+            read_bytes: native.ReadTransferCount,
+            write_bytes: native.WriteTransferCount,
+            other_bytes: native.OtherTransferCount,
+        }
+    );
+    assert_eq!(
+        unsafe { sample_exited_child_logical_io(child.0.as_raw_handle()) }.unwrap(),
+        final_io
+    );
+    assert_eq!(
+        unsafe { sample_exited_child_logical_io(pin.0) }.unwrap(),
+        final_io
+    );
+    assert!(unsafe { sample_exited_child_logical_io(no_query.0) }.is_err());
+    assert!(unsafe { sample_exited_child_logical_io(no_wait.0) }.is_err());
+}
+
+#[test]
 fn native_current_process_counters_are_available() {
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     // SAFETY: current-process pseudo handle remains valid throughout the call.
