@@ -364,7 +364,42 @@ fn supervise(
 
 // Stable diagnostic ABI: never renumber/reuse codes or expose an unknown label.
 // 0 is success; 1 remains the safe fallback for unrecognized failures.
+#[cfg(test)]
+#[test]
+fn scm_ancestor_detail_survives_stopped_status() {
+    let code = 0x84200020;
+    assert_eq!(
+        service_exit_code_with_ancestor("temp_ancestor_failed", Some(code)),
+        code
+    );
+    assert_eq!(
+        service_exit_code_with_ancestor("temp_ancestor_failed", None),
+        1104
+    );
+    assert_eq!(
+        service_exit_code_with_ancestor("unavailable", Some(code)),
+        1008
+    );
+    let stopped = status(
+        SERVICE_STOPPED,
+        0,
+        service_exit_code_with_ancestor("temp_ancestor_failed", Some(code)),
+    );
+    assert_eq!(stopped.dwServiceSpecificExitCode, code);
+    assert_eq!(stopped.dwWin32ExitCode, 1066);
+    assert_eq!(stopped.dwCheckPoint, 0);
+    assert_eq!(stopped.dwWaitHint, 0);
+}
+
+// A dedicated SCM process runs one startup. Publish only typed numeric evidence,
+// before the worker completion channel reports its failure to the supervisor.
+static TEMP_ANCESTOR_EXIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
 fn service_exit_code(label: &str) -> u32 {
+    service_exit_code_with_ancestor(label, TEMP_ANCESTOR_EXIT.get().copied())
+}
+
+fn service_exit_code_with_ancestor(label: &str, ancestor: Option<u32>) -> u32 {
     match label {
         "unauthorized" => 1001,
         "temp_admission_failed" => 1002,
@@ -372,7 +407,7 @@ fn service_exit_code(label: &str) -> u32 {
         "temp_identity_failed" => 1101,
         "temp_path_failed" => 1102,
         "temp_volume_failed" => 1103,
-        "temp_ancestor_failed" => 1104,
+        "temp_ancestor_failed" => ancestor.unwrap_or(1104),
         "temp_root_failed" => 1105,
         "temp_inventory_failed" => 1106,
         "temp_environment_failed" => 1107,
@@ -480,8 +515,12 @@ fn worker(
             }
         },
         || {
-            hermes_memory::admit_broker_temp(&config.temp_dir)
-                .map_err(|error| hermes_memory::BrokerTempGuard::admission_failure_label(&error))
+            hermes_memory::admit_broker_temp(&config.temp_dir).map_err(|error| {
+                if let Some(code) = hermes_memory::BrokerTempGuard::ancestor_failure_code(&error) {
+                    let _ = TEMP_ANCESTOR_EXIT.set(code);
+                }
+                hermes_memory::BrokerTempGuard::admission_failure_label(&error)
+            })
         },
         || {
             let store = hermes_memory::MemoryStore::open_broker(&config.root)

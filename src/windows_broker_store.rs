@@ -146,6 +146,7 @@ pub(super) enum ObjectKind {
     File,
 }
 
+#[cfg(test)]
 pub(super) fn acl_allowed(
     owner: &str,
     protected: bool,
@@ -153,13 +154,31 @@ pub(super) fn acl_allowed(
     service: &str,
     kind: ObjectKind,
 ) -> bool {
+    acl_allowed_detailed(
+        owner,
+        protected,
+        aces,
+        service,
+        kind,
+        &mut AuditDetail::default(),
+    )
+}
+
+fn acl_allowed_detailed(
+    owner: &str,
+    protected: bool,
+    aces: &[Ace],
+    service: &str,
+    kind: ObjectKind,
+    detail: &mut AuditDetail,
+) -> bool {
     let trusted = |sid: &str| {
         sid == service
             || matches!(sid, "S-1-5-18" | "S-1-5-32-544")
             || (kind == ObjectKind::Ancestor
                 && sid == "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464")
     };
-    trusted(owner)
+    audit_predicate(detail, AuditOperation::OwnerPolicy, 0, trusted(owner))
         && (kind != ObjectKind::TempRoot
             || (protected
                 && [service, "S-1-5-18", "S-1-5-32-544"].iter().all(|sid| {
@@ -171,14 +190,31 @@ pub(super) fn acl_allowed(
                 && aces
                     .iter()
                     .any(|ace| ace.sid == service && ace.mask == 0x1f01ff && ace.flags & 0xf == 3)))
-        && !aces.is_empty()
+        && audit_predicate(detail, AuditOperation::DaclPolicy, 0, !aces.is_empty())
         && aces.iter().all(|ace| {
-            ace.kind == 0
-                && ace.flags & !0x1f == 0
-                && ace.mask & !0xf01f01ff == 0
-                && (trusted(&ace.sid)
+            audit_predicate(
+                detail,
+                AuditOperation::AceKind,
+                u32::from(ace.kind),
+                ace.kind == 0,
+            ) && audit_predicate(
+                detail,
+                AuditOperation::AceFlags,
+                u32::from(ace.flags),
+                ace.flags & !0x1f == 0,
+            ) && audit_predicate(
+                detail,
+                AuditOperation::AceMask,
+                compact_bits(ace.mask, !0xf01f01ff) | (u32::from(ace.flags) << 14),
+                ace.mask & !0xf01f01ff == 0,
+            ) && audit_predicate(
+                detail,
+                AuditOperation::AceRights,
+                compact_bits(ace.mask, 0xf00d0150) | (u32::from(ace.flags) << 10),
+                trusted(&ace.sid)
                     || (kind == ObjectKind::Ancestor
-                        && (ace.flags & 0x8 != 0 || ace.mask & !0x1200af == 0)))
+                        && (ace.flags & 0x8 != 0 || ace.mask & !0x1200af == 0)),
+            )
         })
 }
 
@@ -197,21 +233,35 @@ pub(super) fn ace_sid_bounded(bytes: &[u8]) -> bool {
 }
 
 // SAFETY: descriptor must be a live OS-validated security descriptor.
+#[cfg(test)]
 pub(super) unsafe fn audit_descriptor(
     sd: PSECURITY_DESCRIPTOR,
     service: &str,
     kind: ObjectKind,
 ) -> Result<(), MemoryError> {
+    // SAFETY: same descriptor lifetime/validity contract as this wrapper.
+    unsafe { audit_descriptor_detailed(sd, service, kind, &mut AuditDetail::default()) }
+}
+
+unsafe fn audit_descriptor_detailed(
+    sd: PSECURITY_DESCRIPTOR,
+    service: &str,
+    kind: ObjectKind,
+    detail: &mut AuditDetail,
+) -> Result<(), MemoryError> {
     // SAFETY: caller guarantees a live descriptor; each queried interior pointer stays within its lifetime.
     unsafe {
+        detail.at(AuditOperation::Descriptor);
         require(
             !sd.is_null() && IsValidSecurityDescriptor(sd) != 0,
             "invalid descriptor",
         )?;
+        detail.at(AuditOperation::Owner);
         let mut owner = null_mut();
         let mut defaulted = 0;
         win(GetSecurityDescriptorOwner(sd, &mut owner, &mut defaulted))?;
         let owner = sid_text(owner)?;
+        detail.at(AuditOperation::Dacl);
         let mut acl = null_mut();
         let mut present = 0;
         win(GetSecurityDescriptorDacl(
@@ -224,6 +274,7 @@ pub(super) unsafe fn audit_descriptor(
             present != 0 && !acl.is_null() && IsValidAcl(acl) != 0,
             "missing/null/invalid DACL",
         )?;
+        detail.at(AuditOperation::Control);
         let mut control = 0;
         let mut revision = 0;
         win(GetSecurityDescriptorControl(
@@ -233,14 +284,18 @@ pub(super) unsafe fn audit_descriptor(
         ))?;
         let mut aces = Vec::new();
         for index in 0..(*acl).AceCount {
+            detail.at(AuditOperation::AceRead);
             let mut raw = null_mut();
             win(GetAce(acl, u32::from(index), &mut raw))?;
             let header = &*raw.cast::<ACE_HEADER>();
+            detail.at(AuditOperation::AceShape);
+            detail.payload = u32::from(header.AceType) | (u32::from(header.AceFlags) << 8);
             require(
                 header.AceType == 0
                     && usize::from(header.AceSize) >= size_of::<ACCESS_ALLOWED_ACE>(),
                 "unknown or malformed ACE",
             )?;
+            detail.at(AuditOperation::AceSid);
             let ace = &*raw.cast::<ACCESS_ALLOWED_ACE>();
             let sid_bytes = std::slice::from_raw_parts(
                 raw.cast::<u8>().add(8),
@@ -261,16 +316,133 @@ pub(super) unsafe fn audit_descriptor(
             });
         }
         require(
-            acl_allowed(
+            acl_allowed_detailed(
                 &owner,
                 control & SE_DACL_PROTECTED != 0,
                 &aces,
                 service,
                 kind,
+                detail,
             ),
             "untrusted broker ACL",
         )
     }
+}
+
+fn audit_predicate(
+    detail: &mut AuditDetail,
+    operation: AuditOperation,
+    payload: u32,
+    allowed: bool,
+) -> bool {
+    *detail = AuditDetail { operation, payload };
+    allowed
+}
+// Pack only rejected mask bits, in ascending bit order; no SID or full ACL is emitted.
+fn compact_bits(mask: u32, domain: u32) -> u32 {
+    let mut packed = 0;
+    let mut next = 0;
+    for bit in 0..32 {
+        if domain & (1 << bit) != 0 {
+            packed |= ((mask >> bit) & 1) << next;
+            next += 1;
+        }
+    }
+    packed
+}
+
+// Stable SCM diagnostic ABI. Index 0 is the drive root; 63 means >=63.
+// Bit 31 marks this ABI, bits 25..30 index, 20..24 operation, 0..19 payload.
+// Native errors use payload 1..0xffffe; 0xfffff means out of range (source retained).
+// Policy payloads: MetadataPolicy = relevant attributes (0x451); AceShape = kind
+// in bits 0..7 and flags in 8..15; AceKind/AceFlags = raw byte; AceMask = rejected
+// bits from !0xf01f01ff packed low-to-high in bits 0..13, flags in 14..18;
+// AceRights = rejected bits from 0xf00d0150 packed in 0..9, flags in 10..14.
+// DiskType = native type. All other policy failures carry zero. These operation
+// values, bit domains and index/overflow sentinels must not be renumbered/reused.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(u32)]
+enum AuditOperation {
+    #[default]
+    Open = 1,
+    Metadata = 2,
+    MetadataPolicy = 3,
+    DiskType = 4,
+    SecurityInfo = 5,
+    Descriptor = 6,
+    Owner = 7,
+    Dacl = 8,
+    Control = 9,
+    AceRead = 10,
+    AceShape = 11,
+    AceSid = 12,
+    OwnerPolicy = 13,
+    DaclPolicy = 14,
+    AceKind = 15,
+    AceFlags = 16,
+    AceMask = 17,
+    AceRights = 18,
+    FinalPath = 19,
+    Alias = 20,
+}
+#[derive(Clone, Copy, Debug, Default)]
+struct AuditDetail {
+    operation: AuditOperation,
+    payload: u32,
+}
+impl AuditDetail {
+    fn at(&mut self, operation: AuditOperation) {
+        *self = Self {
+            operation,
+            payload: 0,
+        };
+    }
+}
+#[derive(Debug, thiserror::Error)]
+#[error("temp_ancestor_failed")]
+struct AncestorFailure {
+    code: u32,
+    #[source]
+    source: MemoryError,
+}
+fn ancestor_result<T>(
+    index: usize,
+    detail: AuditDetail,
+    result: Result<T, MemoryError>,
+) -> Result<T, MemoryError> {
+    result.map_err(|source| {
+        let (kind, native) = match &source {
+            MemoryError::Io(e) => (e.kind(), e.raw_os_error()),
+            _ => (std::io::ErrorKind::Other, None),
+        };
+        let payload = native.map_or(detail.payload, |n| {
+            u32::try_from(n)
+                .ok()
+                .filter(|n| *n < 0xfffff)
+                .unwrap_or(0xfffff)
+        });
+        let code = 0x80000000
+            | ((index.min(63) as u32) << 25)
+            | ((detail.operation as u32) << 20)
+            | payload;
+        std::io::Error::new(kind, AncestorFailure { code, source }).into()
+    })
+}
+fn audit_ancestor(
+    path: &Path,
+    service: &str,
+    sharing: u32,
+    index: usize,
+) -> Result<OwnedHandle, MemoryError> {
+    let mut detail = AuditDetail::default();
+    let result = audit_path_detailed(
+        path,
+        service,
+        AuditContext::TempAncestor,
+        sharing,
+        &mut detail,
+    );
+    ancestor_result(index, detail, result)
 }
 
 fn wide(path: &Path) -> Vec<u16> {
@@ -297,6 +469,38 @@ fn audit_path_shared(
     kind: ObjectKind,
     sharing: u32,
 ) -> Result<OwnedHandle, MemoryError> {
+    audit_path_detailed(
+        path,
+        service,
+        AuditContext::Compatibility(kind),
+        sharing,
+        &mut AuditDetail::default(),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum AuditContext {
+    Compatibility(ObjectKind),
+    TempAncestor,
+}
+
+impl AuditContext {
+    fn kind(self) -> ObjectKind {
+        match self {
+            Self::Compatibility(kind) => kind,
+            Self::TempAncestor => ObjectKind::Ancestor,
+        }
+    }
+}
+
+fn audit_path_detailed(
+    path: &Path,
+    service: &str,
+    context: AuditContext,
+    sharing: u32,
+    detail: &mut AuditDetail,
+) -> Result<OwnedHandle, MemoryError> {
+    detail.at(AuditOperation::Open);
     // SAFETY: NUL-terminated path; no inheritable handle, no reparse traversal at the leaf.
     let raw = unsafe {
         CreateFileW(
@@ -314,7 +518,7 @@ fn audit_path_shared(
     }
     // SAFETY: successful CreateFileW transfers a unique handle.
     let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
-    audit_handle(handle.as_raw_handle(), path, service, kind)?;
+    audit_handle_detailed(handle.as_raw_handle(), path, service, context, detail)?;
     Ok(handle)
 }
 
@@ -324,19 +528,46 @@ fn audit_handle(
     service: &str,
     kind: ObjectKind,
 ) -> Result<(), MemoryError> {
+    audit_handle_detailed(
+        handle,
+        path,
+        service,
+        AuditContext::Compatibility(kind),
+        &mut AuditDetail::default(),
+    )
+}
+
+fn audit_handle_detailed(
+    handle: HANDLE,
+    path: &Path,
+    service: &str,
+    context: AuditContext,
+    detail: &mut AuditDetail,
+) -> Result<(), MemoryError> {
+    let kind = context.kind();
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     let mut sd = null_mut();
     // SAFETY: borrowed live handle, valid output storage, security descriptor guarded until all readers finish.
     unsafe {
+        detail.at(AuditOperation::Metadata);
         win(GetFileInformationByHandle(handle, &mut info))?;
+        detail.at(AuditOperation::MetadataPolicy);
+        detail.payload = info.dwFileAttributes
+            & (FILE_ATTRIBUTE_REPARSE_POINT
+                | FILE_ATTRIBUTE_DEVICE
+                | FILE_ATTRIBUTE_READONLY
+                | FILE_ATTRIBUTE_DIRECTORY);
         require(
             metadata_allowed(info.dwFileAttributes, info.nNumberOfLinks, kind),
             "reparse, aliased, readonly or wrong-type broker object",
         )?;
+        detail.at(AuditOperation::DiskType);
+        detail.payload = GetFileType(handle);
         require(
-            GetFileType(handle) == FILE_TYPE_DISK,
+            detail.payload == FILE_TYPE_DISK,
             "broker object is not a disk file",
         )?;
+        detail.at(AuditOperation::SecurityInfo);
         let code = GetSecurityInfo(
             handle,
             SE_FILE_OBJECT,
@@ -351,20 +582,19 @@ fn audit_handle(
             return Err(std::io::Error::from_raw_os_error(code as i32).into());
         }
         let _descriptor = Local(sd);
-        audit_descriptor(sd, service, kind).map_err(|error| match error {
-            MemoryError::Io(error) => MemoryError::Io(std::io::Error::new(
-                error.kind(),
-                format!("broker ACL audit at {}: {error}", path.display()),
-            )),
-            other => other,
-        })?;
+        audit_descriptor_detailed(sd, service, kind, detail)
+            .map_err(|error| descriptor_error(path, context, error))?;
+        detail.at(AuditOperation::FinalPath);
         let mut final_path = vec![0u16; 32768];
         let len =
             GetFinalPathNameByHandleW(handle, final_path.as_mut_ptr(), final_path.len() as u32, 0);
-        require(
-            len > 0 && (len as usize) < final_path.len(),
-            "cannot resolve broker path",
+        final_path_result(
+            len,
+            final_path.len(),
+            context,
+            std::io::Error::last_os_error,
         )?;
+        detail.at(AuditOperation::Alias);
         let resolved = String::from_utf16_lossy(&final_path[..len as usize]);
         let expected = format!(r"\\?\{}", path.display());
         require(
@@ -373,6 +603,35 @@ fn audit_handle(
         )?;
     }
     Ok(())
+}
+
+fn descriptor_error(path: &Path, context: AuditContext, error: MemoryError) -> MemoryError {
+    // Only the TEMP ancestor entry opts into native-source diagnostics.
+    if matches!(context, AuditContext::TempAncestor) {
+        return error;
+    }
+    match error {
+        MemoryError::Io(error) => MemoryError::Io(std::io::Error::new(
+            error.kind(),
+            format!("broker ACL audit at {}: {error}", path.display()),
+        )),
+        other => other,
+    }
+}
+
+fn final_path_result(
+    len: u32,
+    capacity: usize,
+    context: AuditContext,
+    last_error: impl FnOnce() -> std::io::Error,
+) -> Result<(), MemoryError> {
+    if len == 0 && matches!(context, AuditContext::TempAncestor) {
+        return Err(last_error().into());
+    }
+    require(
+        len > 0 && (len as usize) < capacity,
+        "cannot resolve broker path",
+    )
 }
 
 pub(super) fn store_entry_allowed(name: &str) -> bool {
@@ -469,13 +728,12 @@ fn admit_namespace_inner(
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
     };
     *stage = TempAdmissionStage::Ancestor;
-    let mut guards = vec![audit_path_shared(
-        &current,
-        service,
-        ObjectKind::Ancestor,
-        sharing,
-    )?];
-    for part in text[3..].split('\\') {
+    let mut guards = vec![if temp {
+        audit_ancestor(&current, service, sharing, 0)?
+    } else {
+        audit_path_shared(&current, service, ObjectKind::Ancestor, sharing)?
+    }];
+    for (index, part) in text[3..].split('\\').enumerate() {
         current.push(part);
         let kind = if current == root && temp {
             ObjectKind::TempRoot
@@ -489,7 +747,11 @@ fn admit_namespace_inner(
         } else {
             TempAdmissionStage::Ancestor
         };
-        guards.push(audit_path_shared(&current, service, kind, sharing)?);
+        guards.push(if temp && kind == ObjectKind::Ancestor {
+            audit_ancestor(&current, service, sharing, index + 1)?
+        } else {
+            audit_path_shared(&current, service, kind, sharing)?
+        });
     }
     *stage = TempAdmissionStage::Inventory;
     for entry in std::fs::read_dir(root)? {
@@ -573,6 +835,382 @@ fn temp_stage<T>(
 #[cfg(test)]
 mod temp_diagnostics_tests {
     use super::*;
+
+    #[test]
+    fn descriptor_errors_preserve_compatibility_and_temp_ancestor_sources() {
+        use std::error::Error;
+        let path = Path::new(r"C:\private\ancestor");
+        for context in [
+            AuditContext::Compatibility(ObjectKind::Ancestor),
+            AuditContext::Compatibility(ObjectKind::Root),
+            AuditContext::Compatibility(ObjectKind::File),
+            AuditContext::Compatibility(ObjectKind::TempRoot),
+            AuditContext::TempAncestor,
+        ] {
+            for source in [
+                std::io::Error::from_raw_os_error(6),
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, "untrusted broker ACL"),
+            ] {
+                let kind = source.kind();
+                let raw = source.raw_os_error();
+                let message = source.to_string();
+                let MemoryError::Io(error) = descriptor_error(path, context, source.into()) else {
+                    panic!("expected I/O error")
+                };
+                assert_eq!(error.kind(), kind);
+                if matches!(context, AuditContext::TempAncestor) {
+                    assert_eq!(error.raw_os_error(), raw);
+                    assert_eq!(error.to_string(), message);
+                    let wrapped =
+                        ancestor_result::<()>(0, AuditDetail::default(), Err(error.into()))
+                            .unwrap_err();
+                    let MemoryError::Io(outer) = wrapped else {
+                        panic!()
+                    };
+                    let failure = outer
+                        .get_ref()
+                        .unwrap()
+                        .downcast_ref::<AncestorFailure>()
+                        .unwrap();
+                    assert!(failure
+                        .source()
+                        .unwrap()
+                        .downcast_ref::<MemoryError>()
+                        .is_some());
+                    let MemoryError::Io(retained) = &failure.source else {
+                        panic!()
+                    };
+                    assert_eq!(retained.kind(), kind);
+                    assert_eq!(retained.raw_os_error(), raw);
+                    assert_eq!(retained.to_string(), message);
+                } else {
+                    assert_eq!(error.raw_os_error(), None);
+                    assert_eq!(
+                        error.to_string(),
+                        format!("broker ACL audit at {}: {message}", path.display())
+                    );
+                    assert!(error.source().is_none());
+                }
+            }
+            assert!(matches!(
+                descriptor_error(path, context, MemoryError::LockPoisoned),
+                MemoryError::LockPoisoned
+            ));
+        }
+    }
+
+    #[test]
+    fn final_path_errors_preserve_compatibility_and_temp_ancestor_sources() {
+        use std::error::Error;
+        for context in [
+            AuditContext::Compatibility(ObjectKind::Ancestor),
+            AuditContext::Compatibility(ObjectKind::Root),
+            AuditContext::Compatibility(ObjectKind::File),
+            AuditContext::Compatibility(ObjectKind::TempRoot),
+            AuditContext::TempAncestor,
+        ] {
+            let native = || std::io::Error::from_raw_os_error(6);
+            let MemoryError::Io(error) = final_path_result(0, 32768, context, native).unwrap_err()
+            else {
+                panic!()
+            };
+            if matches!(context, AuditContext::TempAncestor) {
+                assert_eq!(error.kind(), native().kind());
+                assert_eq!(error.raw_os_error(), Some(6));
+                assert_eq!(error.to_string(), native().to_string());
+                let wrapped = ancestor_result::<()>(
+                    0,
+                    AuditDetail {
+                        operation: AuditOperation::FinalPath,
+                        payload: 0,
+                    },
+                    Err(error.into()),
+                )
+                .unwrap_err();
+                let MemoryError::Io(outer) = wrapped else {
+                    panic!()
+                };
+                let failure = outer
+                    .get_ref()
+                    .unwrap()
+                    .downcast_ref::<AncestorFailure>()
+                    .unwrap();
+                assert!(failure
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<MemoryError>()
+                    .is_some());
+                let MemoryError::Io(retained) = &failure.source else {
+                    panic!()
+                };
+                assert_eq!(retained.kind(), native().kind());
+                assert_eq!(retained.raw_os_error(), Some(6));
+                assert_eq!(retained.to_string(), native().to_string());
+                assert_eq!(failure.code, 0x81300006);
+            } else {
+                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                assert_eq!(error.raw_os_error(), None);
+                assert_eq!(error.to_string(), "cannot resolve broker path");
+                assert!(error.source().is_none());
+            }
+            for len in [32768, u32::MAX] {
+                let MemoryError::Io(error) =
+                    final_path_result(len, 32768, context, || panic!("not a native failure"))
+                        .unwrap_err()
+                else {
+                    panic!()
+                };
+                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                assert_eq!(error.raw_os_error(), None);
+                assert_eq!(error.to_string(), "cannot resolve broker path");
+            }
+            for len in [1, 32767] {
+                assert!(
+                    final_path_result(len, 32768, context, || panic!("not a native failure"))
+                        .is_ok()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ancestor_diagnostic_index_native_overflow_and_u32_boundaries() {
+        for index in [0, 62, 63, 64, usize::MAX] {
+            for (native, payload) in [
+                (0, 0),
+                (1, 1),
+                (0xffffe, 0xffffe),
+                (0xfffff, 0xfffff),
+                (0x100000, 0xfffff),
+                (-1, 0xfffff),
+                (i32::MIN, 0xfffff),
+                (i32::MAX, 0xfffff),
+            ] {
+                let error = ancestor_result::<()>(
+                    index,
+                    AuditDetail {
+                        operation: AuditOperation::FinalPath,
+                        payload: 0,
+                    },
+                    Err(std::io::Error::from_raw_os_error(native).into()),
+                )
+                .unwrap_err();
+                let MemoryError::Io(outer) = &error else {
+                    panic!()
+                };
+                let failure = outer
+                    .get_ref()
+                    .unwrap()
+                    .downcast_ref::<AncestorFailure>()
+                    .unwrap();
+                let MemoryError::Io(source) = &failure.source else {
+                    panic!()
+                };
+                assert_eq!(source.raw_os_error(), Some(native));
+                let error = temp_stage::<()>(TempAdmissionStage::Ancestor, Err(error)).unwrap_err();
+                let code: u32 = BrokerTempGuard::ancestor_failure_code(&error).unwrap();
+                let expected = 0x80000000u64
+                    | ((index.min(63) as u64) << 25)
+                    | ((AuditOperation::FinalPath as u64) << 20)
+                    | payload;
+                assert_eq!(u64::from(code), expected);
+                assert!(code > i32::MAX as u32);
+                assert_eq!((code >> 25) & 63, index.min(63) as u32);
+                assert_eq!((code >> 20) & 31, AuditOperation::FinalPath as u32);
+                assert_eq!(u64::from(code & 0xfffff), payload);
+                assert_eq!(
+                    serde_json::from_str::<u32>(&serde_json::to_string(&code).unwrap()).unwrap(),
+                    code
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ancestor_policy_diagnostics_are_lossless_and_fail_closed() {
+        let service = "S-1-5-80-1-2-3-4-5";
+        let mut detail = AuditDetail::default();
+        // Child-create grants, including inherited ones, remain allowed. No relaxation.
+        for flags in [0, 3, 16, 19] {
+            for mask in [2, 4, 0x100004, 0x1200a9] {
+                let ace = Ace {
+                    sid: "S-1-1-0".into(),
+                    mask,
+                    flags,
+                    kind: 0,
+                };
+                assert!(acl_allowed_detailed(
+                    "S-1-5-32-544",
+                    false,
+                    &[ace],
+                    service,
+                    ObjectKind::Ancestor,
+                    &mut detail
+                ));
+            }
+        }
+        for (mask, flags, kind, operation, payload) in [
+            (
+                0x1f01ff,
+                19,
+                0,
+                AuditOperation::AceRights,
+                compact_bits(0x1f01ff, 0xf00d0150) | (19 << 10),
+            ),
+            (
+                0x40000000,
+                3,
+                0,
+                AuditOperation::AceRights,
+                compact_bits(0x40000000, 0xf00d0150) | (3 << 10),
+            ),
+            (0x200, 3, 0, AuditOperation::AceMask, 1 | (3 << 14)),
+            (0x1200a9, 128, 0, AuditOperation::AceFlags, 128),
+            (0x1200a9, 0, 1, AuditOperation::AceKind, 1),
+        ] {
+            let ace = Ace {
+                sid: "S-1-1-0".into(),
+                mask,
+                flags,
+                kind,
+            };
+            assert!(!acl_allowed_detailed(
+                "S-1-5-32-544",
+                false,
+                std::slice::from_ref(&ace),
+                service,
+                ObjectKind::Ancestor,
+                &mut detail
+            ));
+            assert_eq!(detail.operation as u32, operation as u32);
+            assert_eq!(detail.payload, payload);
+            // Owner check still wins over ACE policy.
+            assert!(!acl_allowed_detailed(
+                "S-1-1-0",
+                false,
+                &[ace],
+                service,
+                ObjectKind::Ancestor,
+                &mut detail
+            ));
+            assert_eq!(detail.operation as u32, AuditOperation::OwnerPolicy as u32);
+        }
+        // Each possible rejected bit round-trips in the numeric mask payload.
+        for domain in [!0xf01f01ffu32, 0xf00d0150] {
+            let mut ordinal = 0;
+            for bit in 0..32 {
+                if domain & (1 << bit) != 0 {
+                    assert_eq!(compact_bits(1 << bit, domain), 1 << ordinal);
+                    ordinal += 1;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ancestor_recorded_good_drive_acl_still_passes() {
+        // Replay report.proof.ancestors[0] from identity run 36954294944.
+        // This is not an observation of the failed run's drive ACL.
+        let owner = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+        let aces: Vec<_> = [
+            ("S-1-5-11", 4, 0),
+            ("S-1-5-11", 3758161920, 11),
+            ("S-1-5-18", 2032127, 3),
+            ("S-1-5-32-544", 2032127, 3),
+            ("S-1-5-32-545", 1179817, 3),
+        ]
+        .into_iter()
+        .map(|(sid, mask, flags)| Ace {
+            sid: sid.into(),
+            mask,
+            flags,
+            kind: 0,
+        })
+        .collect();
+        assert!(acl_allowed(
+            owner,
+            true,
+            &aces,
+            "S-1-5-80-1-2-3-4-5",
+            ObjectKind::Ancestor
+        ));
+    }
+
+    #[test]
+    fn ancestor_native_descriptor_diagnostics_preserve_validation_order() {
+        let service = "S-1-5-80-1-2-3-4-5";
+        for (sddl, operation, payload) in [
+            ("O:WDG:BAD:(A;;FA;;;SY)", AuditOperation::OwnerPolicy, 0),
+            ("O:BAG:BAD:NO_ACCESS_CONTROL", AuditOperation::Dacl, 0),
+            ("O:BAG:BAD:(D;;FA;;;WD)", AuditOperation::AceShape, 1),
+            (
+                "O:BAG:BAD:(A;CIID;0x100100;;;BU)",
+                AuditOperation::AceRights,
+                4 | (18 << 10),
+            ),
+        ] {
+            let mut sd = null_mut();
+            // SAFETY: in-memory SDDL conversion only; no filesystem security changes.
+            unsafe {
+                win(ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    wide(Path::new(sddl)).as_ptr(),
+                    1,
+                    &mut sd,
+                    null_mut(),
+                ))
+                .unwrap();
+                let _allocation = Local(sd);
+                let mut detail = AuditDetail::default();
+                let result =
+                    audit_descriptor_detailed(sd, service, ObjectKind::Ancestor, &mut detail);
+                assert!(result.is_err());
+                assert_eq!(detail.operation as u32, operation as u32);
+                assert_eq!(detail.payload, payload);
+                let error = ancestor_result(0, detail, result).unwrap_err();
+                let error = temp_stage::<()>(TempAdmissionStage::Ancestor, Err(error)).unwrap_err();
+                assert_eq!(
+                    BrokerTempGuard::ancestor_failure_code(&error),
+                    Some(0x80000000 | ((operation as u32) << 20) | payload)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ancestor_diagnostic_preserves_native_error_and_scm_payload() {
+        let error = ancestor_result::<()>(
+            2,
+            AuditDetail::default(),
+            Err(std::io::Error::from_raw_os_error(5).into()),
+        )
+        .unwrap_err();
+        let error = temp_stage::<()>(TempAdmissionStage::Ancestor, Err(error)).unwrap_err();
+        let code = BrokerTempGuard::ancestor_failure_code(&error).unwrap();
+        assert_eq!((code >> 25) & 63, 2);
+        assert_eq!((code >> 20) & 31, AuditOperation::Open as u32);
+        assert_ne!(code & 0xfffff, 0);
+        assert!(!error.to_string().contains("private"));
+        let MemoryError::Io(outer) = &error else {
+            panic!()
+        };
+        let stage = outer
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<TempAdmissionFailure>()
+            .unwrap();
+        let MemoryError::Io(inner) = &stage.source else {
+            panic!()
+        };
+        let detail = inner
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<AncestorFailure>()
+            .unwrap();
+        let MemoryError::Io(native) = &detail.source else {
+            panic!()
+        };
+        assert_eq!(native.raw_os_error().unwrap() as u32, code & 0xfffff);
+    }
 
     #[test]
     fn temp_subreasons_use_typed_errors_not_private_error_text() {
@@ -698,6 +1336,18 @@ pub fn admit_broker_temp(root: &Path) -> Result<BrokerTempGuard, MemoryError> {
 }
 
 impl BrokerTempGuard {
+    /// Content-free SCM code for a typed TEMP ancestor failure; never parses error text.
+    pub fn ancestor_failure_code(error: &MemoryError) -> Option<u32> {
+        let MemoryError::Io(error) = error else {
+            return None;
+        };
+        let stage = error.get_ref()?.downcast_ref::<TempAdmissionFailure>()?;
+        let MemoryError::Io(error) = &stage.source else {
+            return None;
+        };
+        Some(error.get_ref()?.downcast_ref::<AncestorFailure>()?.code)
+    }
+
     /// Bounded startup diagnostic for errors returned by `admit_broker_temp`.
     /// Only typed internal stages are exposed: never paths, SIDs, ACLs, or error text.
     /// Unrelated errors retain the original catch-all label; the admission API is unchanged.
