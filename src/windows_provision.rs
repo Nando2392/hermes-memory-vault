@@ -1328,6 +1328,49 @@ pub fn stop(path: &Path, allow: bool) -> io::Result<serde_json::Value> {
     stop_owned(&a.service, &a.receipt.server_sid)?;
     Ok(serde_json::json!({"state":"SCM_STOPPED","data_retained":true}))
 }
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ActivationPhase {
+    Staging,
+    Initial,
+    Start,
+    Poll,
+    Running,
+    Stopped,
+    Deadline,
+}
+
+// Exactly one bounded, content-free line in the admin's already captured stderr.
+// A query failure keeps the last successful snapshot (or null), never invents one.
+// Diagnostics are not readiness/import evidence and cannot replace the primary error.
+fn activation_diagnostic<T>(
+    result: io::Result<T>,
+    phase: ActivationPhase,
+    snapshot: Option<&SERVICE_STATUS_PROCESS>,
+    writer: &mut impl io::Write,
+) -> io::Result<T> {
+    if let Err(error) = &result {
+        let scm = snapshot.map(|s| {
+            serde_json::json!({
+                "state": s.dwCurrentState, "win32_exit": s.dwWin32ExitCode,
+                "service_exit": s.dwServiceSpecificExitCode, "pid": s.dwProcessId,
+                "checkpoint": s.dwCheckPoint, "wait_hint": s.dwWaitHint,
+            })
+        });
+        let record = serde_json::json!({
+            "schema": 1, "state": "ACTIVATION_FAILED_OUTCOME_UNKNOWN",
+            "phase": phase, "scm": scm, "os_error": error.raw_os_error(),
+        });
+        if let Ok(mut bytes) = serde_json::to_vec(&record) {
+            bytes.push(b'\n');
+            if bytes.len() <= 512 {
+                let _ = writer.write_all(&bytes);
+            }
+        }
+    }
+    result
+}
+
 /// Only the explicitly supplied logical archive is read. No legacy database opens.
 pub fn activate(
     path: &Path,
@@ -1374,6 +1417,8 @@ pub fn activate(
         Err(e) if e.kind() == io::ErrorKind::NotFound => json_new(&admission, &expected_admission)?,
         Err(e) => return Err(e),
     }
+    let mut phase = ActivationPhase::Staging;
+    let mut snapshot = None;
     let result = (|| {
         match crate::windows_enrollment::open_admin_owned_file(&target, 1 << 30) {
             Ok(_guard) => {
@@ -1391,8 +1436,11 @@ pub fn activate(
             }
             Err(e) => return Err(e),
         }
+        phase = ActivationPhase::Initial;
         let initial = service_status(&a.service)?;
+        snapshot = Some(initial);
         if initial.dwCurrentState == SERVICE_STOPPED {
+            phase = ActivationPhase::Start;
             // SAFETY: exact owned registration, no service command-line overrides.
             unsafe {
                 win(StartServiceW(a.service.0, 0, null()))?;
@@ -1405,8 +1453,11 @@ pub fn activate(
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
+            phase = ActivationPhase::Poll;
             let s = service_status(&a.service)?;
+            snapshot = Some(s);
             if s.dwCurrentState == SERVICE_RUNNING {
+                phase = ActivationPhase::Running;
                 require(
                     process_pin(&a.service, &a.receipt.server_sid)?.is_some(),
                     "running service has no process",
@@ -1415,13 +1466,22 @@ pub fn activate(
                     serde_json::json!({"state":"SCM_RUNNING_CLIENT_VALIDATION_PENDING","client_health_verified":false,"logical_sha256":logical_sha256}),
                 );
             }
-            require(
-                s.dwCurrentState != SERVICE_STOPPED && std::time::Instant::now() < deadline,
-                "service failed to reach RUNNING; import outcome unknown",
-            )?;
+            if s.dwCurrentState == SERVICE_STOPPED || std::time::Instant::now() >= deadline {
+                phase = if s.dwCurrentState == SERVICE_STOPPED {
+                    ActivationPhase::Stopped
+                } else {
+                    ActivationPhase::Deadline
+                };
+                require(
+                    false,
+                    "service failed to reach RUNNING; import outcome unknown",
+                )?;
+            }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
     })();
+    // Emit before cleanup through the harness-captured admin stderr.
+    let result = activation_diagnostic(result, phase, snapshot.as_ref(), &mut io::stderr().lock());
     if result.is_err() {
         let stopped = stop_owned(&a.service, &a.receipt.server_sid).is_ok();
         // Append-only recovery markers; no database deletion or unknown-commit retry.
@@ -1434,7 +1494,8 @@ pub fn activate(
             ) {
                 Ok(()) => break,
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists && index < 1000 => index += 1,
-                Err(e) => return Err(e),
+                // Failure evidence must never replace the original activation error.
+                Err(_) => break,
             }
         }
     }
@@ -1443,6 +1504,78 @@ pub fn activate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn scm_diagnostics_stopped_deadline_bounded_and_original_failure() {
+        let stopped = SERVICE_STATUS_PROCESS {
+            dwCurrentState: SERVICE_STOPPED,
+            dwWin32ExitCode: 1066,
+            dwServiceSpecificExitCode: 1007,
+            dwProcessId: u32::MAX,
+            dwCheckPoint: u32::MAX,
+            dwWaitHint: u32::MAX,
+            ..Default::default()
+        };
+        for (phase, expected) in [
+            (ActivationPhase::Stopped, "stopped"),
+            (ActivationPhase::Deadline, "deadline"),
+        ] {
+            let mut output = Vec::new();
+            let original = io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "service failed to reach RUNNING; import outcome unknown",
+            );
+            let result: io::Result<()> =
+                activation_diagnostic(Err(original), phase, Some(&stopped), &mut output);
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "service failed to reach RUNNING; import outcome unknown"
+            );
+            assert!(output.len() <= 512);
+            assert_eq!(output.iter().filter(|&&b| b == b'\n').count(), 1);
+            let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(value["phase"], expected);
+            assert_eq!(value["state"], "ACTIVATION_FAILED_OUTCOME_UNKNOWN");
+            assert_eq!(value["scm"]["state"], SERVICE_STOPPED);
+            assert_eq!(value["scm"]["win32_exit"], 1066);
+            assert_eq!(value["scm"]["service_exit"], 1007);
+            for key in ["pid", "checkpoint", "wait_hint"] {
+                assert_eq!(value["scm"][key], u32::MAX);
+            }
+        }
+        let mut output = Vec::new();
+        let original = io::Error::other("C:\\private\\token\nsecret".repeat(4096));
+        let pointer = original.get_ref().unwrap() as *const _;
+        let result: io::Result<()> =
+            activation_diagnostic(Err(original), ActivationPhase::Poll, None, &mut output);
+        assert!(std::ptr::eq(
+            result.unwrap_err().get_ref().unwrap(),
+            pointer
+        ));
+        assert!(output.len() <= 512);
+        assert!(!String::from_utf8(output).unwrap().contains("secret"));
+        struct Broken;
+        impl io::Write for Broken {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("secret"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let result: io::Result<()> = activation_diagnostic(
+            Err(io::Error::from_raw_os_error(5)),
+            ActivationPhase::Start,
+            None,
+            &mut Broken,
+        );
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(5));
+        let mut output = Vec::new();
+        assert_eq!(
+            activation_diagnostic(Ok(7), ActivationPhase::Running, None, &mut output).unwrap(),
+            7
+        );
+        assert!(output.is_empty());
+    }
     #[test]
     fn source_pin_rejects_hash_hardlinks_and_denies_write_delete() {
         let d = tempfile::tempdir().unwrap();

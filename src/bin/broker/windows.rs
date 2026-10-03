@@ -245,7 +245,12 @@ fn service_main_inner(runtime: &'static Runtime) -> Result<(), &'static str> {
     let thread = match spawn {
         Ok(thread) => thread,
         Err(_) => {
-            report_status(handle, SERVICE_STOPPED, 0, 1)?;
+            let _ = report_status(
+                handle,
+                SERVICE_STOPPED,
+                0,
+                service_exit_code("worker_start_failed"),
+            );
             return Err("worker_start_failed");
         }
     };
@@ -315,8 +320,15 @@ fn supervise(
                     },
                     Err,
                 );
-                report(SERVICE_STOPPED, 0, u32::from(result.is_err()))?;
-                return result;
+                let reported = report(
+                    SERVICE_STOPPED,
+                    0,
+                    result
+                        .as_ref()
+                        .err()
+                        .map_or(0, |code| service_exit_code(code)),
+                );
+                return result.and(reported);
             }
             Event::Ready if !stop.load(Ordering::Acquire) => {
                 state = SERVICE_RUNNING;
@@ -328,7 +340,11 @@ fn supervise(
             state = SERVICE_STOP_PENDING;
         }
         if stopping.is_some_and(|t| t.elapsed() >= stop_budget) {
-            report(SERVICE_STOPPED, 0, 1)?;
+            let _ = report(
+                SERVICE_STOPPED,
+                0,
+                service_exit_code(error.unwrap_or("service_timeout")),
+            );
             return Err(error.unwrap_or("service_timeout"));
         }
         checkpoint = checkpoint.saturating_add(1);
@@ -343,6 +359,37 @@ fn supervise(
         ) {
             error.get_or_insert(code);
         }
+    }
+}
+
+// Stable diagnostic ABI: never renumber/reuse codes or expose an unknown label.
+// 0 is success; 1 remains the safe fallback for unrecognized failures.
+fn service_exit_code(label: &str) -> u32 {
+    match label {
+        "unauthorized" => 1001,
+        "temp_admission_failed" => 1002,
+        "store_admission_failed" => 1003,
+        "temp_selection_failed" => 1004,
+        "bootstrap_config_invalid" => 1005,
+        "bootstrap_source_admission_failed" => 1006,
+        "bootstrap_import_failed" => 1007,
+        "unavailable" => 1008,
+        "pipe_bind_failed" => 1009,
+        "pipe_accept_failed" => 1010,
+        "worker_panicked" => 1011,
+        "worker_start_failed" => 1012,
+        "worker_exited" => 1013,
+        "supervisor_exited" => 1014,
+        "service_timeout" => 1015,
+        "scm_status_failed" => 1016,
+        "scm_handler_failed" => 1017,
+        "service_panicked" => 1018,
+        "scm_dispatcher_failed" => 1019,
+        "service_not_started" => 1020,
+        "service_already_started" => 1021,
+        "invalid_request" => 1022,
+        "startup_cancelled" => 1023,
+        _ => 1,
     }
 }
 
@@ -644,6 +691,89 @@ fn validate(config: &Config) -> Result<(), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn scm_diagnostics_reporting_failure_preserves_worker_failure() {
+        let result = supervise(
+            || Event::Done(Err("bootstrap_import_failed")),
+            &AtomicBool::new(false),
+            |state, _, _| {
+                if state == SERVICE_STOPPED {
+                    Err("scm_status_failed")
+                } else {
+                    Ok(())
+                }
+            },
+            Duration::from_secs(30),
+            Duration::from_secs(15),
+        );
+        assert_eq!(result, Err("bootstrap_import_failed"));
+    }
+    #[test]
+    fn scm_diagnostics_stable_unique_codes_and_safe_fallback() {
+        let labels = [
+            "unauthorized",
+            "temp_admission_failed",
+            "store_admission_failed",
+            "temp_selection_failed",
+            "bootstrap_config_invalid",
+            "bootstrap_source_admission_failed",
+            "bootstrap_import_failed",
+            "unavailable",
+            "pipe_bind_failed",
+            "pipe_accept_failed",
+            "worker_panicked",
+            "worker_start_failed",
+            "worker_exited",
+            "supervisor_exited",
+            "service_timeout",
+            "scm_status_failed",
+            "scm_handler_failed",
+            "service_panicked",
+            "scm_dispatcher_failed",
+            "service_not_started",
+            "service_already_started",
+            "invalid_request",
+            "startup_cancelled",
+        ];
+        let mut codes = std::collections::BTreeSet::new();
+        for (index, label) in labels.into_iter().enumerate() {
+            let mut exit = 0;
+            assert_eq!(
+                supervise(
+                    || Event::Done(Err(label)),
+                    &AtomicBool::new(false),
+                    |state, _, code| {
+                        if state == SERVICE_STOPPED {
+                            exit = code;
+                        }
+                        Ok(())
+                    },
+                    Duration::from_secs(30),
+                    Duration::from_secs(15),
+                ),
+                Err(label)
+            );
+            assert_eq!(exit, 1001 + index as u32);
+            assert!(codes.insert(exit));
+            let encoded = status(SERVICE_STOPPED, 0, exit);
+            assert_eq!(encoded.dwWin32ExitCode, 1066);
+            assert_eq!(encoded.dwServiceSpecificExitCode, exit);
+        }
+        for label in ["", "C:\\private\\token\nsecret", "unknown"] {
+            let mut exit = 0;
+            let _ = supervise(
+                || Event::Done(Err(label)),
+                &AtomicBool::new(false),
+                |_, _, code| {
+                    exit = code;
+                    Ok(())
+                },
+                Duration::from_secs(30),
+                Duration::from_secs(15),
+            );
+            assert_eq!(exit, 1);
+        }
+    }
     #[derive(Default)]
     struct Duplex {
         input: io::Cursor<Vec<u8>>,

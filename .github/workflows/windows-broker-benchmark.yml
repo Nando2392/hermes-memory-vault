@@ -79,7 +79,7 @@ jobs:
               provenance['source_sha256'] = source_digest
               # Derived from all 44 build-source files after POSIX CLI fixes.
               # Changing this pin requires another independent source review.
-              if source_digest != '870c613140bad95225a7c03cda78f67a7bfe43d911d45d4ec37f6b34b3cc4580':
+              if source_digest != '83afb75dc0abef23da24905ee7d222887cffc86deb51fc000fa2cd12b8987a5d':
                   raise RuntimeError('Build inputs differ from reviewed small-case snapshot')
               provenance['workflow_sha256'] = digest(root / '.github/workflows/windows-broker-benchmark.yml')
               provenance['gate_pass'] = True
