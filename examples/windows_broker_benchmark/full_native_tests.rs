@@ -396,7 +396,8 @@ fn shared_full64_orchestration_runs_real_store_and_retains_before_each_ack() {
             &manifest,
         )
         .unwrap();
-        let imported = crate::full_oracles::verify_stopped_sqlite(
+        let imported = crate::full_oracles::verify_owned_stopped_sqlite(
+            &temp,
             &root.join("install/store/memory.db"),
             &generation,
             &manifest,

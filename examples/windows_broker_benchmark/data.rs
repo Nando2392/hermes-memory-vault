@@ -255,6 +255,7 @@ pub fn generate(root: &Path, bytes: u64) -> Result<serde_json::Value> {
         None,
         hermes_memory::logical_migration::MAX_ARCHIVE_BYTES,
         |path| Ok(hermes_memory::MemoryStore::open(path)?),
+        production_fixture_export,
     )
 }
 
@@ -267,6 +268,7 @@ pub fn generate_with_spec(root: &Path, spec: &FixtureSpec) -> Result<serde_json:
         Some(spec),
         hermes_memory::logical_migration::MAX_ARCHIVE_BYTES,
         |path| Ok(hermes_memory::MemoryStore::open(path)?),
+        production_fixture_export,
     )
 }
 
@@ -302,7 +304,21 @@ pub(crate) fn generate_with_spec_for_owned_store(
         Some(spec),
         hermes_memory::logical_migration::MAX_ARCHIVE_BYTES,
         open_owned_fixture_store,
+        |database, output| {
+            Ok(crate::owned_fixture_export::export(
+                database,
+                database.parent().ok_or("fixture parent")?,
+                output,
+            )?)
+        },
     )
+}
+
+fn production_fixture_export(
+    database: &Path,
+    output: &mut dyn Write,
+) -> Result<hermes_memory::logical_migration::MigrationReceipt> {
+    Ok(hermes_memory::logical_migration::export_from_staged_sqlite_copy(database, output)?)
 }
 
 fn generate_inner(
@@ -311,6 +327,10 @@ fn generate_inner(
     spec: Option<&FixtureSpec>,
     archive_limit: u64,
     open_store: impl FnOnce(&Path) -> Result<hermes_memory::MemoryStore>,
+    export: impl FnOnce(
+        &Path,
+        &mut dyn Write,
+    ) -> Result<hermes_memory::logical_migration::MigrationReceipt>,
 ) -> Result<serde_json::Value> {
     let maximum_jsonl = bytes
         .checked_add(MAX_SEED_BATCH_BYTES)
@@ -373,9 +393,9 @@ fn generate_inner(
         .write(true)
         .create_new(true)
         .open(&archive)?;
-    let receipt = hermes_memory::logical_migration::export_from_staged_sqlite_copy(
-        source.join("memory.db"),
-        LimitedWriter::new(&mut output, archive_limit),
+    let receipt = export(
+        &source.join("memory.db"),
+        &mut LimitedWriter::new(&mut output, archive_limit),
     )?;
     output.flush()?;
     output.sync_all()?;
@@ -746,15 +766,50 @@ mod tests {
             shape: FixtureShape::RepresentativeV2,
             target_jsonl_bytes: 8192,
         };
-        assert!(
-            generate_inner(&root, spec.target_jsonl_bytes, Some(&spec), 100, |path| {
-                Ok(hermes_memory::MemoryStore::open(path)?)
-            })
-            .is_err()
-        );
+        assert!(generate_inner(
+            &root,
+            spec.target_jsonl_bytes,
+            Some(&spec),
+            100,
+            |path| { Ok(hermes_memory::MemoryStore::open(path)?) },
+            production_fixture_export
+        )
+        .is_err());
         assert!(fs::metadata(root.join("archive.jsonl")).unwrap().len() <= 100);
         assert!(!root.join("generation.json").exists());
         assert!(generate_with_spec(&root, &spec).is_err());
+    }
+
+    #[cfg(any(windows, all(target_os = "linux", feature = "experimental-broker")))]
+    #[test]
+    fn owned_seed_export_cap_retains_partial_without_success_or_source_mutation() {
+        let owner = tempfile::tempdir_in(std::env::var_os("TMPDIR").unwrap()).unwrap();
+        let root = owner.path().join("capped");
+        let spec = FixtureSpec {
+            shape: FixtureShape::RepresentativeV2,
+            target_jsonl_bytes: 8192,
+        };
+        let mut before = None;
+        assert!(generate_inner(
+            &root,
+            spec.target_jsonl_bytes,
+            Some(&spec),
+            100,
+            open_owned_fixture_store,
+            |database, output| {
+                before = Some(inventory(database.parent().unwrap())?);
+                Ok(crate::owned_fixture_export::export(
+                    database,
+                    database.parent().unwrap(),
+                    output,
+                )?)
+            }
+        )
+        .is_err());
+        assert!(fs::metadata(root.join("archive.jsonl")).unwrap().len() <= 100);
+        assert!(!root.join("generation.json").exists());
+        assert_eq!(before.unwrap(), inventory(&root.join("source")).unwrap());
+        assert!(generate_with_spec_for_owned_store(&root, &spec).is_err());
     }
 
     #[test]

@@ -281,6 +281,41 @@ pub fn verify_stopped_sqlite(
     generation: &Value,
     manifest: &FullManifest,
 ) -> Result<Value> {
+    verify_stopped_sqlite_inner(database, generation, manifest, |database| {
+        Ok(
+            hermes_memory::logical_migration::export_from_staged_sqlite_copy(
+                database,
+                std::io::sink(),
+            )?,
+        )
+    })
+}
+#[cfg(test)]
+pub(crate) fn verify_owned_stopped_sqlite(
+    owner: &tempfile::TempDir,
+    database: &Path,
+    generation: &Value,
+    manifest: &FullManifest,
+) -> Result<Value> {
+    ensure(
+        database.starts_with(owner.path()),
+        "outside test-owned temporary fixture",
+    )?;
+    crate::owned_fixture_export::check_owned(database, database.parent().ok_or("fixture parent")?)?;
+    verify_stopped_sqlite_inner(database, generation, manifest, |database| {
+        Ok(crate::owned_fixture_export::export(
+            database,
+            database.parent().ok_or("fixture parent")?,
+            std::io::sink(),
+        )?)
+    })
+}
+fn verify_stopped_sqlite_inner(
+    database: &Path,
+    generation: &Value,
+    manifest: &FullManifest,
+    export: impl FnOnce(&Path) -> Result<hermes_memory::logical_migration::MigrationReceipt>,
+) -> Result<Value> {
     for suffix in ["-wal", "-shm"] {
         ensure(
             !std::path::PathBuf::from(format!("{}{suffix}", database.display())).try_exists()?,
@@ -325,10 +360,7 @@ pub fn verify_stopped_sqlite(
         )?;
     }
     drop(connection);
-    let final_export = hermes_memory::logical_migration::export_from_staged_sqlite_copy(
-        database,
-        std::io::sink(),
-    )?;
+    let final_export = export(database)?;
     ensure(
         final_export.records == manifest.final_records()
             && final_export.snapshot_states == 1

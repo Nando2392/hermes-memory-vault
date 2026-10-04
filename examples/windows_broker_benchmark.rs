@@ -27,6 +27,9 @@ mod full_workload_barrier;
 mod full_workload_receipt;
 #[path = "windows_broker_benchmark/policy.rs"]
 mod hosted_policy;
+#[cfg(test)]
+#[path = "windows_broker_benchmark/owned_fixture_export.rs"]
+mod owned_fixture_export;
 #[path = "windows_broker_benchmark/two_warmup.rs"]
 mod two_warmup;
 mod policy {

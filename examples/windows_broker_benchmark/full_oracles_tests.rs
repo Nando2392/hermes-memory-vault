@@ -110,7 +110,7 @@ fn stopped_streaming_oracles_bind_same_count_fields_order_state_and_notes() {
         let projection = root.join("store/events.jsonl");
         let source = root.join("seed/source/events.jsonl");
         let vault = root.join("export");
-        verify_stopped_sqlite(&database, &generation, &manifest).unwrap();
+        verify_owned_stopped_sqlite(&temp, &database, &generation, &manifest).unwrap();
         verify_projection(&projection, &source, &manifest).unwrap();
         verify_export(&vault, &source, &manifest).unwrap();
         assert!(fs::metadata(&projection).unwrap().len() > 8 * 1024 * 1024);
@@ -151,7 +151,7 @@ fn stopped_streaming_oracles_bind_same_count_fields_order_state_and_notes() {
                 )
                 .unwrap();
             drop(connection);
-            assert!(verify_stopped_sqlite(&database, &generation, &manifest).is_err());
+            assert!(verify_owned_stopped_sqlite(&temp, &database, &generation, &manifest).is_err());
             let connection = rusqlite::Connection::open(&database).unwrap();
             connection
                 .execute(
@@ -166,7 +166,7 @@ fn stopped_streaming_oracles_bind_same_count_fields_order_state_and_notes() {
             .execute("UPDATE snapshot_counters SET next_occurrence=2", [])
             .unwrap();
         drop(connection);
-        assert!(verify_stopped_sqlite(&database, &generation, &manifest).is_err());
+        assert!(verify_owned_stopped_sqlite(&temp, &database, &generation, &manifest).is_err());
         let connection = rusqlite::Connection::open(&database).unwrap();
         connection
             .execute("UPDATE snapshot_counters SET next_occurrence=1", [])
@@ -245,6 +245,6 @@ fn stopped_streaming_oracles_bind_same_count_fields_order_state_and_notes() {
         file.sync_all().unwrap();
         drop(file);
         verify_export(&vault, &source, &manifest).unwrap();
-        verify_stopped_sqlite(&database, &generation, &manifest).unwrap();
+        verify_owned_stopped_sqlite(&temp, &database, &generation, &manifest).unwrap();
     }
 }
