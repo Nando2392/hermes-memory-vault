@@ -254,6 +254,7 @@ pub fn generate(root: &Path, bytes: u64) -> Result<serde_json::Value> {
         bytes,
         None,
         hermes_memory::logical_migration::MAX_ARCHIVE_BYTES,
+        |path| Ok(hermes_memory::MemoryStore::open(path)?),
     )
 }
 
@@ -265,6 +266,37 @@ pub fn generate_with_spec(root: &Path, spec: &FixtureSpec) -> Result<serde_json:
         spec.target_jsonl_bytes,
         Some(spec),
         hermes_memory::logical_migration::MAX_ARCHIVE_BYTES,
+        |path| Ok(hermes_memory::MemoryStore::open(path)?),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn open_owned_fixture_store(root: &Path) -> Result<hermes_memory::MemoryStore> {
+    #[cfg(all(target_os = "linux", feature = "experimental-broker"))]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        // Reserve only a fresh child; never chmod or repair an existing namespace.
+        fs::DirBuilder::new().mode(0o700).create(root)?;
+        Ok(hermes_memory::MemoryStore::open_broker(root)?)
+    }
+    #[cfg(not(all(target_os = "linux", feature = "experimental-broker")))]
+    {
+        Ok(hermes_memory::MemoryStore::open(root)?)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn generate_with_spec_for_owned_store(
+    root: &Path,
+    spec: &FixtureSpec,
+) -> Result<serde_json::Value> {
+    spec.validate()?;
+    generate_inner(
+        root,
+        spec.target_jsonl_bytes,
+        Some(spec),
+        hermes_memory::logical_migration::MAX_ARCHIVE_BYTES,
+        open_owned_fixture_store,
     )
 }
 
@@ -273,13 +305,14 @@ fn generate_inner(
     bytes: u64,
     spec: Option<&FixtureSpec>,
     archive_limit: u64,
+    open_store: impl FnOnce(&Path) -> Result<hermes_memory::MemoryStore>,
 ) -> Result<serde_json::Value> {
     let maximum_jsonl = bytes
         .checked_add(MAX_SEED_BATCH_BYTES)
         .ok_or("target byte overflow")?;
     fs::create_dir(root)?; // CreateNew: refuse any previously existing namespace.
     let source = root.join("source");
-    let store = hermes_memory::MemoryStore::open(&source)?;
+    let store = open_store(&source)?;
     store.ingest_snapshot(&snapshot())?;
     let mut count = 0u64;
     while fs::metadata(source.join("events.jsonl"))?.len() < bytes {
@@ -376,6 +409,37 @@ fn generate_inner(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn owned_store_seed_preserves_records_source_and_namespace_reservation() {
+        let temp = tempfile::tempdir_in(std::env::var_os("TMPDIR").unwrap()).unwrap();
+        let root = temp.path().join("owned-seed");
+        let spec = FixtureSpec {
+            shape: FixtureShape::RepresentativeV2,
+            target_jsonl_bytes: 8192,
+        };
+        let generated = generate_with_spec_for_owned_store(&root, &spec).unwrap();
+        assert_eq!(generated["seed_records"], 4);
+        assert_eq!(generated["records"], 5);
+        assert_eq!(generated["snapshot_states"], 1);
+        assert_eq!(generated["snapshot_counters"], 1);
+        assert_eq!(generated["source_before"], generated["source_after"]);
+        let lines = std::io::BufRead::lines(std::io::BufReader::new(
+            File::open(root.join("source/events.jsonl")).unwrap(),
+        ));
+        for (index, line) in lines.skip(1).enumerate() {
+            let actual: MemoryRecord = serde_json::from_str(&line.unwrap()).unwrap();
+            assert_eq!(actual, representative_record(index as u64).unwrap());
+        }
+        assert!(generate_with_spec_for_owned_store(&root, &spec).is_err());
+        let invalid_root = temp.path().join("invalid");
+        let invalid = FixtureSpec {
+            target_jsonl_bytes: 0,
+            ..spec
+        };
+        assert!(generate_with_spec_for_owned_store(&invalid_root, &invalid).is_err());
+        assert!(!invalid_root.exists());
+    }
+
+    #[test]
     fn two_warmup_manifest_has_distinct_bounded_exact_payloads() {
         let first = TwoWarmupManifest.record(0).unwrap();
         let second = TwoWarmupManifest.record(1).unwrap();
@@ -471,7 +535,12 @@ mod tests {
             shape: FixtureShape::RepresentativeV2,
             target_jsonl_bytes: 8192,
         };
-        assert!(generate_inner(&root, spec.target_jsonl_bytes, Some(&spec), 100).is_err());
+        assert!(
+            generate_inner(&root, spec.target_jsonl_bytes, Some(&spec), 100, |path| {
+                Ok(hermes_memory::MemoryStore::open(path)?)
+            })
+            .is_err()
+        );
         assert!(fs::metadata(root.join("archive.jsonl")).unwrap().len() <= 100);
         assert!(!root.join("generation.json").exists());
         assert!(generate_with_spec(&root, &spec).is_err());

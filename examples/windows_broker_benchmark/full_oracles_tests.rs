@@ -6,7 +6,7 @@ use std::io::{Seek, SeekFrom, Write};
 fn stopped_streaming_oracles_bind_same_count_fields_order_state_and_notes() {
     let temp = tempfile::tempdir_in(std::env::var_os("TMPDIR").unwrap()).unwrap();
     let root = temp.path();
-    let generation = data::generate_with_spec(
+    let generation = data::generate_with_spec_for_owned_store(
         &root.join("seed"),
         &data::FixtureSpec {
             shape: data::FixtureShape::RepresentativeV2,
@@ -16,7 +16,7 @@ fn stopped_streaming_oracles_bind_same_count_fields_order_state_and_notes() {
     .unwrap();
     let manifest =
         FullManifest::new(crate::full_manifest::WorkloadSpec::full20x256_v1(), 16).unwrap();
-    let store = hermes_memory::MemoryStore::open(root.join("store")).unwrap();
+    let store = data::open_owned_fixture_store(&root.join("store")).unwrap();
     store
         .import_logical_archive_once(
             BufReader::new(File::open(root.join("seed/archive.jsonl")).unwrap()),

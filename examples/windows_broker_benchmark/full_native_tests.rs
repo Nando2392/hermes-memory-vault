@@ -275,7 +275,7 @@ fn ordinary_case(root: &Path) -> crate::commands::Case {
 fn shared_full64_orchestration_runs_real_store_and_retains_before_each_ack() {
     let temp = tempfile::tempdir_in(std::env::var_os("TMPDIR").unwrap()).unwrap();
     let root = temp.path();
-    let generation = crate::data::generate_with_spec(
+    let generation = crate::data::generate_with_spec_for_owned_store(
         &root.join("seed"),
         &crate::data::FixtureSpec::representative_6_mib(),
     )
@@ -289,7 +289,8 @@ fn shared_full64_orchestration_runs_real_store_and_retains_before_each_ack() {
         generation["seed_records"].as_u64().unwrap(),
     )
     .unwrap();
-    let store = hermes_memory::MemoryStore::open(root.join("install/store")).unwrap();
+    std::fs::create_dir(root.join("install")).unwrap();
+    let store = crate::data::open_owned_fixture_store(&root.join("install/store")).unwrap();
     store
         .import_logical_archive_once(
             std::io::BufReader::new(std::fs::File::open(root.join("seed/archive.jsonl")).unwrap()),
@@ -433,7 +434,7 @@ fn shared_peer_unknown_real_commit_has_no_done_or_retry() {
         16,
     )
     .unwrap();
-    let store = hermes_memory::MemoryStore::open(root.join("store")).unwrap();
+    let store = crate::data::open_owned_fixture_store(&root.join("store")).unwrap();
     let adapter = Adapter {
         root,
         case: &case,
@@ -522,7 +523,7 @@ fn shared_controller_invalid_after_done_receipt_withholds_ack_and_next_release()
         16,
     )
     .unwrap();
-    let store = hermes_memory::MemoryStore::open(root.join("store")).unwrap();
+    let store = crate::data::open_owned_fixture_store(&root.join("store")).unwrap();
     let initial = std::fs::metadata(root.join("store/events.jsonl"))
         .unwrap()
         .len();
