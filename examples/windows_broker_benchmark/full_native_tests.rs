@@ -211,15 +211,17 @@ fn explicit_full_selector_is_available_and_mutually_exclusive() {
     }
 }
 
+use crate::full_workload_receipt::Adapter;
+#[cfg(any(windows, all(target_os = "linux", feature = "experimental-broker")))]
 use crate::{
     contract::CommandRequest,
-    full_workload_receipt::Adapter,
     measure::{CommandMeasurement, LogicalIo, MemoryCoverage, SamplePolicy, Timepoint},
 };
 use std::{
     path::Path,
     time::{Duration, Instant},
 };
+#[cfg(any(windows, all(target_os = "linux", feature = "experimental-broker")))]
 fn measured_fixture(request: &CommandRequest<'_>, policy: &SamplePolicy, output: &Value) -> Value {
     let io = LogicalIo {
         read_operations: 1,
@@ -273,329 +275,354 @@ fn ordinary_case(root: &Path) -> crate::commands::Case {
 }
 #[test]
 fn shared_full64_orchestration_runs_real_store_and_retains_before_each_ack() {
-    let temp = tempfile::tempdir_in(std::env::var_os("TMPDIR").unwrap()).unwrap();
-    let root = temp.path();
-    let generation = crate::data::generate_with_spec_for_owned_store(
-        &root.join("seed"),
-        &crate::data::FixtureSpec::representative_6_mib(),
-    )
-    .unwrap();
-    for dir in ["scratch", "controller"] {
-        std::fs::create_dir(root.join(dir)).unwrap();
+    #[cfg(not(any(windows, all(target_os = "linux", feature = "experimental-broker"))))]
+    {
+        crate::data::assert_owned_store_refusal(6 * 1024 * 1024, "seed", "install/store");
     }
-    let case = ordinary_case(root);
-    let manifest = crate::full_manifest::FullManifest::new(
-        crate::full_manifest::WorkloadSpec::full20x256_v1(),
-        generation["seed_records"].as_u64().unwrap(),
-    )
-    .unwrap();
-    std::fs::create_dir(root.join("install")).unwrap();
-    let store = crate::data::open_owned_fixture_store(&root.join("install/store")).unwrap();
-    store
-        .import_logical_archive_once(
-            std::io::BufReader::new(std::fs::File::open(root.join("seed/archive.jsonl")).unwrap()),
-            generation["logical_sha256"].as_str().unwrap(),
+    #[cfg(any(windows, all(target_os = "linux", feature = "experimental-broker")))]
+    {
+        let temp = tempfile::tempdir_in(std::env::var_os("TMPDIR").unwrap()).unwrap();
+        let root = temp.path();
+        let generation = crate::data::generate_with_spec_for_owned_store(
+            &root.join("seed"),
+            &crate::data::FixtureSpec::representative_6_mib(),
         )
         .unwrap();
-    store.prepare_export_index().unwrap();
-    let adapter = Adapter {
-        root,
-        case: &case,
-        enrollment: "Enrollment",
-        epoch: "ordinary",
-        timeout: Duration::from_secs(30),
-        cancelled: crate::contract::never_cancel,
-    };
-    let mut commands = vec![];
-    let mut retained = vec![];
-    let mut boundaries = vec![];
-    let mut calls = vec![];
-    std::thread::scope(|scope| {
-        let peer = scope.spawn(|| {
-            execute_peer_with_runner(
+        for dir in ["scratch", "controller"] {
+            std::fs::create_dir(root.join(dir)).unwrap();
+        }
+        let case = ordinary_case(root);
+        let manifest = crate::full_manifest::FullManifest::new(
+            crate::full_manifest::WorkloadSpec::full20x256_v1(),
+            generation["seed_records"].as_u64().unwrap(),
+        )
+        .unwrap();
+        std::fs::create_dir(root.join("install")).unwrap();
+        let store = crate::data::open_owned_fixture_store(&root.join("install/store")).unwrap();
+        store
+            .import_logical_archive_once(
+                std::io::BufReader::new(
+                    std::fs::File::open(root.join("seed/archive.jsonl")).unwrap(),
+                ),
+                generation["logical_sha256"].as_str().unwrap(),
+            )
+            .unwrap();
+        store.prepare_export_index().unwrap();
+        let adapter = Adapter {
+            root,
+            case: &case,
+            enrollment: "Enrollment",
+            epoch: "ordinary",
+            timeout: Duration::from_secs(30),
+            cancelled: crate::contract::never_cancel,
+        };
+        let mut commands = vec![];
+        let mut retained = vec![];
+        let mut boundaries = vec![];
+        let mut calls = vec![];
+        std::thread::scope(|scope| {
+            let peer = scope.spawn(|| {
+                execute_peer_with_runner(
+                    &adapter,
+                    &manifest,
+                    Instant::now() + Duration::from_secs(300),
+                    &mut commands,
+                    |request, policy| {
+                        calls.push(policy.operation_id);
+                        let output = match policy.operation_id {
+                            0..=61 => {
+                                let records: Vec<hermes_memory::MemoryRecord> =
+                                    serde_json::from_slice(request.input)?;
+                                let (i, d) = store.ingest_many(&records)?;
+                                json!({"inserted":i,"duplicates":d})
+                            }
+                            62 => {
+                                let snapshot = serde_json::from_slice(request.input)?;
+                                let (i, d) = store.ingest_snapshot(&snapshot)?;
+                                json!({"inserted":i,"duplicates":d})
+                            }
+                            _ => {
+                                let sessions = hermes_memory::client_export::render_markdown(
+                                    &root.join("scratch/export"),
+                                    crate::data::WORKSPACE,
+                                    |r| {
+                                        store.export_page(r, "ordinary").map_err(|e| {
+                                            hermes_memory::MemoryError::Io(std::io::Error::other(
+                                                e.to_string(),
+                                            ))
+                                        })
+                                    },
+                                )?;
+                                json!({"sessions":sessions})
+                            }
+                        };
+                        Ok(measured_fixture(request, policy, &output))
+                    },
+                )
+                .map_err(|e| e.to_string())
+            });
+            controller_intervals(
                 &adapter,
                 &manifest,
+                &root.join("install/store/events.jsonl"),
+                generation["jsonl_bytes"].as_u64().unwrap(),
                 Instant::now() + Duration::from_secs(300),
-                &mut commands,
-                |request, policy| {
-                    calls.push(policy.operation_id);
-                    let output = match policy.operation_id {
-                        0..=61 => {
-                            let records: Vec<hermes_memory::MemoryRecord> =
-                                serde_json::from_slice(request.input)?;
-                            let (i, d) = store.ingest_many(&records)?;
-                            json!({"inserted":i,"duplicates":d})
-                        }
-                        62 => {
-                            let snapshot = serde_json::from_slice(request.input)?;
-                            let (i, d) = store.ingest_snapshot(&snapshot)?;
-                            json!({"inserted":i,"duplicates":d})
-                        }
-                        _ => {
-                            let sessions = hermes_memory::client_export::render_markdown(
-                                &root.join("scratch/export"),
-                                crate::data::WORKSPACE,
-                                |r| {
-                                    store.export_page(r, "ordinary").map_err(|e| {
-                                        hermes_memory::MemoryError::Io(std::io::Error::other(
-                                            e.to_string(),
-                                        ))
-                                    })
-                                },
-                            )?;
-                            json!({"sessions":sessions})
-                        }
-                    };
-                    Ok(measured_fixture(request, policy, &output))
+                &mut retained,
+                &mut boundaries,
+                |id, after| {
+                    assert_eq!(
+                        root.join(format!("scratch/full20x256-v1-op-{id}-done.json"))
+                            .exists(),
+                        after
+                    );
+                    assert!(!root
+                        .join(format!(
+                            "controller/full20x256-v1-op-{id}-validated-ack.json"
+                        ))
+                        .exists());
+                    Ok(Value::Null)
                 },
             )
-            .map_err(|e| e.to_string())
+            .unwrap();
+            peer.join().unwrap().unwrap();
         });
-        controller_intervals(
-            &adapter,
-            &manifest,
+        assert_eq!(calls, (0..64).collect::<Vec<_>>());
+        assert_eq!(boundaries.len(), 64);
+        validate_final_commands(&commands, &retained).unwrap();
+        drop(store);
+        let projection = crate::full_oracles::verify_projection(
             &root.join("install/store/events.jsonl"),
-            generation["jsonl_bytes"].as_u64().unwrap(),
-            Instant::now() + Duration::from_secs(300),
-            &mut retained,
-            &mut boundaries,
-            |id, after| {
-                assert_eq!(
-                    root.join(format!("scratch/full20x256-v1-op-{id}-done.json"))
-                        .exists(),
-                    after
-                );
-                assert!(!root
-                    .join(format!(
-                        "controller/full20x256-v1-op-{id}-validated-ack.json"
-                    ))
-                    .exists());
-                Ok(Value::Null)
-            },
+            &root.join("seed/source/events.jsonl"),
+            &manifest,
         )
         .unwrap();
-        peer.join().unwrap().unwrap();
-    });
-    assert_eq!(calls, (0..64).collect::<Vec<_>>());
-    assert_eq!(boundaries.len(), 64);
-    validate_final_commands(&commands, &retained).unwrap();
-    drop(store);
-    let projection = crate::full_oracles::verify_projection(
-        &root.join("install/store/events.jsonl"),
-        &root.join("seed/source/events.jsonl"),
-        &manifest,
-    )
-    .unwrap();
-    let imported = crate::full_oracles::verify_stopped_sqlite(
-        &root.join("install/store/memory.db"),
-        &generation,
-        &manifest,
-    )
-    .unwrap();
-    let exported = crate::full_oracles::verify_export(
-        &root.join("scratch/export"),
-        &root.join("seed/source/events.jsonl"),
-        &manifest,
-    )
-    .unwrap();
-    let worker=FullReport::from_observations(&json!({"pass":true,"commands":commands,"case_epoch":"ordinary","seed_records":generation["seed_records"],"workload_complete":true}),false).unwrap();
-    let report=FullReport::from_observations(&json!({"pass":true,"client":worker,"generation":generation,"correctness_complete":true,"source_unchanged":true,"startup_import":imported,"final_payloads":projection,"export":exported,"metrics":{"controller_retained_commands":retained,"operations":boundaries,"native_handle_verified":false}}),true).unwrap();
-    assert!(
-        !report.native_handle_verified && !report.measurement_complete && !report.release_ready
-    );
-    let path = root.join("full-report.json");
-    write_report_bounded(&path, &report).unwrap();
-    let persisted = read_report(&path).unwrap();
-    validate_final_commands(
-        persisted["commands"].as_array().unwrap(),
-        persisted["controller_retained_commands"]
-            .as_array()
-            .unwrap(),
-    )
-    .unwrap();
-    let bytes = std::fs::metadata(root.join("install/store/events.jsonl"))
-        .unwrap()
-        .len();
-    assert!(bytes > 8 * 1024 * 1024);
-    println!("ordinary shared orchestration: operations={} additions={} seeds={} final_records={} projection_bytes={bytes} native_handle_verified=false",calls.len(),manifest.expected_additions(),generation["seed_records"],manifest.final_records());
+        let imported = crate::full_oracles::verify_stopped_sqlite(
+            &root.join("install/store/memory.db"),
+            &generation,
+            &manifest,
+        )
+        .unwrap();
+        let exported = crate::full_oracles::verify_export(
+            &root.join("scratch/export"),
+            &root.join("seed/source/events.jsonl"),
+            &manifest,
+        )
+        .unwrap();
+        let worker=FullReport::from_observations(&json!({"pass":true,"commands":commands,"case_epoch":"ordinary","seed_records":generation["seed_records"],"workload_complete":true}),false).unwrap();
+        let report=FullReport::from_observations(&json!({"pass":true,"client":worker,"generation":generation,"correctness_complete":true,"source_unchanged":true,"startup_import":imported,"final_payloads":projection,"export":exported,"metrics":{"controller_retained_commands":retained,"operations":boundaries,"native_handle_verified":false}}),true).unwrap();
+        assert!(
+            !report.native_handle_verified && !report.measurement_complete && !report.release_ready
+        );
+        let path = root.join("full-report.json");
+        write_report_bounded(&path, &report).unwrap();
+        let persisted = read_report(&path).unwrap();
+        validate_final_commands(
+            persisted["commands"].as_array().unwrap(),
+            persisted["controller_retained_commands"]
+                .as_array()
+                .unwrap(),
+        )
+        .unwrap();
+        let bytes = std::fs::metadata(root.join("install/store/events.jsonl"))
+            .unwrap()
+            .len();
+        assert!(bytes > 8 * 1024 * 1024);
+        println!("ordinary shared orchestration: operations={} additions={} seeds={} final_records={} projection_bytes={bytes} native_handle_verified=false",calls.len(),manifest.expected_additions(),generation["seed_records"],manifest.final_records());
+    }
 }
 
 #[test]
 fn shared_peer_unknown_real_commit_has_no_done_or_retry() {
-    use crate::full_workload_barrier::{FullBarrier, Phase, Role};
-    let temp = tempfile::tempdir_in(std::env::var_os("TMPDIR").unwrap()).unwrap();
-    let root = temp.path();
-    for dir in ["scratch", "controller"] {
-        std::fs::create_dir(root.join(dir)).unwrap();
+    #[cfg(not(any(windows, all(target_os = "linux", feature = "experimental-broker"))))]
+    {
+        // Refused acquisition: no admitted commit, not an unknown-after-commit observation.
+        crate::data::assert_owned_store_refusal(0, "seed", "store");
     }
-    let case = ordinary_case(root);
-    let manifest = crate::full_manifest::FullManifest::new(
-        crate::full_manifest::WorkloadSpec::full20x256_v1(),
-        16,
-    )
-    .unwrap();
-    let store = crate::data::open_owned_fixture_store(&root.join("store")).unwrap();
-    let adapter = Adapter {
-        root,
-        case: &case,
-        enrollment: "Enrollment",
-        epoch: "unknown",
-        timeout: Duration::from_secs(1),
-        cancelled: crate::contract::never_cancel,
-    };
-    let mut commands = vec![];
-    let mut calls = 0;
-    std::thread::scope(|scope| {
-        let peer = scope.spawn(|| {
-            execute_peer_with_runner(
-                &adapter,
-                &manifest,
-                Instant::now() + Duration::from_secs(10),
-                &mut commands,
-                |request, _| {
-                    calls += 1;
-                    let records: Vec<hermes_memory::MemoryRecord> =
-                        serde_json::from_slice(request.input)?;
-                    store.ingest_many(&records)?;
-                    Err("unknown real commit".into())
-                },
-            )
-            .map_err(|e| e.to_string())
-        });
-        let mut controller =
-            FullBarrier::new(root, "unknown", Role::Controller, &manifest).unwrap();
-        controller
-            .wait(
-                0,
-                Phase::Ready,
-                Instant::now() + Duration::from_secs(5),
-                || false,
-                || {},
-            )
-            .unwrap();
-        controller.publish(0, Phase::Release).unwrap();
-        assert!(peer
-            .join()
-            .unwrap()
-            .unwrap_err()
-            .contains("unknown real commit"));
-    });
-    assert_eq!(calls, 1);
-    assert!(commands.is_empty());
-    assert!(root.join("scratch/full20x256-v1-op-0.attempt").exists());
-    for path in [
-        "scratch/full20x256-v1-op-0-done.json",
-        "scratch/full20x256-v1-op-1-ready.json",
-        "controller/full20x256-v1-op-0-validated-ack.json",
-        "controller/full20x256-v1-op-1-release.json",
-    ] {
-        assert!(!root.join(path).exists());
-    }
-    assert!(execute_peer_with_runner(
-        &adapter,
-        &manifest,
-        Instant::now() + Duration::from_secs(5),
-        &mut commands,
-        |_, _| {
-            calls += 1;
-            Err("retry forbidden".into())
+    #[cfg(any(windows, all(target_os = "linux", feature = "experimental-broker")))]
+    {
+        use crate::full_workload_barrier::{FullBarrier, Phase, Role};
+        let temp = tempfile::tempdir_in(std::env::var_os("TMPDIR").unwrap()).unwrap();
+        let root = temp.path();
+        for dir in ["scratch", "controller"] {
+            std::fs::create_dir(root.join(dir)).unwrap();
         }
-    )
-    .is_err());
-    assert_eq!(calls, 1);
+        let case = ordinary_case(root);
+        let manifest = crate::full_manifest::FullManifest::new(
+            crate::full_manifest::WorkloadSpec::full20x256_v1(),
+            16,
+        )
+        .unwrap();
+        let store = crate::data::open_owned_fixture_store(&root.join("store")).unwrap();
+        let adapter = Adapter {
+            root,
+            case: &case,
+            enrollment: "Enrollment",
+            epoch: "unknown",
+            timeout: Duration::from_secs(1),
+            cancelled: crate::contract::never_cancel,
+        };
+        let mut commands = vec![];
+        let mut calls = 0;
+        std::thread::scope(|scope| {
+            let peer = scope.spawn(|| {
+                execute_peer_with_runner(
+                    &adapter,
+                    &manifest,
+                    Instant::now() + Duration::from_secs(10),
+                    &mut commands,
+                    |request, _| {
+                        calls += 1;
+                        let records: Vec<hermes_memory::MemoryRecord> =
+                            serde_json::from_slice(request.input)?;
+                        store.ingest_many(&records)?;
+                        Err("unknown real commit".into())
+                    },
+                )
+                .map_err(|e| e.to_string())
+            });
+            let mut controller =
+                FullBarrier::new(root, "unknown", Role::Controller, &manifest).unwrap();
+            controller
+                .wait(
+                    0,
+                    Phase::Ready,
+                    Instant::now() + Duration::from_secs(5),
+                    || false,
+                    || {},
+                )
+                .unwrap();
+            controller.publish(0, Phase::Release).unwrap();
+            assert!(peer
+                .join()
+                .unwrap()
+                .unwrap_err()
+                .contains("unknown real commit"));
+        });
+        assert_eq!(calls, 1);
+        assert!(commands.is_empty());
+        assert!(root.join("scratch/full20x256-v1-op-0.attempt").exists());
+        for path in [
+            "scratch/full20x256-v1-op-0-done.json",
+            "scratch/full20x256-v1-op-1-ready.json",
+            "controller/full20x256-v1-op-0-validated-ack.json",
+            "controller/full20x256-v1-op-1-release.json",
+        ] {
+            assert!(!root.join(path).exists());
+        }
+        assert!(execute_peer_with_runner(
+            &adapter,
+            &manifest,
+            Instant::now() + Duration::from_secs(5),
+            &mut commands,
+            |_, _| {
+                calls += 1;
+                Err("retry forbidden".into())
+            }
+        )
+        .is_err());
+        assert_eq!(calls, 1);
+    }
 }
 #[test]
 fn shared_controller_invalid_after_done_receipt_withholds_ack_and_next_release() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static STOP: AtomicBool = AtomicBool::new(false);
-    fn cancelled() -> bool {
-        STOP.load(Ordering::SeqCst)
+    #[cfg(not(any(windows, all(target_os = "linux", feature = "experimental-broker"))))]
+    {
+        // Refused acquisition: op-21 corruption remains supported-body coverage only.
+        crate::data::assert_owned_store_refusal(0, "seed", "store");
     }
-    STOP.store(false, Ordering::SeqCst);
-    let temp = tempfile::tempdir_in(std::env::var_os("TMPDIR").unwrap()).unwrap();
-    let root = temp.path();
-    for dir in ["scratch", "controller"] {
-        std::fs::create_dir(root.join(dir)).unwrap();
-    }
-    let case = ordinary_case(root);
-    let manifest = crate::full_manifest::FullManifest::new(
-        crate::full_manifest::WorkloadSpec::full20x256_v1(),
-        16,
-    )
-    .unwrap();
-    let store = crate::data::open_owned_fixture_store(&root.join("store")).unwrap();
-    let initial = std::fs::metadata(root.join("store/events.jsonl"))
-        .unwrap()
-        .len();
-    let adapter = Adapter {
-        root,
-        case: &case,
-        enrollment: "Enrollment",
-        epoch: "invalid",
-        timeout: Duration::from_secs(5),
-        cancelled,
-    };
-    let mut commands = vec![];
-    let mut retained = vec![];
-    let mut boundaries = vec![];
-    std::thread::scope(|scope| {
-        let peer = scope.spawn(|| {
-            execute_peer_with_runner(
+    #[cfg(any(windows, all(target_os = "linux", feature = "experimental-broker")))]
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static STOP: AtomicBool = AtomicBool::new(false);
+        fn cancelled() -> bool {
+            STOP.load(Ordering::SeqCst)
+        }
+        STOP.store(false, Ordering::SeqCst);
+        let temp = tempfile::tempdir_in(std::env::var_os("TMPDIR").unwrap()).unwrap();
+        let root = temp.path();
+        for dir in ["scratch", "controller"] {
+            std::fs::create_dir(root.join(dir)).unwrap();
+        }
+        let case = ordinary_case(root);
+        let manifest = crate::full_manifest::FullManifest::new(
+            crate::full_manifest::WorkloadSpec::full20x256_v1(),
+            16,
+        )
+        .unwrap();
+        let store = crate::data::open_owned_fixture_store(&root.join("store")).unwrap();
+        let initial = std::fs::metadata(root.join("store/events.jsonl"))
+            .unwrap()
+            .len();
+        let adapter = Adapter {
+            root,
+            case: &case,
+            enrollment: "Enrollment",
+            epoch: "invalid",
+            timeout: Duration::from_secs(5),
+            cancelled,
+        };
+        let mut commands = vec![];
+        let mut retained = vec![];
+        let mut boundaries = vec![];
+        std::thread::scope(|scope| {
+            let peer = scope.spawn(|| {
+                execute_peer_with_runner(
+                    &adapter,
+                    &manifest,
+                    Instant::now() + Duration::from_secs(60),
+                    &mut commands,
+                    |request, policy| {
+                        let records: Vec<hermes_memory::MemoryRecord> =
+                            serde_json::from_slice(request.input)?;
+                        let (i, d) = store.ingest_many(&records)?;
+                        Ok(measured_fixture(
+                            request,
+                            policy,
+                            &json!({"inserted":i,"duplicates":d}),
+                        ))
+                    },
+                )
+                .map_err(|e| e.to_string())
+            });
+            let result = controller_intervals(
                 &adapter,
                 &manifest,
+                &root.join("store/events.jsonl"),
+                initial,
                 Instant::now() + Duration::from_secs(60),
-                &mut commands,
-                |request, policy| {
-                    let records: Vec<hermes_memory::MemoryRecord> =
-                        serde_json::from_slice(request.input)?;
-                    let (i, d) = store.ingest_many(&records)?;
-                    Ok(measured_fixture(
-                        request,
-                        policy,
-                        &json!({"inserted":i,"duplicates":d}),
-                    ))
+                &mut retained,
+                &mut boundaries,
+                |id, after| {
+                    if after && id == 21 {
+                        let path = root
+                            .join("scratch")
+                            .join(crate::full_workload_receipt::label(id))
+                            .with_extension("result.json");
+                        let mut value: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+                        value["elapsed_us"] = json!(999);
+                        std::fs::write(path, serde_json::to_vec(&value)?)?;
+                    }
+                    Ok(Value::Null)
                 },
-            )
-            .map_err(|e| e.to_string())
+            );
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("full measured result differs"));
+            STOP.store(true, Ordering::SeqCst);
+            assert!(peer.join().unwrap().is_err());
         });
-        let result = controller_intervals(
-            &adapter,
-            &manifest,
-            &root.join("store/events.jsonl"),
-            initial,
-            Instant::now() + Duration::from_secs(60),
-            &mut retained,
-            &mut boundaries,
-            |id, after| {
-                if after && id == 21 {
-                    let path = root
-                        .join("scratch")
-                        .join(crate::full_workload_receipt::label(id))
-                        .with_extension("result.json");
-                    let mut value: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
-                    value["elapsed_us"] = json!(999);
-                    std::fs::write(path, serde_json::to_vec(&value)?)?;
-                }
-                Ok(Value::Null)
-            },
-        );
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("full measured result differs"));
-        STOP.store(true, Ordering::SeqCst);
-        assert!(peer.join().unwrap().is_err());
-    });
-    STOP.store(false, Ordering::SeqCst);
-    assert_eq!(retained.len(), 21);
-    assert_eq!(commands.len(), 22);
-    assert!(!root
-        .join("controller/full20x256-v1-op-21-validated-ack.json")
-        .exists());
-    assert!(!root
-        .join("controller/full20x256-v1-op-22-release.json")
-        .exists());
-    assert!(!root.join("scratch/full20x256-v1-op-22-ready.json").exists());
+        STOP.store(false, Ordering::SeqCst);
+        assert_eq!(retained.len(), 21);
+        assert_eq!(commands.len(), 22);
+        assert!(!root
+            .join("controller/full20x256-v1-op-21-validated-ack.json")
+            .exists());
+        assert!(!root
+            .join("controller/full20x256-v1-op-22-release.json")
+            .exists());
+        assert!(!root.join("scratch/full20x256-v1-op-22-ready.json").exists());
+    }
 }
 #[test]
 fn shared_peer_missing_release_never_invokes_runner() {

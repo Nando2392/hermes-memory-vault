@@ -12,8 +12,14 @@ jobs:
   linux-regression:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        configuration: [featureless, all-features]
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: dtolnay/rust-toolchain@stable
       - name: Provision job-owned test scratch
         shell: bash
@@ -71,7 +77,84 @@ jobs:
           cargo test --locked --features experimental-broker --test memory broker_second_instance_rejected_without_mutation -- --exact --nocapture
           cargo test --locked --features experimental-broker --lib broker_store_tests -- --nocapture
           cargo test --locked --features experimental-broker --test broker_export -- --nocapture
-      - name: Full portable and broker correctness suites
+      - name: Full correctness inventory and positive execution (${{ matrix.configuration }})
+        shell: bash
+        env:
+          CONFIGURATION: ${{ matrix.configuration }}
+          REVIEWED_SHA: ${{ github.sha }}
         run: |
-          cargo test --locked --all-targets --no-default-features
-          cargo test --locked --all-targets --all-features
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$REVIEWED_SHA"
+          printf 'Exact full-suite source: %s configuration: %s\n' "$REVIEWED_SHA" "$CONFIGURATION"
+          case "$CONFIGURATION" in
+            featureless) feature_args=(--no-default-features) ;;
+            all-features) feature_args=(--all-features) ;;
+            *) exit 1 ;;
+          esac
+          set +e
+          cargo test --locked --all-targets "${feature_args[@]}" -- --list 2>&1 | tee full-inventory.log
+          inventory_status=("${PIPESTATUS[@]}")
+          printf 'commit=%s\nconfiguration=%s\ninventory_cargo_exit=%s\ninventory_collection_exit=%s\n' "$REVIEWED_SHA" "$CONFIGURATION" "${inventory_status[0]}" "${inventory_status[1]}" | tee full-identity.txt
+          identity_status=("${PIPESTATUS[@]}")
+          set -e
+          if [ "${inventory_status[0]}" -ne 0 ]; then exit "${inventory_status[0]}"; fi
+          if [ "${inventory_status[1]}" -ne 0 ]; then exit "${inventory_status[1]}"; fi
+          if [ "${identity_status[0]}" -ne 0 ]; then exit "${identity_status[0]}"; fi
+          if [ "${identity_status[1]}" -ne 0 ]; then exit "${identity_status[1]}"; fi
+          set +e
+          cargo test --locked --all-targets "${feature_args[@]}" 2>&1 | tee full-execution.log
+          runtime_status=("${PIPESTATUS[@]}")
+          printf 'cargo_exit=%s\ncollection_exit=%s\n' "${runtime_status[0]}" "${runtime_status[1]}" | tee -a full-identity.txt
+          identity_status=("${PIPESTATUS[@]}")
+          set -e
+          if [ "${runtime_status[0]}" -ne 0 ]; then exit "${runtime_status[0]}"; fi
+          if [ "${runtime_status[1]}" -ne 0 ]; then exit "${runtime_status[1]}"; fi
+          if [ "${identity_status[0]}" -ne 0 ]; then exit "${identity_status[0]}"; fi
+          if [ "${identity_status[1]}" -ne 0 ]; then exit "${identity_status[1]}"; fi
+          python - <<'PY'
+          import pathlib
+          import re
+          def collect(path, runtime):
+              targets = {}
+              current = None
+              for line in pathlib.Path(path).read_text().splitlines():
+                  line = re.sub(r'\x1b\[[0-9;]*m', '', line)
+                  match = re.search(r'Running .* \(([^)]+)\)', line)
+                  if match:
+                      current = match[1]
+                      assert current not in targets, current
+                      targets[current] = set()
+                  match = re.fullmatch(r'test (.+) \.\.\. ok', line) if runtime else re.fullmatch(r'(.+): test', line)
+                  if match:
+                      assert current is not None
+                      assert match[1] not in targets[current], match[1]
+                      targets[current].add(match[1])
+                  if runtime and 'test result:' in line:
+                      assert '; 0 ignored;' in line, line
+              assert targets
+              return targets
+          inventory = collect('full-inventory.log', False)
+          executed = collect('full-execution.log', True)
+          if executed != inventory:
+              raise SystemExit('FAIL: actual per-target positive executions differ from compiled inventory')
+          names = set().union(*executed.values())
+          required = {
+              'data::tests::owned_store_seed_preserves_records_source_and_namespace_reservation',
+              'full_native::tests::shared_full64_orchestration_runs_real_store_and_retains_before_each_ack',
+              'full_native::tests::shared_controller_invalid_after_done_receipt_withholds_ack_and_next_release',
+              'full_native::tests::shared_peer_unknown_real_commit_has_no_done_or_retry',
+              'full_oracles::tests::stopped_streaming_oracles_bind_same_count_fields_order_state_and_notes',
+          }
+          assert required <= names, required - names
+          print('PASS: per-target inventory equals positive runtime execution; all five original names ran')
+          PY
+      - name: Retain exact configuration inventory and execution
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-correctness-${{ matrix.configuration }}-${{ github.sha }}
+          path: |
+            full-inventory.log
+            full-execution.log
+            full-identity.txt
+          if-no-files-found: error

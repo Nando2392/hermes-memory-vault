@@ -291,6 +291,11 @@ pub(crate) fn generate_with_spec_for_owned_store(
     spec: &FixtureSpec,
 ) -> Result<serde_json::Value> {
     spec.validate()?;
+    // Direct POSIX refusal must precede even the outer fixture reservation.
+    #[cfg(not(any(windows, all(target_os = "linux", feature = "experimental-broker"))))]
+    {
+        hermes_memory::MemoryStore::open(root.join("source"))?;
+    }
     generate_inner(
         root,
         spec.target_jsonl_bytes,
@@ -406,37 +411,243 @@ fn generate_inner(
     serde_json::to_writer_pretty(report_file, &report)?;
     Ok(report)
 }
+
+// These helpers are assertion-bearing refusal scenarios, not successful-store substitutes.
+#[cfg(all(
+    test,
+    not(any(windows, all(target_os = "linux", feature = "experimental-broker")))
+))]
+fn assert_typed_unsupported<T>(result: Result<T>) {
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("unsupported fixture unexpectedly acquired a store"),
+    };
+    match error.downcast_ref::<hermes_memory::MemoryError>() {
+        Some(hermes_memory::MemoryError::Io(io)) => {
+            assert_eq!(io.kind(), std::io::ErrorKind::Unsupported);
+            assert_eq!(io.to_string(), "direct POSIX memory storage is unsupported; use the separately provisioned experimental broker");
+        }
+        other => panic!("expected typed MemoryError::Io(Unsupported), got {other:?}"),
+    }
+}
+
+#[cfg(all(
+    test,
+    not(any(windows, all(target_os = "linux", feature = "experimental-broker")))
+))]
+fn refusal_snapshot(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, String> {
+    fn visit(
+        base: &Path,
+        path: &Path,
+        out: &mut std::collections::BTreeMap<std::path::PathBuf, String>,
+    ) {
+        let metadata = fs::symlink_metadata(path).unwrap();
+        let kind = metadata.file_type();
+        let mut value = if kind.is_symlink() {
+            format!("symlink:{:?}", fs::read_link(path).unwrap())
+        } else if kind.is_dir() {
+            "directory".to_string()
+        } else {
+            assert!(kind.is_file());
+            format!("file:{:?}", fs::read(path).unwrap())
+        };
+        value.push_str(&format!(":readonly={}", metadata.permissions().readonly()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            value.push_str(&format!(
+                ":mode={}:uid={}:gid={}:dev={}:ino={}:links={}",
+                metadata.mode(),
+                metadata.uid(),
+                metadata.gid(),
+                metadata.dev(),
+                metadata.ino(),
+                metadata.nlink()
+            ));
+        }
+        out.insert(path.strip_prefix(base).unwrap().to_path_buf(), value);
+        if kind.is_dir() {
+            for entry in fs::read_dir(path).unwrap() {
+                visit(base, &entry.unwrap().path(), out);
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    visit(root, root, &mut out);
+    out
+}
+
+#[cfg(all(
+    test,
+    not(any(windows, all(target_os = "linux", feature = "experimental-broker")))
+))]
+pub(crate) fn assert_owned_store_refusal(bytes: u64, seed: &str, store: &str) {
+    let temp = tempfile::tempdir_in(std::env::var_os("TMPDIR").unwrap()).unwrap();
+    let root = temp.path();
+    // Deliberate harness setup is part of the baseline, not an operation artifact.
+    for dir in ["scratch", "controller", "install"] {
+        fs::create_dir(root.join(dir)).unwrap();
+    }
+    fs::write(root.join("sentinel"), b"caller-owned baseline").unwrap();
+    let before = refusal_snapshot(root);
+    if bytes != 0 {
+        let spec = FixtureSpec {
+            shape: FixtureShape::RepresentativeV2,
+            target_jsonl_bytes: bytes,
+        };
+        for _ in 0..2 {
+            assert_typed_unsupported(generate_with_spec_for_owned_store(&root.join(seed), &spec));
+            assert_eq!(refusal_snapshot(root), before);
+        }
+    }
+    for _ in 0..2 {
+        assert_typed_unsupported(open_owned_fixture_store(&root.join(store)));
+        assert_eq!(refusal_snapshot(root), before);
+    }
+    for leaf in [seed, store, "export", "scratch/export", "full-report.json"] {
+        assert!(
+            !root.join(leaf).exists(),
+            "unexpected operation artifact: {leaf}"
+        );
+    }
+    for parent in [seed, store] {
+        for leaf in [
+            "source",
+            "archive.jsonl",
+            "generation.json",
+            "memory.db",
+            "memory.db-wal",
+            "memory.db-shm",
+            "events.jsonl",
+            "memory.lock",
+            "memory.init.lock",
+        ] {
+            assert!(!root.join(parent).join(leaf).exists());
+        }
+    }
+    for id in 0..64 {
+        for phase in ["ready", "release", "done", "validated-ack"] {
+            for dir in ["scratch", "controller"] {
+                assert!(!root
+                    .join(format!("{dir}/full20x256-v1-op-{id}-{phase}.json"))
+                    .exists());
+            }
+        }
+        for extension in [
+            "attempt",
+            "result.json",
+            "intent.json",
+            "stdin",
+            "stdout",
+            "stderr",
+        ] {
+            assert!(!root
+                .join("scratch")
+                .join(crate::full_workload_receipt::label(id))
+                .with_extension(extension)
+                .exists());
+        }
+    }
+    assert_eq!(refusal_snapshot(root), before);
+    println!("owned fixture contract: typed Unsupported; unchanged baseline; no admitted runner, retained receipt, ACK, commit, oracle or report execution");
+}
+
+#[cfg(all(
+    test,
+    not(any(windows, all(target_os = "linux", feature = "experimental-broker")))
+))]
+pub(crate) fn assert_owned_refusal_sentinels() {
+    let temp = tempfile::tempdir_in(std::env::var_os("TMPDIR").unwrap()).unwrap();
+    let root = temp.path();
+    let populated = root.join("populated");
+    fs::create_dir(&populated).unwrap();
+    let sentinel = root.join("sentinel");
+    fs::write(
+        &sentinel,
+        b"caller-owned database/sidecar/projection sentinel",
+    )
+    .unwrap();
+    for name in [
+        "memory.db",
+        "memory.db-wal",
+        "memory.db-shm",
+        "events.jsonl",
+    ] {
+        fs::hard_link(&sentinel, populated.join(name)).unwrap();
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&populated, root.join("alias")).unwrap();
+    let before = refusal_snapshot(root);
+    let spec = FixtureSpec {
+        shape: FixtureShape::RepresentativeV2,
+        target_jsonl_bytes: 8192,
+    };
+    let invalid = FixtureSpec {
+        target_jsonl_bytes: 0,
+        ..spec.clone()
+    };
+    let error = generate_with_spec_for_owned_store(&root.join("invalid"), &invalid).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "representative target must be 1..600 MiB in bytes"
+    );
+    assert_eq!(refusal_snapshot(root), before);
+    let mut paths = vec![root.join("absent"), root.join("missing/child"), populated];
+    #[cfg(unix)]
+    paths.push(root.join("alias"));
+    for path in paths {
+        for _ in 0..2 {
+            assert_typed_unsupported(generate_with_spec_for_owned_store(&path, &spec));
+            assert_eq!(refusal_snapshot(root), before);
+            assert_typed_unsupported(open_owned_fixture_store(&path));
+            assert_eq!(refusal_snapshot(root), before);
+        }
+    }
+    assert_eq!(
+        fs::read(sentinel).unwrap(),
+        b"caller-owned database/sidecar/projection sentinel"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
     fn owned_store_seed_preserves_records_source_and_namespace_reservation() {
-        let temp = tempfile::tempdir_in(std::env::var_os("TMPDIR").unwrap()).unwrap();
-        let root = temp.path().join("owned-seed");
-        let spec = FixtureSpec {
-            shape: FixtureShape::RepresentativeV2,
-            target_jsonl_bytes: 8192,
-        };
-        let generated = generate_with_spec_for_owned_store(&root, &spec).unwrap();
-        assert_eq!(generated["seed_records"], 4);
-        assert_eq!(generated["records"], 5);
-        assert_eq!(generated["snapshot_states"], 1);
-        assert_eq!(generated["snapshot_counters"], 1);
-        assert_eq!(generated["source_before"], generated["source_after"]);
-        let lines = std::io::BufRead::lines(std::io::BufReader::new(
-            File::open(root.join("source/events.jsonl")).unwrap(),
-        ));
-        for (index, line) in lines.skip(1).enumerate() {
-            let actual: MemoryRecord = serde_json::from_str(&line.unwrap()).unwrap();
-            assert_eq!(actual, representative_record(index as u64).unwrap());
+        #[cfg(not(any(windows, all(target_os = "linux", feature = "experimental-broker"))))]
+        {
+            crate::data::assert_owned_store_refusal(8192, "owned-seed", "store");
+            crate::data::assert_owned_refusal_sentinels();
         }
-        assert!(generate_with_spec_for_owned_store(&root, &spec).is_err());
-        let invalid_root = temp.path().join("invalid");
-        let invalid = FixtureSpec {
-            target_jsonl_bytes: 0,
-            ..spec
-        };
-        assert!(generate_with_spec_for_owned_store(&invalid_root, &invalid).is_err());
-        assert!(!invalid_root.exists());
+        #[cfg(any(windows, all(target_os = "linux", feature = "experimental-broker")))]
+        {
+            let temp = tempfile::tempdir_in(std::env::var_os("TMPDIR").unwrap()).unwrap();
+            let root = temp.path().join("owned-seed");
+            let spec = FixtureSpec {
+                shape: FixtureShape::RepresentativeV2,
+                target_jsonl_bytes: 8192,
+            };
+            let generated = generate_with_spec_for_owned_store(&root, &spec).unwrap();
+            assert_eq!(generated["seed_records"], 4);
+            assert_eq!(generated["records"], 5);
+            assert_eq!(generated["snapshot_states"], 1);
+            assert_eq!(generated["snapshot_counters"], 1);
+            assert_eq!(generated["source_before"], generated["source_after"]);
+            let lines = std::io::BufRead::lines(std::io::BufReader::new(
+                File::open(root.join("source/events.jsonl")).unwrap(),
+            ));
+            for (index, line) in lines.skip(1).enumerate() {
+                let actual: MemoryRecord = serde_json::from_str(&line.unwrap()).unwrap();
+                assert_eq!(actual, representative_record(index as u64).unwrap());
+            }
+            assert!(generate_with_spec_for_owned_store(&root, &spec).is_err());
+            let invalid_root = temp.path().join("invalid");
+            let invalid = FixtureSpec {
+                target_jsonl_bytes: 0,
+                ..spec
+            };
+            assert!(generate_with_spec_for_owned_store(&invalid_root, &invalid).is_err());
+            assert!(!invalid_root.exists());
+        }
     }
 
     #[test]
