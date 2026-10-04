@@ -1,0 +1,31 @@
+# Default-branch manual registration only; every job is unconditionally skipped.
+name: Reviewed DrainGuard native lifecycle (disposable only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      reviewed:
+        description: Fresh independent immutable source/workflow safety review completed
+        required: true
+        type: boolean
+        default: false
+      reviewed_commit:
+        description: Exact reviewed 40-character lowercase commit SHA
+        required: true
+        type: string
+      inventory_sha256:
+        description: Independently reviewed exact native_tests/source_inventory.json SHA256
+        required: true
+        type: string
+      workflow_sha256:
+        description: Independently reviewed exact published workflow SHA256
+        required: true
+        type: string
+
+permissions: {}
+jobs:
+  registration:
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'true'
