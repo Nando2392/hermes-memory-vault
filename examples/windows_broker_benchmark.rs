@@ -18,6 +18,8 @@ mod data;
 mod fixtures;
 #[path = "windows_broker_benchmark/policy.rs"]
 mod hosted_policy;
+#[path = "windows_broker_benchmark/two_warmup.rs"]
+mod two_warmup;
 mod policy {
     pub use crate::hosted_policy::hosted_gate;
     pub fn disposable_gates(
@@ -69,6 +71,9 @@ pub struct Options {
     /// One measured representative-v2 insert; incomplete pilot, not steady-state evidence.
     #[arg(long)]
     representative_small_pilot: bool,
+    /// Two measured deterministic warmups only; not the full steady-state workload.
+    #[arg(long, conflicts_with = "representative_small_pilot")]
+    representative_two_warmup: bool,
     /// Unsupported by this small-case controller; never silently ignored.
     #[arg(long)]
     large_mib: Option<u64>,

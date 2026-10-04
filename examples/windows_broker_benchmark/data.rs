@@ -139,6 +139,39 @@ pub fn record(index: u64) -> MemoryRecord {
         metadata: serde_json::json!({"fixture": true, "index": index}),
     }
 }
+/// Closed admission for this seam; later schedules may reuse deterministic ordinal records.
+#[derive(Clone, Copy, Debug)]
+pub struct TwoWarmupManifest;
+#[allow(dead_code)] // Internal sandbox only; no native/workflow admission.
+impl TwoWarmupManifest {
+    pub const OPERATIONS: u32 = 2;
+    pub fn record(self, id: u32) -> Result<MemoryRecord> {
+        if id >= Self::OPERATIONS {
+            return Err("only two warmup operations admitted".into());
+        }
+        let r = MemoryRecord {
+            id: format!("benchmark-workload-v1-{id:06}"),
+            session_id: "benchmark-client".into(),
+            workspace: WORKSPACE.into(),
+            kind: "user".into(),
+            content: format!("deterministic warmup {id:06} ").repeat(64),
+            timestamp: 1_710_000_000.0 + f64::from(id),
+            metadata: serde_json::json!({"workload":"two-warmup-v1", "operation_id":id}),
+        };
+        r.validate()?;
+        if serde_json::to_vec(&r)?.len() > MAX_SEED_LINE_BYTES - 1 {
+            return Err("warmup record byte bound".into());
+        }
+        Ok(r)
+    }
+    pub fn payload(self, id: u32) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(&[self.record(id)?])?)
+    }
+    pub fn cli_epoch(self, id: u32) -> Result<u64> {
+        self.record(id)?;
+        Ok(3 + u64::from(id))
+    }
+}
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 use sha2::{Digest, Sha256};
 use std::{
@@ -342,6 +375,23 @@ fn generate_inner(
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn two_warmup_manifest_has_distinct_bounded_exact_payloads() {
+        let first = TwoWarmupManifest.record(0).unwrap();
+        let second = TwoWarmupManifest.record(1).unwrap();
+        assert_ne!(first.id, second.id);
+        assert!(first.timestamp > record(MAX_SEED_RECORDS - 1).timestamp);
+        assert!(second.timestamp > first.timestamp);
+        assert_eq!(first.session_id, "benchmark-client");
+        let payload = TwoWarmupManifest.payload(0).unwrap();
+        let decoded: Vec<MemoryRecord> = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(decoded, [first]);
+        assert!(payload.len() <= MAX_SEED_LINE_BYTES + 2);
+        assert_eq!(TwoWarmupManifest.cli_epoch(0).unwrap(), 3);
+        assert_eq!(TwoWarmupManifest.cli_epoch(1).unwrap(), 4);
+        assert!(TwoWarmupManifest.record(2).is_err());
+        assert!(TwoWarmupManifest.record(20).is_err());
+    }
     #[cfg(windows)]
     #[test]
     fn fresh_fixture_exports_real_records_snapshots_and_preserves_source() {

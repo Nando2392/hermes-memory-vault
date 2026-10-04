@@ -78,6 +78,33 @@ struct PilotMessage {
     operation_id: u32,
     phase: PilotPhase,
 }
+/// Separate ordinary-file integration receipt; never a pilot Job/schema extension.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // Internal sandbox only; no native/workflow admission.
+pub struct WarmupReceipt {
+    pub schema: u8,
+    pub operation_id: u32,
+    pub cli_epoch: u64,
+    pub payload: Vec<u8>,
+    pub inserted: u64,
+    pub duplicates: u64,
+}
+#[allow(dead_code)] // Internal sandbox only; no native/workflow admission.
+impl WarmupReceipt {
+    pub fn validate(&self, id: u32) -> Result<()> {
+        let manifest = crate::data::TwoWarmupManifest;
+        ensure(
+            self.schema == 3
+                && self.operation_id == id
+                && self.cli_epoch == manifest.cli_epoch(id)?
+                && self.payload == manifest.payload(id)?
+                && self.inserted == 1
+                && self.duplicates == 0,
+            "two-warmup exact receipt/payload mismatch",
+        )
+    }
+}
 pub struct PilotBarrier {
     root: PathBuf,
     epoch: String,
@@ -173,6 +200,554 @@ impl PilotBarrier {
         }
     }
 }
+/// Internal schema-2 tracer bullet: exactly two warmups, no public admission.
+/// Each peer observes all four phases before advancing its operation ID. The
+/// barrier conveys sequencing only, not receipt validation or service authority.
+#[allow(dead_code)]
+pub struct OperationBarrier {
+    root: PathBuf,
+    epoch: String,
+    next: usize,
+}
+#[allow(dead_code)]
+impl OperationBarrier {
+    pub fn new(root: &Path, epoch: &str, operation_limit: u32) -> Result<Self> {
+        ensure(operation_limit == 2, "only two internal warmups admitted")?;
+        ensure(
+            !epoch.is_empty() && epoch.len() <= 256,
+            "operation epoch bound",
+        )?;
+        Ok(Self {
+            root: root.into(),
+            epoch: epoch.into(),
+            next: 0,
+        })
+    }
+    fn path(&self, id: u32, phase: PilotPhase) -> PathBuf {
+        let dir = match phase {
+            PilotPhase::Ready | PilotPhase::Done => "scratch",
+            _ => "controller",
+        };
+        self.root
+            .join(dir)
+            .join(format!("workload-op-{id}-{}.json", phase.name()))
+    }
+    fn validate_files(&self, id: u32, phase: PilotPhase) -> Result<()> {
+        ensure(
+            id < 2 && self.next == id as usize * 4 + phase.index(),
+            "operation phase out of order",
+        )?;
+        // Eight fixed publication paths; never enumerate an untrusted directory.
+        for future in self.next + 1..8 {
+            ensure(
+                !self
+                    .path((future / 4) as u32, PILOT_PHASES[future % 4])
+                    .try_exists()?,
+                "operation future phase already exists",
+            )?;
+        }
+        Ok(())
+    }
+    pub fn publish(&mut self, id: u32, phase: PilotPhase) -> Result<()> {
+        self.validate_files(id, phase)?;
+        let destination = self.path(id, phase);
+        ensure(
+            !destination.try_exists()?,
+            "operation publication already exists",
+        )?;
+        let staging = destination.with_extension("pending");
+        let bytes = serde_json::to_vec(&PilotMessage {
+            schema: 2,
+            epoch: self.epoch.clone(),
+            operation_id: id,
+            phase,
+        })?;
+        ensure(bytes.len() <= 1024, "operation message size bound")?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::hard_link(staging, destination)?;
+        self.next += 1;
+        Ok(())
+    }
+    pub fn wait(
+        &mut self,
+        id: u32,
+        phase: PilotPhase,
+        deadline: Instant,
+        cancelled: fn() -> bool,
+    ) -> Result<()> {
+        let now = Instant::now();
+        ensure(
+            deadline > now && deadline.duration_since(now) <= Duration::from_secs(60),
+            "operation deadline bound",
+        )?;
+        loop {
+            ensure(
+                !cancelled() && Instant::now() < deadline,
+                "operation barrier cancelled or timed out",
+            )?;
+            self.validate_files(id, phase)?;
+            match File::open(self.path(id, phase)) {
+                Ok(file) => {
+                    ensure(
+                        file.metadata()?.is_file() && file.metadata()?.len() <= 1024,
+                        "operation message size/type bound",
+                    )?;
+                    let mut bytes = Vec::new();
+                    file.take(1025).read_to_end(&mut bytes)?;
+                    ensure(bytes.len() <= 1024, "operation message grew")?;
+                    let message: PilotMessage = serde_json::from_slice(&bytes)?;
+                    ensure(
+                        message.schema == 2
+                            && message.epoch == self.epoch
+                            && message.operation_id == id
+                            && message.phase == phase,
+                        "stale or invalid operation message",
+                    )?;
+                    ensure(
+                        !cancelled() && Instant::now() < deadline,
+                        "operation barrier cancelled or timed out",
+                    )?;
+                    self.next += 1;
+                    return Ok(());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    thread::sleep(Duration::from_millis(2))
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod repeated_tests {
+    use super::*;
+
+    fn root() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        for dir in ["scratch", "controller"] {
+            std::fs::create_dir(root.path().join(dir)).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn cancellation_during_message_validation_refuses_to_advance() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CHECKS: AtomicUsize = AtomicUsize::new(0);
+        fn cancel_after_first_check() -> bool {
+            CHECKS.fetch_add(1, Ordering::SeqCst) != 0
+        }
+        let root = root();
+        let mut writer = OperationBarrier::new(root.path(), "epoch", 2).unwrap();
+        writer.publish(0, PilotPhase::Ready).unwrap();
+        let mut reader = OperationBarrier::new(root.path(), "epoch", 2).unwrap();
+        assert!(reader
+            .wait(
+                0,
+                PilotPhase::Ready,
+                Instant::now() + Duration::from_secs(1),
+                cancel_after_first_check
+            )
+            .is_err());
+        assert_eq!(reader.next, 0);
+    }
+
+    #[test]
+    fn invalid_wire_messages_never_advance_the_reader() {
+        let valid = json!({"schema":2,"epoch":"epoch","operation_id":0,"phase":"ready"});
+        let mut invalid = vec![b"{".to_vec(), vec![b' '; 1025]];
+        for (field, value) in [
+            ("schema", json!(1)),
+            ("epoch", json!("stale")),
+            ("operation_id", json!(1)),
+            ("phase", json!("done")),
+            ("unknown", json!(true)),
+        ] {
+            let mut message = valid.clone();
+            message[field] = value;
+            invalid.push(serde_json::to_vec(&message).unwrap());
+        }
+        for bytes in invalid {
+            let root = root();
+            let mut reader = OperationBarrier::new(root.path(), "epoch", 2).unwrap();
+            let path = reader.path(0, PilotPhase::Ready);
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(reader
+                .wait(
+                    0,
+                    PilotPhase::Ready,
+                    Instant::now() + Duration::from_millis(100),
+                    never_cancel
+                )
+                .is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(reader.next, 0);
+        }
+    }
+
+    #[test]
+    fn partial_pending_timeout_and_cancellation_cannot_authorize_an_operation() {
+        let root = root();
+        let mut barrier = OperationBarrier::new(root.path(), "epoch", 2).unwrap();
+        let staging = barrier.path(0, PilotPhase::Ready).with_extension("pending");
+        std::fs::write(&staging, b"{").unwrap();
+        let started = Instant::now();
+        assert!(barrier
+            .wait(
+                0,
+                PilotPhase::Ready,
+                started + Duration::from_millis(20),
+                never_cancel
+            )
+            .is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(barrier
+            .wait(
+                0,
+                PilotPhase::Ready,
+                Instant::now() + Duration::from_secs(1),
+                || true
+            )
+            .is_err());
+        assert!(barrier
+            .wait(0, PilotPhase::Ready, Instant::now(), never_cancel)
+            .is_err());
+        assert!(barrier.publish(0, PilotPhase::Ready).is_err());
+        assert_eq!(std::fs::read(&staging).unwrap(), b"{");
+        assert_eq!(barrier.next, 0);
+        assert!(!barrier.path(0, PilotPhase::Ready).exists());
+    }
+
+    #[test]
+    fn constructor_sequence_duplicate_and_stale_operation_bounds() {
+        let root = root();
+        for limit in [0, 1, 3, u32::MAX] {
+            assert!(OperationBarrier::new(root.path(), "epoch", limit).is_err());
+        }
+        for epoch in ["", &"x".repeat(257)] {
+            assert!(OperationBarrier::new(root.path(), epoch, 2).is_err());
+        }
+        let mut barrier = OperationBarrier::new(root.path(), "epoch", 2).unwrap();
+        for id in [1, 2, u32::MAX] {
+            assert!(barrier.publish(id, PilotPhase::Ready).is_err());
+        }
+        assert!(barrier.publish(0, PilotPhase::Done).is_err());
+        barrier.publish(0, PilotPhase::Ready).unwrap();
+        let path = barrier.path(0, PilotPhase::Ready);
+        let before = std::fs::read(&path).unwrap();
+        assert!(barrier.publish(0, PilotPhase::Ready).is_err());
+        assert_eq!(before, std::fs::read(&path).unwrap());
+        for phase in [
+            PilotPhase::Release,
+            PilotPhase::Done,
+            PilotPhase::Acknowledged,
+        ] {
+            barrier.publish(0, phase).unwrap();
+        }
+        assert!(barrier.publish(0, PilotPhase::Done).is_err());
+        assert!(barrier
+            .wait(
+                0,
+                PilotPhase::Acknowledged,
+                Instant::now() + Duration::from_secs(1),
+                never_cancel
+            )
+            .is_err());
+        barrier.publish(1, PilotPhase::Ready).unwrap();
+    }
+
+    #[test]
+    fn second_peer_is_paused_until_controller_acknowledges_first() {
+        paused_peer_case(Duration::ZERO);
+    }
+
+    #[test]
+    fn paused_peer_startup_delay_does_not_spend_ack_wait_budget() {
+        paused_peer_case(Duration::from_secs(6));
+    }
+
+    fn paused_peer_case(startup_delay: Duration) {
+        use std::cell::Cell;
+        use std::sync::mpsc::channel;
+
+        // This callback cancels only after one real missing-file poll. No sleep
+        // or peer startup latency is used as evidence that ACK was withheld.
+        thread_local! {
+            static ACK_POLLS: Cell<usize> = const { Cell::new(0) };
+        }
+        fn cancel_after_missing_ack_poll() -> bool {
+            ACK_POLLS.with(|polls| {
+                let previous = polls.get();
+                polls.set(previous + 1);
+                previous != 0
+            })
+        }
+        let root = root();
+        let (peer_tx, controller_rx) = channel();
+        let (controller_tx, peer_rx) = channel();
+        let phase_timeout = Duration::from_secs(5);
+        // Fixture readiness is separately bounded, including the injected 6s
+        // scheduling delay. The real barrier keeps its five-second wait budget.
+        let coordination_timeout = Duration::from_secs(10);
+        thread::scope(|scope| {
+            let path = root.path();
+            let peer = scope.spawn(move || {
+                thread::sleep(startup_delay);
+                let mut b = OperationBarrier::new(path, "epoch", 2).unwrap();
+                for id in 0..2 {
+                    b.publish(id, PilotPhase::Ready).unwrap();
+                    peer_tx.send((id, PilotPhase::Ready)).unwrap();
+                    assert_eq!(
+                        peer_rx.recv_timeout(coordination_timeout).unwrap(),
+                        (id, PilotPhase::Release)
+                    );
+                    b.wait(
+                        id,
+                        PilotPhase::Release,
+                        Instant::now() + phase_timeout,
+                        never_cancel,
+                    )
+                    .unwrap();
+                    std::fs::write(path.join(format!("peer-warmup-{id}")), [id as u8]).unwrap();
+                    b.publish(id, PilotPhase::Done).unwrap();
+                    if id == 0 {
+                        ACK_POLLS.with(|polls| polls.set(0));
+                        assert_eq!(
+                            b.wait(
+                                id,
+                                PilotPhase::Acknowledged,
+                                Instant::now() + phase_timeout,
+                                cancel_after_missing_ack_poll,
+                            )
+                            .unwrap_err()
+                            .to_string(),
+                            "operation barrier cancelled or timed out"
+                        );
+                        ACK_POLLS.with(|polls| assert_eq!(polls.get(), 2));
+                        assert_eq!(b.next, 3);
+                        assert!(!b.path(0, PilotPhase::Acknowledged).exists());
+                        assert!(!b.path(1, PilotPhase::Ready).exists());
+                        assert!(!path.join("peer-warmup-1").exists());
+                    }
+                    // Done readiness includes the explicit missing-ACK probe.
+                    peer_tx.send((id, PilotPhase::Done)).unwrap();
+                    assert_eq!(
+                        peer_rx.recv_timeout(coordination_timeout).unwrap(),
+                        (id, PilotPhase::Acknowledged)
+                    );
+                    b.wait(
+                        id,
+                        PilotPhase::Acknowledged,
+                        Instant::now() + phase_timeout,
+                        never_cancel,
+                    )
+                    .unwrap();
+                    peer_tx.send((id, PilotPhase::Acknowledged)).unwrap();
+                }
+            });
+            let mut c = OperationBarrier::new(path, "epoch", 2).unwrap();
+            for id in 0..2 {
+                assert_eq!(
+                    controller_rx.recv_timeout(coordination_timeout).unwrap(),
+                    (id, PilotPhase::Ready)
+                );
+                c.wait(
+                    id,
+                    PilotPhase::Ready,
+                    Instant::now() + phase_timeout,
+                    never_cancel,
+                )
+                .unwrap();
+                c.publish(id, PilotPhase::Release).unwrap();
+                controller_tx.send((id, PilotPhase::Release)).unwrap();
+                assert_eq!(
+                    controller_rx.recv_timeout(coordination_timeout).unwrap(),
+                    (id, PilotPhase::Done)
+                );
+                c.wait(
+                    id,
+                    PilotPhase::Done,
+                    Instant::now() + phase_timeout,
+                    never_cancel,
+                )
+                .unwrap();
+                if id == 0 {
+                    assert!(!c.path(0, PilotPhase::Acknowledged).exists());
+                    assert!(!c.path(1, PilotPhase::Ready).exists());
+                    assert!(!path.join("peer-warmup-1").exists());
+                }
+                c.publish(id, PilotPhase::Acknowledged).unwrap();
+                controller_tx.send((id, PilotPhase::Acknowledged)).unwrap();
+                assert_eq!(
+                    controller_rx.recv_timeout(coordination_timeout).unwrap(),
+                    (id, PilotPhase::Acknowledged)
+                );
+            }
+            peer.join().unwrap();
+        });
+        assert_eq!(
+            std::fs::read(root.path().join("peer-warmup-1")).unwrap(),
+            [1]
+        );
+    }
+
+    #[test]
+    fn existing_destination_and_pending_sentinels_are_never_overwritten() {
+        for pending in [false, true] {
+            let root = root();
+            let mut barrier = OperationBarrier::new(root.path(), "epoch", 2).unwrap();
+            let destination = barrier.path(0, PilotPhase::Ready);
+            let staging = destination.with_extension("pending");
+            std::fs::write(&destination, b"destination-sentinel").unwrap();
+            if pending {
+                std::fs::write(&staging, b"pending-sentinel").unwrap();
+            }
+            assert!(barrier.publish(0, PilotPhase::Ready).is_err());
+            assert_eq!(
+                std::fs::read(&destination).unwrap(),
+                b"destination-sentinel"
+            );
+            if pending {
+                assert_eq!(std::fs::read(&staging).unwrap(), b"pending-sentinel");
+            } else {
+                assert!(!staging.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn escaped_epoch_cannot_publish_an_oversized_message() {
+        let root = root();
+        let mut barrier = OperationBarrier::new(root.path(), &"\0".repeat(256), 2).unwrap();
+        assert!(barrier.publish(0, PilotPhase::Ready).is_err());
+        for dir in ["scratch", "controller"] {
+            assert_eq!(std::fs::read_dir(root.path().join(dir)).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn absolute_wait_deadline_is_capped_before_consuming_a_message() {
+        let root = root();
+        let mut writer = OperationBarrier::new(root.path(), "epoch", 2).unwrap();
+        writer.publish(0, PilotPhase::Ready).unwrap();
+        let mut reader = OperationBarrier::new(root.path(), "epoch", 2).unwrap();
+        assert!(reader
+            .wait(
+                0,
+                PilotPhase::Ready,
+                Instant::now() + Duration::from_secs(61),
+                never_cancel
+            )
+            .is_err());
+        reader
+            .wait(
+                0,
+                PilotPhase::Ready,
+                Instant::now() + Duration::from_secs(1),
+                never_cancel,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn early_future_publications_refuse_without_advancing_or_clobbering() {
+        for (id, phase) in [
+            (0, PilotPhase::Release),
+            (1, PilotPhase::Ready),
+            (1, PilotPhase::Acknowledged),
+        ] {
+            let root = root();
+            let mut barrier = OperationBarrier::new(root.path(), "epoch", 2).unwrap();
+            let sentinel = barrier.path(id, phase);
+            std::fs::write(&sentinel, b"early-sentinel").unwrap();
+            assert!(barrier.publish(0, PilotPhase::Ready).is_err());
+            assert!(barrier
+                .wait(
+                    0,
+                    PilotPhase::Ready,
+                    Instant::now() + Duration::from_millis(20),
+                    never_cancel
+                )
+                .is_err());
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"early-sentinel");
+            assert!(!barrier.path(0, PilotPhase::Ready).exists());
+            std::fs::remove_file(sentinel).unwrap();
+            barrier.publish(0, PilotPhase::Ready).unwrap();
+        }
+    }
+
+    #[test]
+    fn two_warmups_cannot_start_second_before_first_acknowledgement() {
+        let root = root();
+        let mut b = OperationBarrier::new(root.path(), "owned-epoch", 2).unwrap();
+        let mut c = OperationBarrier::new(root.path(), "owned-epoch", 2).unwrap();
+        // This tests phase ordering, not fsync/setup throughput. Each wait consumes
+        // an already-published message; keep its two-second bound local to that wait.
+        for id in 0..2 {
+            b.publish(id, PilotPhase::Ready).unwrap();
+            c.wait(
+                id,
+                PilotPhase::Ready,
+                Instant::now() + Duration::from_secs(2),
+                never_cancel,
+            )
+            .unwrap();
+            c.publish(id, PilotPhase::Release).unwrap();
+            b.wait(
+                id,
+                PilotPhase::Release,
+                Instant::now() + Duration::from_secs(2),
+                never_cancel,
+            )
+            .unwrap();
+            // Ordinary-file stand-in for a warmup, not a broker correctness claim.
+            std::fs::write(
+                root.path().join(format!("warmup-{id}")),
+                format!("insert-{id}"),
+            )
+            .unwrap();
+            b.publish(id, PilotPhase::Done).unwrap();
+            c.wait(
+                id,
+                PilotPhase::Done,
+                Instant::now() + Duration::from_secs(2),
+                never_cancel,
+            )
+            .unwrap();
+            if id == 0 {
+                assert!(b.publish(1, PilotPhase::Ready).is_err());
+                assert!(c.publish(1, PilotPhase::Release).is_err());
+                assert!(!root.path().join("warmup-1").exists());
+            }
+            c.publish(id, PilotPhase::Acknowledged).unwrap();
+            b.wait(
+                id,
+                PilotPhase::Acknowledged,
+                Instant::now() + Duration::from_secs(2),
+                never_cancel,
+            )
+            .unwrap();
+        }
+        for id in 0..2 {
+            assert_eq!(
+                std::fs::read_to_string(root.path().join(format!("warmup-{id}"))).unwrap(),
+                format!("insert-{id}")
+            );
+        }
+        assert!(b.publish(2, PilotPhase::Ready).is_err());
+        for dir in ["scratch", "controller"] {
+            assert_eq!(std::fs::read_dir(root.path().join(dir)).unwrap().count(), 8);
+        }
+    }
+}
+
 #[cfg(test)]
 mod pilot_tests {
     use super::*;
@@ -374,6 +949,12 @@ impl Capture {
             "bounded CLI capture requires Windows",
         ))
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    // Observe only post-exit pipe draining, excluding fixture startup and evidence fsync.
+    static CHILD_DRAIN_ELAPSED: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
 }
 
 /// Both pipes are serviced fairly on one thread, one bounded chunk per turn.
@@ -582,6 +1163,8 @@ fn command_inner(
                     || wait_error.is_some()
                     || shutdown.is_some_and(|t| t.elapsed() >= Duration::from_secs(2));
                 if drained && reaped {
+                    #[cfg(test)]
+                    CHILD_DRAIN_ELAPSED.with(|elapsed| elapsed.set(Some(drain.elapsed())));
                     break;
                 }
             }
@@ -1024,11 +1607,17 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn capture_does_not_wait_for_or_kill_descendants() {
-        let started = Instant::now();
+        CHILD_DRAIN_ELAPSED.with(|elapsed| elapsed.set(None));
         let (dir, result) = fixture("descendant", Duration::from_secs(5));
-        let elapsed = started.elapsed();
-        // Wait for the finite fixture even if assertions below fail.
-        thread::sleep(Duration::from_millis(2200));
+        let elapsed = CHILD_DRAIN_ELAPSED.with(|elapsed| elapsed.get().unwrap());
+        // Observe finite descendant completion rather than guessing its startup
+        // latency with a fixed sleep. This is outside the drain timing assertion.
+        let completion_deadline = Instant::now() + Duration::from_secs(5);
+        while !dir.path().join("descendant-completed").exists()
+            && Instant::now() < completion_deadline
+        {
+            thread::sleep(Duration::from_millis(2));
+        }
         assert!(dir.path().join("descendant-completed").exists());
         assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
         assert_eq!(result["exit_code"], 0);
@@ -1053,7 +1642,13 @@ mod tests {
                 &vec![b'x'; 8 * 1024 * 1024],
                 dir.path(),
                 "unread",
-                Duration::from_millis(100),
+                // Cancellation is immediate; do not simultaneously trigger the
+                // 100ms timeout while Windows is still starting the child.
+                if cancel {
+                    Duration::from_secs(5)
+                } else {
+                    Duration::from_millis(100)
+                },
                 if cancel { || true } else { never_cancel },
             )
             .unwrap();

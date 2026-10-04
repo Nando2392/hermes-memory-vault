@@ -13,7 +13,7 @@ on:
         type: choice
         required: true
         default: small
-        options: [small, representative-small-pilot]
+        options: [small, representative-small-pilot, representative-two-warmup]
       reviewed:
         description: 'Independent source AND workflow review completed; disposable 6 MiB only'
         type: boolean
@@ -55,7 +55,7 @@ jobs:
           def digest(path):
               return hashlib.sha256(path.read_bytes()).hexdigest()
           try:
-              if os.environ.get('BENCHMARK_CASE') not in ('small', 'representative-small-pilot'):
+              if os.environ.get('BENCHMARK_CASE') not in ('small', 'representative-small-pilot', 'representative-two-warmup'):
                   raise RuntimeError('Unsupported benchmark case; only disposable 6 MiB allowed')
               expected = {
                   'GITHUB_ACTIONS': 'true', 'RUNNER_ENVIRONMENT': 'github-hosted',
@@ -87,10 +87,10 @@ jobs:
               provenance['source_files'] = inventory
               source_digest = hashlib.sha256(json.dumps(inventory, separators=(',', ':')).encode()).hexdigest()
               provenance['source_sha256'] = source_digest
-              # Frozen 44-file pilot snapshot; NOT inherited approval.
+              # Frozen native two-warmup build-input inventory; NOT inherited approval.
               # This exact combined source/workflow requires independent review.
-              if len(inventory) != 44 or source_digest != '5069d5f8ad384e10f2157d3d6512d30a5b03d751ad19e5ea04c47e750f1832db':
-                  raise RuntimeError('Build inputs differ from frozen small/pilot snapshot')
+              if source_digest != 'e46c031347750e17942fc7d747f22927a22e8aadbd714ac8408c2f1998884efa':
+                  raise RuntimeError('Build inputs differ from frozen native two-warmup snapshot')
               provenance['workflow_sha256'] = digest(root / '.github/workflows/windows-broker-benchmark.yml')
               provenance['gate_pass'] = True
           except Exception as error:
@@ -141,9 +141,24 @@ jobs:
           def require(condition, message):
               if not condition:
                   raise RuntimeError(message)
+          def verify_source(root, provenance):
+              paths = sorted([p.relative_to(root).as_posix()
+                              for folder in ('src', 'examples')
+                              for p in (root / folder).rglob('*') if p.is_file()]
+                             + ['Cargo.toml', 'Cargo.lock'])
+              require(not any((root / p).is_symlink() for p in paths), 'Source symlink refused')
+              for name in ('.cargo', 'build.rs', 'rust-toolchain', 'rust-toolchain.toml'):
+                  require(not (root / name).exists(), 'Unreviewed build override')
+              inventory = [{'path': p, 'sha256': hashlib.sha256((root / p).read_bytes()).hexdigest()} for p in paths]
+              digest = hashlib.sha256(json.dumps(inventory, separators=(',', ':')).encode()).hexdigest()
+              require(exact_equal(inventory, provenance['source_files']) and digest == provenance['source_sha256'], 'Build source changed since pinned preflight')
+              return digest
           def selected_case(value):
-              require(value in ('small', 'representative-small-pilot'), 'Unsupported 6 MiB case')
-              return value == 'representative-small-pilot'
+              require(value in ('small', 'representative-small-pilot', 'representative-two-warmup'), 'Unsupported 6 MiB case')
+              return value
+          def exact_equal(left, right):
+              # Python structural equality aliases bool/int/float; preserve JSON representation.
+              return left == right and json.dumps(left, sort_keys=True, separators=(',', ':')) == json.dumps(right, sort_keys=True, separators=(',', ':'))
           def uint(value):
               return type(value) is int and 0 <= value <= 18446744073709551615
           def sha(value):
@@ -152,15 +167,17 @@ jobs:
               keys = {'read_operations', 'write_operations', 'other_operations', 'read_bytes', 'write_bytes', 'other_bytes'}
               require(isinstance(value, dict) and set(value) == keys and all(uint(v) for v in value.values()), 'Logical IO schema')
           def process_sample(value):
+              fields = {'logical_io', 'private_bytes', 'working_set_bytes', 'lifetime_peak_private_bytes', 'lifetime_peak_working_set_bytes'}
+              require(isinstance(value, dict) and set(value) == fields, 'Process sample fields')
               logical_io(value['logical_io'])
               for key in ('private_bytes', 'working_set_bytes', 'lifetime_peak_private_bytes', 'lifetime_peak_working_set_bytes'):
                   require(uint(value[key]), 'Process memory schema')
-          def validate_measurement(m, payload_bytes):
+          def validate_measurement(m, payload_bytes, operation_id=0):
               # Mirrors the current Rust schema, including explicitly missing coverage.
               fields = 'schema identity operation_id payload_bytes command_success child_exit_us live_attempts live_samples exit_races live_errors first_live_error first_sample_us last_sample_us max_sample_gap_us memory timepoints omitted_timepoints final_lifetime_logical_io final_io_error'.split()
               require(isinstance(m, dict) and set(m) == set(fields), 'CLI measurement fields')
-              require(type(m['schema']) is int and m['schema'] == 2 and type(m['operation_id']) is int and m['operation_id'] == 0, 'CLI schema/operation')
-              require(m['identity'] == {'role': 'cli-child', 'epoch': 3} and type(m['identity']['epoch']) is int, 'CLI retained epoch')
+              require(type(m['schema']) is int and m['schema'] == 2 and type(m['operation_id']) is int and m['operation_id'] == operation_id, 'CLI schema/operation')
+              require(exact_equal(m['identity'], {'role': 'cli-child', 'epoch': 3 + operation_id}) and type(m['identity']['epoch']) is int, 'CLI retained epoch')
               require(uint(m['payload_bytes']) and m['payload_bytes'] == payload_bytes and m['command_success'] is True, 'CLI payload/success')
               for key in ('child_exit_us', 'live_attempts', 'live_samples', 'exit_races', 'live_errors', 'max_sample_gap_us', 'omitted_timepoints'):
                   require(uint(m[key]), 'CLI numeric metadata')
@@ -168,6 +185,8 @@ jobs:
               points = m['timepoints']
               require(isinstance(points, list) and len(points) <= 12 and len(points) + m['omitted_timepoints'] == m['live_samples'], 'CLI retained point accounting')
               has_samples = m['live_samples'] > 0
+              require(has_samples == bool(points), 'CLI live samples require retained prefix')
+              require((points[0]['since_spawn_start_us'] if points else None) == m['first_sample_us'], 'CLI first retained timestamp')
               for key in ('memory', 'first_sample_us', 'last_sample_us'):
                   require((m[key] is not None) == has_samples, 'CLI missing coverage must remain null')
               require((m['first_live_error'] is not None) == (m['live_errors'] > 0), 'CLI live error accounting')
@@ -182,18 +201,21 @@ jobs:
                   memory_keys = ('sampled_private_bytes', 'sampled_working_set_bytes', 'observed_lifetime_peak_private_bytes', 'observed_lifetime_peak_working_set_bytes')
                   require(isinstance(m['memory'], dict) and set(m['memory']) == set(memory_keys) and all(uint(v) for v in m['memory'].values()), 'CLI memory schema')
               previous = None
+              retained_gap = 0
               for point in points:
                   require(isinstance(point, dict) and set(point) == {'since_spawn_start_us', 'logical_io', 'private_bytes', 'working_set_bytes', 'lifetime_peak_private_bytes', 'lifetime_peak_working_set_bytes'}, 'CLI timepoint fields')
-                  process_sample(point)
+                  process_sample({k: v for k, v in point.items() if k != 'since_spawn_start_us'})
                   t = point['since_spawn_start_us']
                   require(uint(t) and m['first_sample_us'] <= t <= m['last_sample_us'], 'CLI timepoint coverage')
                   if previous is not None:
+                      retained_gap = max(retained_gap, t - previous['since_spawn_start_us'])
                       require(t >= previous['since_spawn_start_us'] and all(point['logical_io'][k] >= previous['logical_io'][k] for k in point['logical_io']), 'CLI counter/time regression')
                   if final_io is not None:
                       require(all(final_io[k] >= point['logical_io'][k] for k in final_io), 'CLI final counter regression')
                   for maximum, field in zip(memory_keys, ('private_bytes', 'working_set_bytes', 'lifetime_peak_private_bytes', 'lifetime_peak_working_set_bytes')):
                       require(m['memory'][maximum] >= point[field], 'CLI sampled maximum regression')
                   previous = point
+              require(m['max_sample_gap_us'] >= retained_gap and (m['omitted_timepoints'] != 0 or m['max_sample_gap_us'] == retained_gap), 'CLI retained cadence mismatch')
           def command_group(group, expected):
               require(isinstance(group, list) and len(group) == len(expected), 'Missing/extra command evidence')
               for command, label in zip(group, expected):
@@ -209,45 +231,159 @@ jobs:
                   else:
                       require(command['exit_code'] == 0 and command.get('success') is True, 'Command failed')
               return dict(zip(expected, group))
+          def warmup_record(id):
+              return {'id': f'benchmark-workload-v1-{id:06}', 'session_id': 'benchmark-client', 'workspace': 'disposable-benchmark', 'kind': 'user', 'content': f'deterministic warmup {id:06} ' * 64, 'timestamp': 1710000000.0 + id, 'metadata': {'operation_id': id, 'workload': 'two-warmup-v1'}}
+          def validate_two_warmup(report, commands):
+              client, metrics = report['client'], report['metrics']
+              epoch = report['fixture']['client_service']
+              require(isinstance(epoch, str) and 1 <= len(epoch.encode()) <= 256, 'Two-warmup case epoch')
+              require(client.get('case') == report['case'], 'Client case mismatch')
+              for obj in (report['generation'], report['startup_import']['persisted_startup_receipt'], report['startup_import']['final_read_only_export']):
+                  require(all(uint(obj[k]) for k in ('records', 'snapshot_states', 'snapshot_counters')), 'Two-warmup strict oracle counts')
+              require(16 <= report['generation']['seed_records'] <= 400000 and uint(client['export']['records']) and uint(client['export']['sessions']), 'Two-warmup count bounds')
+              for value in (report['client_stop']['process']['exit_code'], report['client_stop']['scm_exit_code'], report['broker_exit']['exit_code'], report['broker_after']['pinned_process']['exit_code']):
+                  require(type(value) is int and value == 0, 'Two-warmup strict clean exit')
+              receipt = client['two_warmup']
+              require(set(receipt) == {'schema', 'case_epoch', 'expected_additions', 'sampling_complete', 'full_workload_complete', 'performance_policy_status'} and type(receipt['schema']) is int and receipt['schema'] == 4 and receipt['case_epoch'] == epoch and type(receipt['expected_additions']) is int and receipt['expected_additions'] == 2, 'Two-warmup client receipt')
+              for obj in (metrics, receipt):
+                  require(obj.get('sampling_complete') is False and obj.get('full_workload_complete') is False and obj.get('performance_policy_status') == 'unapproved', 'Two-warmup incomplete/unapproved')
+              require(all(obj.get('performance_complete', False) is False for obj in (report, client, metrics, receipt)), 'Unapproved performance claim')
+              require(metrics.get('measured') is True and metrics.get('native_handle_verified') is True and metrics.get('warmups_complete') is True and type(metrics.get('expected_warmups')) is int and metrics['expected_warmups'] == 2, 'Two-warmup native coverage')
+              require(exact_equal(report['generation']['fixture_spec'], {'shape': 'representative-v2', 'target_jsonl_bytes': 6291456}), 'Two-warmup fixture spec; no large case')
+              native, operations = metrics['native_intervals'], metrics['operations']
+              require(isinstance(native, list) and isinstance(operations, list) and len(native) == len(operations) == 2, 'Exactly two ordered operations')
+              measured = [c for c in client['commands'] if 'measurement' in c]
+              require(exact_equal(measured, [commands['warmup-op-0'], commands['warmup-op-1']]), 'Exactly two ordered measured CLI commands')
+              retained = metrics['controller_retained_receipts']
+              require(isinstance(retained, list) and len(retained) == 2 and exact_equal(measured, retained), 'Final commands differ from exact controller-retained receipts')
+              for command in report['commands'] + client['commands']:
+                  if 'elapsed_us' in command:
+                      require(uint(command['elapsed_us']), 'Command duration schema')
+              previous_projection = None
+              previous_after = None
+              for id, (interval, op, command) in enumerate(zip(native, operations, measured)):
+                  require(set(interval) == {'operation_id', 'before_release', 'after_done', 'receipt_validated', 'projection'}, 'Native interval fields')
+                  require(set(op) == {'operation_id', 'cli_epoch', 'payload_bytes', 'before_release', 'after_done', 'receipt_validated', 'exact_append_verified', 'hashing'}, 'Operation receipt fields')
+                  for obj in (interval, op):
+                      require(type(obj['operation_id']) is int and obj['operation_id'] == id and obj['receipt_validated'] is True, 'Operation order/receipt; no future ACK')
+                  require(op['exact_append_verified'] is True and op['hashing'] == 'outside bracket' and type(op['cli_epoch']) is int and op['cli_epoch'] == 3 + id, 'Operation append/CLI epoch')
+                  record = warmup_record(id)
+                  payload = len(json.dumps([record], separators=(',', ':')).encode())
+                  require(uint(op['payload_bytes']) and op['payload_bytes'] == payload, 'Operation exact stdin bytes')
+                  ack = json.loads(command['stdout'])
+                  require(isinstance(ack, dict) and ack == {'inserted': 1, 'duplicates': 0} and all(uint(v) for v in ack.values()), 'Warmup exact acknowledgement')
+                  validate_measurement(command['measurement'], payload, id)
+                  for stream in ('stdout', 'stderr'):
+                      require(command[stream + '_file'].replace('\\', '/').rsplit('/', 1)[-1] == f'warmup-op-{id}.{stream}', 'Warmup capture correlation')
+                  a, b = interval['before_release'], interval['after_done']
+                  require(exact_equal(op['before_release'], a) and exact_equal(op['after_done'], b), 'Native/operation receipt correlation')
+                  for boundary, after in ((a, False), (b, True)):
+                      fields = {'case_epoch', 'operation_id', 'broker_epoch', 'supervisor_epoch', 'cli_epoch', 'broker', 'supervisor'}
+                      if after:
+                          fields |= {'broker_logical_io_delta', 'supervisor_logical_io_delta', 'handshake_span_us'}
+                      require(set(boundary) == fields and boundary['case_epoch'] == epoch, 'Native boundary fields/case')
+                      for key, expected in (('operation_id', id), ('broker_epoch', 1), ('supervisor_epoch', 2), ('cli_epoch', 3 + id)):
+                          require(type(boundary[key]) is int and boundary[key] == expected, 'Native retained epochs/order')
+                  require(uint(b['handshake_span_us']), 'Native interval duration')
+                  for role in ('broker', 'supervisor'):
+                      process_sample(a[role])
+                      process_sample(b[role])
+                      delta = b[role + '_logical_io_delta']
+                      logical_io(delta)
+                      require(all(b[role]['logical_io'][k] >= a[role]['logical_io'][k] and delta[k] == b[role]['logical_io'][k] - a[role]['logical_io'][k] for k in delta), 'Checked native IO delta')
+                      if previous_after is not None:
+                          require(all(a[role]['logical_io'][k] >= previous_after[role]['logical_io'][k] for k in delta), 'Same retained handle cross-operation counters')
+                  projection = interval['projection']
+                  require(set(projection) == {'same_identity', 'before_bytes', 'after_bytes', 'volume_serial_number', 'file_id'} and projection['same_identity'] is True, 'Native projection identity')
+                  require(uint(projection['before_bytes']) and uint(projection['after_bytes']) and 6291456 <= projection['before_bytes'] < projection['after_bytes'] <= 8388608 and projection['after_bytes'] - projection['before_bytes'] == payload - 1, 'Exact append range/record newline')
+                  require(uint(projection['volume_serial_number']) and isinstance(projection['file_id'], list) and len(projection['file_id']) == 16 and all(uint(v) and v <= 255 for v in projection['file_id']), 'Native file identity schema')
+                  if previous_projection is not None:
+                      require(exact_equal(projection['before_bytes'], previous_projection['after_bytes']) and all(exact_equal(projection[k], previous_projection[k]) for k in ('volume_serial_number', 'file_id')), 'Cross-operation projection identity/range')
+                  previous_projection, previous_after = projection, b
+              stage = metrics['warmup_commands']
+              require(isinstance(stage, dict) and set(stage) == set('schema stage sample_count expected_count commands_successful benchmark_correctness_verified logical_io_complete sampled_memory_available child_exit_us logical_io samples performance_policy_status io_scope memory_scope latency_scope timepoint_retention supervision_scope'.split()), 'Closed actual schema2 stage')
+              require(type(stage['schema']) is int and stage['schema'] == 2 and stage['stage'] == 'warmup' and type(stage['sample_count']) is int and stage['sample_count'] == 2 and type(stage['expected_count']) is int and stage['expected_count'] == 2 and stage['commands_successful'] is True and stage['benchmark_correctness_verified'] is False and stage['performance_policy_status'] == 'unapproved' and exact_equal(stage['samples'], [c['measurement'] for c in measured]), 'Actual schema2 warmup stage totals/receipts')
+              require(stage['logical_io_complete'] is all(c['measurement']['final_lifetime_logical_io'] is not None and c['measurement']['final_io_error'] is None for c in measured) and stage['sampled_memory_available'] is all(c['measurement']['live_samples'] > 0 and c['measurement']['live_errors'] == 0 for c in measured), 'Warmup coverage totals')
+              def statistics(values):
+                  values = sorted(values)
+                  if not values:
+                      return None
+                  return {'count': len(values), 'p50': values[(len(values) * 50 + 99) // 100 - 1], 'p95': values[(len(values) * 95 + 99) // 100 - 1], 'worst': values[-1]}
+              def check_statistics(actual, values):
+                  require(exact_equal(actual, statistics(values)) and (actual is None or (isinstance(actual, dict) and all(uint(v) for v in actual.values()))), 'Warmup checked statistics')
+              samples = stage['samples']
+              check_statistics(stage['child_exit_us'], [m['child_exit_us'] for m in samples])
+              io_keys = {'read_operations', 'write_operations', 'other_operations', 'read_bytes', 'write_bytes', 'other_bytes'}
+              require(isinstance(stage['logical_io'], dict) and set(stage['logical_io']) == io_keys, 'Stage logical IO fields')
+              for key in io_keys:
+                  check_statistics(stage['logical_io'][key], [m['final_lifetime_logical_io'][key] for m in samples if m['final_lifetime_logical_io'] is not None])
+              startup = report['startup_import']
+              require(sha(startup['expected_final_logical_sha256']) and startup['expected_final_logical_sha256'] == startup['final_read_only_export']['logical_sha256'], 'Independent final SQLite oracle')
+              final = report['final_payloads']
+              require(final['exact_records_including_metadata_verified'] is True and uint(final['records']) and final['records'] == report['generation']['seed_records'] + 3 and uint(final['bytes']) and final['bytes'] == previous_projection['after_bytes'] and final['bytes'] <= 8388608 and final['verification'] == 'post-stop, sequential streaming, outside measurement', 'Final exact JSONL oracle')
+              return {'correctness_pass': True, 'measurement_status': 'incomplete-two-warmup', 'sampling_complete': False, 'full_workload_complete': False, 'performance_policy_status': 'unapproved', 'performance_complete': False}
           def validate_report(report, case, pins):
-              pilot = selected_case(case)
-              require(type(report.get('schema')) is int and report['schema'] == (2 if pilot else 1) and report.get('case') == ('representative-6MiB-pilot' if pilot else 'small-6MiB'), 'Controller schema/case mismatch')
+              selected_case(case)
+              pilot = case == 'representative-small-pilot'
+              two_warmup = case == 'representative-two-warmup'
+              require(type(report.get('schema')) is int and report['schema'] == (4 if two_warmup else 2 if pilot else 1) and report.get('case') == ('representative-6MiB-two-warmup' if two_warmup else 'representative-6MiB-pilot' if pilot else 'small-6MiB'), 'Controller schema/case mismatch')
               require(report.get('pass') is True and 'error' not in report, 'Controller correctness failure')
               require(report.get('source_unchanged') is True and report.get('client_registration_deleted') is True, 'Controller source/cleanup failure')
-              require(report.get('executable_sha256') == {role: pins[role] for role in ('admin', 'broker', 'client')}, 'Executable pin mismatch')
+              require(exact_equal(report.get('executable_sha256'), {role: pins[role] for role in ('admin', 'broker', 'client')}), 'Executable pin mismatch')
               client = report['client']
-              require(type(client.get('schema')) is int and client['schema'] == 1 and client.get('pass') is True and 'error' not in client, 'Client correctness failure')
+              require(type(client.get('schema')) is int and client['schema'] == (4 if two_warmup else 1) and client.get('pass') is True and 'error' not in client, 'Client correctness failure')
               for key in ('source_unchanged', 'local_sqlite_write_denied', 'wrong_server_enrollment_admitted_but_pipe_peer_denied'):
                   require(client.get(key) is True, 'Missing client source/authorization check')
               command_group(report['commands'], ['plan', 'prepare', 'activate', 'status', 'stop'])
-              insert = 'pilot-insert' if pilot else 'ingest'
-              commands = command_group(client['commands'], ['scoped-search', insert, 'duplicate', 'unchanged-snapshot', 'known-search', 'wrong-workspace', 'wrong-root', 'wrong-server-pin', 'export'])
-              for label, expected in ((insert, {'inserted': 1, 'duplicates': 0}), ('duplicate', {'inserted': 0, 'duplicates': 1}), ('unchanged-snapshot', {'inserted': 0, 'duplicates': 0}), ('export', {'sessions': 18 if pilot else 3})):
-                  require(json.loads(commands[label]['stdout']) == expected, 'CLI acknowledgement mismatch')
+              insert = 'warmup-op-0' if two_warmup else 'pilot-insert' if pilot else 'ingest'
+              commands = command_group(client['commands'], ['scoped-search', insert] + (['warmup-op-1'] if two_warmup else []) + ['duplicate', 'unchanged-snapshot', 'known-search', 'wrong-workspace', 'wrong-root', 'wrong-server-pin', 'export'])
+              for label, expected in ((insert, {'inserted': 1, 'duplicates': 0}), ('duplicate', {'inserted': 0, 'duplicates': 1}), ('unchanged-snapshot', {'inserted': 0, 'duplicates': 0}), ('export', {'sessions': 18 if pilot or two_warmup else 3})):
+                  require(exact_equal(json.loads(commands[label]['stdout']), expected), 'CLI acknowledgement mismatch')
               record = {'id': 'benchmark-000009000000', 'session_id': 'benchmark-client', 'workspace': 'disposable-benchmark', 'kind': 'user', 'content': 'hmvsmallcanary actual broker client durable record', 'timestamp': 1709000000.0, 'metadata': {'fixture': True, 'index': 9000000}}
-              require(json.loads(commands['known-search']['stdout']) == [record], 'Exact known search')
+              if two_warmup:
+                  record = warmup_record(0)
+              require(exact_equal(json.loads(commands['known-search']['stdout']), [record]), 'Exact known search')
               hits = json.loads(commands['scoped-search']['stdout'])
               require(isinstance(hits, list) and len(hits) > 0 and all(h.get('workspace') == 'disposable-benchmark' for h in hits), 'Scoped search')
               generation = report['generation']
+              for obj in (generation, report['startup_import']['persisted_startup_receipt'], report['startup_import']['final_read_only_export']):
+                  require(all(uint(obj[k]) for k in ('records', 'snapshot_states', 'snapshot_counters')), 'Strict oracle counts')
               seeds = generation['seed_records']
-              require(uint(seeds) and 0 < seeds <= (400000 if pilot else 100000) and generation['records'] == seeds + 1, 'Generation counts')
+              require(uint(seeds) and 0 < seeds <= (400000 if pilot or two_warmup else 100000) and generation['records'] == seeds + 1, 'Generation counts')
               require(sha(generation['logical_sha256']) and generation['snapshot_states'] == 1 and generation['snapshot_counters'] == 1, 'Generation receipt')
-              require(bool(generation['source_before']) and generation['source_before'] == generation['source_after'], 'Generation source inventory')
+              for inventory in (generation['source_before'], generation['source_after']):
+                  require(isinstance(inventory, dict) and all(isinstance(entry, dict) and set(entry) == {'bytes', 'sha256'} and uint(entry['bytes']) and sha(entry['sha256']) for entry in inventory.values()), 'Legacy fixture byte evidence; source inventory schema')
+              require(bool(generation['source_before']) and exact_equal(generation['source_before'], generation['source_after']), 'Generation source inventory')
               startup = report['startup_import']
               for key in ('records', 'snapshot_states', 'snapshot_counters', 'logical_sha256'):
-                  require(startup['persisted_startup_receipt'][key] == generation[key], 'Persisted startup receipt mismatch')
+                  require(exact_equal(startup['persisted_startup_receipt'][key], generation[key]), 'Persisted startup receipt mismatch')
               final = startup['final_read_only_export']
-              require(final['records'] == seeds + 2 and final['snapshot_states'] == 1 and final['snapshot_counters'] == 1 and sha(final['logical_sha256']), 'Stopped database receipt')
+              require(final['records'] == seeds + (3 if two_warmup else 2) and final['snapshot_states'] == 1 and final['snapshot_counters'] == 1 and sha(final['logical_sha256']), 'Stopped database receipt')
               export = client['export']
-              require(export['records'] == seeds + 2 and export['sessions'] == (18 if pilot else 3) and len(export['files']) == export['sessions'] and sha(export['index_sha256']), 'Export counts')
-              require(export.get('snapshot_payload_verified') is True and export.get('exact_payloads_verified' if pilot else 'known_payload_verified') is True, 'Export payload checks')
+              require(uint(export['records']) and uint(export['sessions']), 'Export numeric counts')
+              require(export['records'] == seeds + (3 if two_warmup else 2) and export['sessions'] == (18 if pilot or two_warmup else 3) and len(export['files']) == export['sessions'] and sha(export['index_sha256']), 'Export counts')
+              require(export.get('snapshot_payload_verified') is True and export.get('exact_payloads_verified' if pilot or two_warmup else 'known_payload_verified') is True, 'Export payload checks')
+              for value in (report['client_stop']['process']['exit_code'], report['client_stop']['scm_exit_code'], report['broker_exit']['exit_code'], report['broker_after']['pinned_process']['exit_code']):
+                  require(type(value) is int and value == 0, 'Strict clean exit')
               require(report['client_stop']['process']['exited'] is True and report['client_stop']['process']['exit_code'] == 0 and report['client_stop']['scm_exit_code'] == 0, 'Client clean stop')
               require(report['broker_exit']['exited'] is True and report['broker_exit']['exit_code'] == 0, 'Broker clean stop')
               before, after = report['broker_before'], report['broker_after']
-              require(bool(before['initial_identity']) and before['initial_identity'] == after['initial_identity'] and before['name'] == after['name'], 'Retained C identity changed')
+              for identity in (before['initial_identity'], after['initial_identity']):
+                  if isinstance(identity, dict):
+                      if 'elevated' in identity:
+                          require(type(identity['elevated']) is bool, 'Retained token elevation schema')
+                      for key in ('groups', 'privileges'):
+                          if key in identity:
+                              require(isinstance(identity[key], list) and all(isinstance(item, dict) and uint(item['attributes']) for item in identity[key]), 'Retained token attributes schema')
+              require(bool(before['initial_identity']) and exact_equal(before['initial_identity'], after['initial_identity']) and isinstance(before['name'], str) and exact_equal(before['name'], after['name']), 'Retained C identity changed')
               require(before['pinned_process']['exited'] is False and after['pinned_process']['exited'] is True and after['pinned_process']['exit_code'] == 0, 'Retained C lifecycle')
               metrics = report['metrics']
               require(all(obj.get('performance_complete', False) is False for obj in (report, metrics, client)), 'Unapproved performance claim')
+              if two_warmup:
+                  return validate_two_warmup(report, commands)
+              for command in report['commands'] + client['commands']:
+                  if 'elapsed_us' in command:
+                      require(uint(command['elapsed_us']), 'Command duration schema')
               if not pilot:
                   # Legacy emits byte/inventory evidence, not a representative fixture_spec.
                   # Bound retained JSONL; do not infer an exact 6 MiB legacy corpus.
@@ -255,7 +391,7 @@ jobs:
                   require(uint(generation.get('jsonl_bytes')) and 0 < generation['jsonl_bytes'] <= 8388608 and isinstance(source_jsonl, dict) and uint(source_jsonl.get('bytes')) and source_jsonl['bytes'] == generation['jsonl_bytes'] and sha(source_jsonl.get('sha256')), 'Legacy fixture byte evidence')
                   require(metrics.get('measured') is False and 'pilot' not in client and all('measurement' not in c for c in client['commands']), 'Legacy small must remain unmeasured')
                   return {'correctness_pass': True, 'measurement_status': 'not-measured', 'performance_complete': False}
-              require(generation['fixture_spec'] == {'shape': 'representative-v2', 'target_jsonl_bytes': 6291456}, 'Pilot fixture spec; no large case')
+              require(exact_equal(generation['fixture_spec'], {'shape': 'representative-v2', 'target_jsonl_bytes': 6291456}), 'Pilot fixture spec; no large case')
               require(metrics.get('measured') is True and metrics.get('sampling_complete') is False and metrics.get('performance_policy_status') == 'unapproved', 'Pilot is incomplete/unapproved')
               interval = metrics['pilot_interval']
               for key, value in (('schema', 1), ('operation_id', 0), ('broker_epoch', 1), ('supervisor_epoch', 2), ('cli_epoch', 3)):
@@ -278,13 +414,13 @@ jobs:
               require(sha(projection['before_sha256']) and sha(projection['after_sha256']) and uint(projection['volume_serial_number']), 'Pilot projection metadata')
               require(isinstance(projection['file_id'], list) and len(projection['file_id']) == 16 and all(uint(b) and b <= 255 for b in projection['file_id']), 'Pilot FILE_ID_128 bytes')
               final_payloads = report['final_payloads']
-              require(final_payloads.get('exact_records_including_metadata_verified') is True and final_payloads['records'] == seeds + 2 and uint(final_payloads['bytes']) and final_payloads['bytes'] == projection['after_bytes'] and final_payloads['bytes'] <= 8388608, 'Final persisted payload checks')
+              require(final_payloads.get('exact_records_including_metadata_verified') is True and uint(final_payloads['records']) and final_payloads['records'] == seeds + 2 and uint(final_payloads['bytes']) and final_payloads['bytes'] == projection['after_bytes'] and final_payloads['bytes'] <= 8388608, 'Final persisted payload checks')
               measured = [c for c in client['commands'] if 'measurement' in c]
               require(len(measured) == 1 and measured[0] is commands[insert], 'Exactly one actual measured CLI')
               m = measured[0]['measurement']
               validate_measurement(m, payload_bytes)
               p = client['pilot']
-              require(type(p['schema']) is int and p['schema'] == 1 and type(p['operation_id']) is int and p['operation_id'] == 0 and p['stage'] == interval['stage'] and p['expected_additions'] == 1 and p['sampling_complete'] is False and p['performance_policy_status'] == 'unapproved' and p['measurement'] == m, 'Client pilot receipt')
+              require(type(p['schema']) is int and p['schema'] == 1 and type(p['operation_id']) is int and p['operation_id'] == 0 and p['stage'] == interval['stage'] and type(p['expected_additions']) is int and p['expected_additions'] == 1 and p['sampling_complete'] is False and p['performance_policy_status'] == 'unapproved' and exact_equal(p['measurement'], m), 'Client pilot receipt')
               require(all(obj.get('performance_complete', False) is False for obj in (report, metrics, client, p)), 'Unapproved performance claim')
               return {'correctness_pass': True, 'measurement_status': 'incomplete-pilot', 'sampling_complete': False, 'performance_policy_status': 'unapproved', 'performance_complete': False}
           def read_stream(pipe, name):
@@ -307,7 +443,8 @@ jobs:
                       state['error'] = str(error)[:4096]
                   bad_capture.set()
           try:
-              pilot = selected_case(os.environ.get('BENCHMARK_CASE'))
+              case = selected_case(os.environ.get('BENCHMARK_CASE'))
+              pilot = case == 'representative-small-pilot'
               binaries = {
                   'harness': root / 'target/release/examples/windows_broker_benchmark.exe',
                   'admin': root / 'target/release/hermes-memory-admin.exe',
@@ -322,6 +459,7 @@ jobs:
                       pins[role] = hashlib.file_digest(source, 'sha256').hexdigest()
               provenance_path = evidence / 'provenance.json'
               provenance = json.loads(provenance_path.read_text(encoding='utf-8'))
+              status['source_before_sha256'] = verify_source(root, provenance)
               provenance['executable_sha256'] = pins
               provenance_path.write_text(json.dumps(provenance, indent=2), encoding='utf-8')
               if result_path.exists():
@@ -332,6 +470,8 @@ jobs:
                       '--client-exe', str(binaries['client']), '--admin-exe', str(binaries['admin'])]
               if pilot:
                   args.append('--representative-small-pilot')
+              elif case == 'representative-two-warmup':
+                  args.append('--representative-two-warmup')
               status['argv'] = args
               # No shell, PID search, tree kill, service cleanup or ACL repair.
               # On Windows Popen.kill uses ONLY this retained direct-child handle.
@@ -373,6 +513,8 @@ jobs:
                   raw = source.read(result_limit + 1)
               if len(raw) > result_limit:
                   raise RuntimeError('Controller result exceeds 16 MiB evidence/validation cap')
+              status['source_after_sha256'] = verify_source(root, provenance)
+              require(status['source_before_sha256'] == status['source_after_sha256'], 'Source changed during invocation')
               report = json.loads(raw)
               status.update(validate_report(report, os.environ.get('BENCHMARK_CASE'), pins))
               status['case'] = report['case']

@@ -55,6 +55,365 @@ fn read_client_report(file: &mut File) -> Result<Value> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+/// Sequencing/receipt/append controller, usable without lifecycle authority.
+/// `sample` must close over one retained observer; ordinary adapters return null.
+#[allow(dead_code)] // Native admission and same-handle metrics remain a later review gate.
+pub fn two_warmup_sandbox_intervals(
+    root: &Path,
+    epoch: &str,
+    projection: &Path,
+    deadline: Instant,
+    cancelled: fn() -> bool,
+    mut sample: impl FnMut(u32, bool) -> Result<Value>,
+) -> Result<Value> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek, SeekFrom};
+    let mut barrier = contract::OperationBarrier::new(root, epoch, 2)?;
+    let mut evidence = Vec::with_capacity(2);
+    for id in 0..crate::data::TwoWarmupManifest::OPERATIONS {
+        barrier.wait(
+            id,
+            contract::PilotPhase::Ready,
+            deadline.min(Instant::now() + Duration::from_secs(60)),
+            cancelled,
+        )?;
+        let mut file = File::open(projection)?;
+        let before_bytes = file.metadata()?.len();
+        ensure(before_bytes <= 8 * 1024 * 1024, "warmup projection bound")?;
+        let before_hash = crate::data::hash_file(projection)?; // Outside sample bracket.
+        let before = sample(id, false)?;
+        barrier.publish(id, contract::PilotPhase::Release)?;
+        barrier.wait(
+            id,
+            contract::PilotPhase::Done,
+            deadline.min(Instant::now() + Duration::from_secs(60)),
+            cancelled,
+        )?;
+        let after = sample(id, true)?; // Before receipt reads or any corpus hashing.
+        let receipt_file = File::open(root.join(format!("scratch/workload-op-{id}-receipt.json")))?;
+        ensure(
+            receipt_file.metadata()?.is_file() && receipt_file.metadata()?.len() <= 65536,
+            "warmup receipt bound",
+        )?;
+        let receipt: contract::WarmupReceipt = serde_json::from_reader(receipt_file.take(65537))?;
+        receipt.validate(id)?;
+        let mut expected = serde_json::to_vec(&crate::data::TwoWarmupManifest.record(id)?)?;
+        expected.push(b'\n');
+        ensure(
+            file.metadata()?.len() == before_bytes + expected.len() as u64,
+            "warmup exact append length",
+        )?;
+        file.seek(SeekFrom::Start(0))?;
+        let mut prefix = (&mut file).take(before_bytes);
+        let mut hash = Sha256::new();
+        let mut buffer = [0u8; 65536];
+        loop {
+            let n = prefix.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            hash.update(&buffer[..n]);
+        }
+        ensure(
+            format!("{:x}", hash.finalize()) == before_hash,
+            "warmup prefix mutation",
+        )?;
+        let mut actual = vec![0; expected.len()];
+        file.read_exact(&mut actual)?;
+        ensure(
+            actual == expected && file.read(&mut [0; 1])? == 0,
+            "warmup exact append payload",
+        )?;
+        // The callback seam does not certify a native C handle or projection path identity.
+        evidence.push(json!({"operation_id":id,"cli_epoch":receipt.cli_epoch,"payload_bytes":receipt.payload.len(),"before_release":before,"after_done":after,"receipt_validated":true,"exact_append_verified":true,"hashing":"outside bracket"}));
+        ensure(
+            !cancelled() && Instant::now() < deadline,
+            "warmup cancelled/expired before ACK",
+        )?;
+        barrier.publish(id, contract::PilotPhase::Acknowledged)?;
+    }
+    Ok(
+        json!({"schema":3,"case":"representative-two-warmup-sandbox","operations":evidence,"sampling_complete":false,"native_handle_verified":false,"performance_policy_status":"unapproved"}),
+    )
+}
+#[cfg(all(test, windows))]
+mod two_warmup_sequence_tests {
+    use super::*;
+    #[test]
+    fn controller_observes_both_boundaries_before_ack_for_each_operation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("scratch")).unwrap();
+        std::fs::create_dir(root.join("controller")).unwrap();
+        let store = hermes_memory::MemoryStore::open(root.join("store")).unwrap();
+        store
+            .ingest_many(&[crate::data::representative_record(0).unwrap()])
+            .unwrap();
+        let mut observations = Vec::new();
+        // Complete store initialization before either peer starts its operation deadline.
+        std::thread::scope(|scope| {
+            let child = scope.spawn(move || {
+                crate::client::execute_two_warmup_sandbox(
+                    root,
+                    "boundaries",
+                    Instant::now() + Duration::from_secs(5),
+                    contract::never_cancel,
+                    |_, _, payload| {
+                        let records: Vec<hermes_memory::MemoryRecord> =
+                            serde_json::from_slice(payload)?;
+                        let (a, b) = store.ingest_many(&records)?;
+                        Ok((a as u64, b as u64))
+                    },
+                )
+                .map_err(|e| e.to_string())
+            });
+            let report = two_warmup_sandbox_intervals(
+                root,
+                "boundaries",
+                &root.join("store/events.jsonl"),
+                Instant::now() + Duration::from_secs(5),
+                contract::never_cancel,
+                |id, after| {
+                    assert!(root
+                        .join(format!("scratch/workload-op-{id}-ready.json"))
+                        .exists());
+                    assert_eq!(
+                        root.join(format!("scratch/workload-op-{id}-done.json"))
+                            .exists(),
+                        after
+                    );
+                    assert!(!root
+                        .join(format!("controller/workload-op-{id}-acknowledged.json"))
+                        .exists());
+                    observations.push(if after {
+                        "after-done"
+                    } else {
+                        "before-release"
+                    });
+                    Ok(Value::Null) // No fabricated native measurements.
+                },
+            )
+            .unwrap();
+            assert_eq!(report["operations"].as_array().unwrap().len(), 2);
+            assert_eq!(report["native_handle_verified"], false);
+            child.join().unwrap().unwrap();
+        });
+        assert_eq!(
+            observations,
+            [
+                "before-release",
+                "after-done",
+                "before-release",
+                "after-done"
+            ]
+        );
+    }
+    #[test]
+    fn unknown_commit_error_is_not_retried_or_published_as_done() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("scratch")).unwrap();
+        std::fs::create_dir(root.join("controller")).unwrap();
+        let store = hermes_memory::MemoryStore::open(root.join("store")).unwrap();
+        std::thread::scope(|scope| {
+            let child = scope.spawn(move || {
+                let mut calls = 0;
+                let result = crate::client::execute_two_warmup_sandbox(
+                    root,
+                    "unknown-commit",
+                    Instant::now() + Duration::from_secs(2),
+                    contract::never_cancel,
+                    |_, _, payload| {
+                        calls += 1;
+                        let records: Vec<hermes_memory::MemoryRecord> =
+                            serde_json::from_slice(payload)?;
+                        store.ingest_many(&records)?;
+                        Err("unknown commit injected after real insertion".into())
+                    },
+                );
+                assert!(result.unwrap_err().to_string().contains("unknown commit"));
+                assert_eq!(calls, 1);
+            });
+            let mut barrier = contract::OperationBarrier::new(root, "unknown-commit", 2).unwrap();
+            barrier
+                .wait(
+                    0,
+                    contract::PilotPhase::Ready,
+                    Instant::now() + Duration::from_secs(2),
+                    contract::never_cancel,
+                )
+                .unwrap();
+            barrier.publish(0, contract::PilotPhase::Release).unwrap();
+            child.join().unwrap();
+            assert!(!root.join("scratch/workload-op-0-done.json").exists());
+            assert!(!root.join("scratch/workload-op-1-ready.json").exists());
+        });
+    }
+    #[test]
+    fn bad_receipt_after_done_never_acknowledges_or_advances() {
+        static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        fn cancelled() -> bool {
+            STOP.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        STOP.store(false, std::sync::atomic::Ordering::SeqCst);
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("scratch")).unwrap();
+        std::fs::create_dir(root.join("controller")).unwrap();
+        let store = hermes_memory::MemoryStore::open(root.join("store")).unwrap();
+        store
+            .ingest_many(&[crate::data::representative_record(0).unwrap()])
+            .unwrap();
+        drop(store);
+        std::thread::scope(|scope| {
+            let child = scope.spawn(move || {
+                let store = hermes_memory::MemoryStore::open(root.join("store")).unwrap();
+                crate::client::execute_two_warmup_sandbox(
+                    root,
+                    "bad-receipt",
+                    Instant::now() + Duration::from_secs(10),
+                    cancelled,
+                    |_, _, payload| {
+                        let records: Vec<hermes_memory::MemoryRecord> =
+                            serde_json::from_slice(payload)?;
+                        let (a, b) = store.ingest_many(&records)?;
+                        Ok((a as u64, b as u64))
+                    },
+                )
+                .map_err(|e| e.to_string())
+            });
+            let result = two_warmup_sandbox_intervals(
+                root,
+                "bad-receipt",
+                &root.join("store/events.jsonl"),
+                Instant::now() + Duration::from_secs(10),
+                contract::never_cancel,
+                |id, after| {
+                    if after {
+                        let path = root.join(format!("scratch/workload-op-{id}-receipt.json"));
+                        let mut value: Value = serde_json::from_reader(File::open(&path)?)?;
+                        value["cli_epoch"] = json!(999);
+                        std::fs::write(path, serde_json::to_vec(&value)?)?;
+                    }
+                    Ok(Value::Null)
+                },
+            );
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("receipt/payload mismatch"));
+            STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(child.join().unwrap().is_err());
+        });
+        assert!(!root
+            .join("controller/workload-op-0-acknowledged.json")
+            .exists());
+        assert!(!root.join("scratch/workload-op-1-ready.json").exists());
+    }
+    #[test]
+    fn exact_receipt_mutations_and_unknown_fields_are_refused() {
+        for mutation in 0..8 {
+            let receipt = contract::WarmupReceipt {
+                schema: 3,
+                operation_id: 0,
+                cli_epoch: 3,
+                payload: crate::data::TwoWarmupManifest.payload(0).unwrap(),
+                inserted: 1,
+                duplicates: 0,
+            };
+            receipt.validate(0).unwrap();
+            let mut value = serde_json::to_value(receipt).unwrap();
+            match mutation {
+                0 => value["schema"] = json!(1),
+                1 => value["operation_id"] = json!(1),
+                2 => value["cli_epoch"] = json!(4),
+                3 => value["inserted"] = json!(0),
+                4 => value["duplicates"] = json!(1),
+                5 => value["payload"][0] = json!(0),
+                6 => {
+                    value.as_object_mut().unwrap().remove("payload");
+                }
+                _ => value["unknown"] = json!(true),
+            }
+            match serde_json::from_value::<contract::WarmupReceipt>(value) {
+                Ok(bad) => assert!(bad.validate(0).is_err()),
+                Err(_) => assert!(mutation >= 6),
+            }
+        }
+    }
+    #[test]
+    fn missing_ack_does_not_execute_second_real_insert() {
+        static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        fn cancelled() -> bool {
+            STOP.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        STOP.store(false, std::sync::atomic::Ordering::SeqCst);
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("scratch")).unwrap();
+        std::fs::create_dir(temp.path().join("controller")).unwrap();
+        std::thread::scope(|scope| {
+            let root = temp.path();
+            let child = scope.spawn(move || {
+                let store = hermes_memory::MemoryStore::open(root.join("store")).unwrap();
+                crate::client::execute_two_warmup_sandbox(
+                    root,
+                    "missing-ack",
+                    Instant::now() + Duration::from_secs(10),
+                    cancelled,
+                    |_, _, payload| {
+                        let records: Vec<hermes_memory::MemoryRecord> =
+                            serde_json::from_slice(payload)?;
+                        let (inserted, duplicates) = store.ingest_many(&records)?;
+                        Ok((inserted as u64, duplicates as u64))
+                    },
+                )
+                .map_err(|e| e.to_string())
+            });
+            let mut barrier = contract::OperationBarrier::new(root, "missing-ack", 2).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            barrier
+                .wait(
+                    0,
+                    contract::PilotPhase::Ready,
+                    deadline,
+                    contract::never_cancel,
+                )
+                .unwrap();
+            barrier.publish(0, contract::PilotPhase::Release).unwrap();
+            barrier
+                .wait(
+                    0,
+                    contract::PilotPhase::Done,
+                    deadline,
+                    contract::never_cancel,
+                )
+                .unwrap();
+            STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(child.join().unwrap().unwrap_err().contains("cancelled"));
+            assert!(!root.join("scratch/workload-op-1-ready.json").exists());
+        });
+        let text = std::fs::read_to_string(temp.path().join("store/events.jsonl")).unwrap();
+        assert!(!text.contains("benchmark-workload-v1-000001"));
+    }
+}
+pub(crate) fn validate_warmup_command(value: &Value, id: u32) -> Result<()> {
+    ensure(
+        contract::output(value)? == json!({"inserted":1,"duplicates":0}),
+        "warmup exact acknowledgement",
+    )?;
+    let measurement: crate::measure::CommandMeasurement =
+        serde_json::from_value(value["measurement"].clone())?;
+    measurement.validate()?;
+    let manifest = data::TwoWarmupManifest;
+    let policy = crate::measure::SamplePolicy::cli(manifest.cli_epoch(id)?, id);
+    ensure(
+        measurement.identity == policy.identity
+            && measurement.operation_id == id
+            && measurement.command_success
+            && measurement.payload_bytes == manifest.payload(id)?.len() as u64,
+        "warmup measurement identity/payload mismatch",
+    )
+}
 fn validate_pilot_receipt(value: &Value) -> Result<()> {
     ensure(
         contract::output(value)? == json!({"inserted":1,"duplicates":0}),
@@ -144,12 +503,18 @@ pub fn run(options: Options) -> Result<()> {
             report["case"] = json!("representative-6MiB-pilot");
             report["metrics"] = json!({"measured":false,"sampling_complete":false,"performance_policy_status":"unapproved","workload":"one first-warmup insert; NOT full warmup/20-sample steady workload"});
         }
+        if options.representative_two_warmup {
+            report["schema"] = json!(4);
+            report["case"] = json!("representative-6MiB-two-warmup");
+            report["metrics"] = json!({"measured":false,"sampling_complete":false,"performance_policy_status":"unapproved","expected_warmups":2,"full_workload_complete":false,"workload":"exactly two warmups; no steady-state20 admission"});
+        }
         let outcome = small(
             &broker,
             &client,
             &admin,
             &mut report,
             options.representative_small_pilot,
+            options.representative_two_warmup,
         );
         if let Err(ref e) = outcome {
             report["error"] = json!(e.to_string());
@@ -168,6 +533,7 @@ fn small(
     admin_source: &Path,
     report: &mut Value,
     pilot: bool,
+    two_warmup: bool,
 ) -> Result<()> {
     let mut fixture = crate::scm::Fixture::create(true, true)?;
     let root = fixture.root().to_owned();
@@ -195,7 +561,7 @@ fn small(
     let mut observed = None;
     let mut generation = Value::Null;
     let operation = (|| -> Result<()> {
-        generation = if pilot {
+        generation = if pilot || two_warmup {
             data::generate_with_spec(
                 &root.join("small"),
                 &data::FixtureSpec::representative_6_mib(),
@@ -290,8 +656,28 @@ fn small(
             .ok_or("wrong SID candidate")?;
         wrong["server_sid"] = json!(wrong_sid);
         contract::json_new(&root.join("wrong-server-enrollment.json"), &wrong)?;
+        if two_warmup {
+            contract::json_new(
+                &root.join("two-warmup-job.json"),
+                &crate::two_warmup::TwoWarmupJob {
+                    schema: 4,
+                    epoch: fixture.client_name().to_owned(),
+                    fixture_spec: data::FixtureSpec::representative_6_mib(),
+                },
+            )?;
+        }
         contract::json_new(&root.join("job.json"), &job)?;
         report["client_start"] = fixture.start_client()?;
+        if two_warmup {
+            native_two_warmup_intervals(
+                &root,
+                fixture.client_name(),
+                &fixture,
+                observed.as_ref().ok_or("missing retained C")?,
+                &job,
+                report,
+            )?;
+        }
         if let Some(pilot_job) = &job.pilot {
             pilot_interval(
                 &root,
@@ -317,7 +703,7 @@ fn small(
         let mut file = open_client_report(&root.join("scratch/client-result.json"))?;
         report["client"] = read_client_report(&mut file)?;
         report["client_observation"] = fixture.observe_client()?;
-        if pilot {
+        if pilot || two_warmup {
             let commands = report["client"]["commands"]
                 .as_array()
                 .ok_or("pilot commands missing")?;
@@ -326,10 +712,19 @@ fn small(
                 .filter(|v| v.get("measurement").is_some())
                 .collect();
             ensure(
-                measured.len() == 1,
+                measured.len() == if two_warmup { 2 } else { 1 },
                 "pilot requires exactly one measured command",
             )?;
-            validate_pilot_receipt(measured[0])?;
+            if two_warmup {
+                validate_final_warmup_commands(
+                    commands,
+                    report["metrics"]["controller_retained_receipts"]
+                        .as_array()
+                        .ok_or("controller-retained receipts missing")?,
+                )?;
+            } else {
+                validate_pilot_receipt(measured[0])?;
+            }
         }
         ensure(
             report["client"]["pass"] == true,
@@ -387,7 +782,9 @@ fn small(
         report["broker_exit"]["exited"] == true && report["broker_exit"]["exit_code"] == 0,
         "C did not stop cleanly",
     )?;
-    report["startup_import"] = if pilot {
+    report["startup_import"] = if two_warmup {
+        crate::fixtures::verify_stopped_two_warmup(&install.join("store/memory.db"), &generation)?
+    } else if pilot {
         crate::fixtures::verify_stopped_import_with_expected(
             &install.join("store/memory.db"),
             &generation,
@@ -400,6 +797,13 @@ fn small(
         data::inventory(&root.join("small/source"))? == generation["source_before"],
         "source changed after shutdown",
     )?;
+    if two_warmup {
+        report["final_payloads"] = crate::client::verify_two_warmup_projection(
+            &install.join("store/events.jsonl"),
+            &root.join("small/source/events.jsonl"),
+            generation["seed_records"].as_u64().ok_or("seed count")?,
+        )?;
+    }
     if pilot {
         report["final_payloads"] = crate::client::verify_pilot_projection(
             &install.join("store/events.jsonl"),
@@ -485,6 +889,125 @@ fn pilot_interval(
     Ok(())
 }
 #[cfg(all(windows, feature = "experimental-broker"))]
+fn native_two_warmup_intervals(
+    root: &Path,
+    epoch: &str,
+    fixture: &crate::scm::Fixture,
+    broker: &crate::scm::ObservedService,
+    job: &contract::Job,
+    report: &mut Value,
+) -> Result<()> {
+    use std::io::Read;
+    let projection = root.join("install-small/store/events.jsonl");
+    let mut baseline = None;
+    let mut previous_identity = None;
+    let mut retained_receipts = Vec::with_capacity(2);
+    // Preserve partial boundary/receipt evidence even if a later check fails.
+    report["metrics"]["native_intervals"] = json!([]);
+    report["metrics"]["controller_retained_receipts"] = json!([]);
+    let result = two_warmup_sandbox_intervals(
+        root,
+        epoch,
+        &projection,
+        Instant::now() + Duration::from_secs(120),
+        contract::never_cancel,
+        |id, after| {
+            if !after {
+                let file = crate::metrics::snapshot_jsonl(&projection)?;
+                ensure(
+                    file.length >= 6 * 1024 * 1024 && file.length <= 8 * 1024 * 1024,
+                    "native representative projection bound",
+                )?;
+                if let Some(identity) = &previous_identity {
+                    ensure(
+                        file.identity == *identity,
+                        "native projection identity changed between warmups",
+                    )?;
+                }
+                previous_identity = Some(file.identity.clone());
+                let b = fixture.sample_client()?;
+                let c = broker.sample()?;
+                let value = json!({"case_epoch":epoch,"operation_id":id,"broker_epoch":1,"supervisor_epoch":2,"cli_epoch":data::TwoWarmupManifest.cli_epoch(id)?,"broker":process_sample(c),"supervisor":process_sample(b)});
+                report["metrics"]["native_intervals"].as_array_mut().ok_or("interval array")?.push(json!({"operation_id":id,"before_release":value,"after_done":null,"receipt_validated":false}));
+                baseline = Some((file, c, b, Instant::now()));
+                Ok(value)
+            } else {
+                // SAME retained C and B handles; no reopening by PID or service query.
+                let c = broker.sample()?;
+                let b = fixture.sample_client()?;
+                let (file, before_c, before_b, started) =
+                    baseline.take().ok_or("missing warmup baseline")?;
+                let span = started.elapsed().as_micros();
+                let c_delta = c.logical_io.checked_delta(&before_c.logical_io)?;
+                let b_delta = b.logical_io.checked_delta(&before_b.logical_io)?;
+                let value = json!({"case_epoch":epoch,"operation_id":id,"broker_epoch":1,"supervisor_epoch":2,"cli_epoch":data::TwoWarmupManifest.cli_epoch(id)?,"broker":process_sample(c),"supervisor":process_sample(b),"broker_logical_io_delta":crate::measure::LogicalIo::from(c_delta),"supervisor_logical_io_delta":crate::measure::LogicalIo::from(b_delta),"handshake_span_us":span});
+                report["metrics"]["native_intervals"][id as usize]["after_done"] = value.clone();
+                // End samples already captured: all receipt/file hashing below is outside.
+                let after_file = crate::metrics::verify_append(&projection, &file)?;
+                let path = root.join(format!("scratch/warmup-op-{id}-native.json"));
+                let mut input = open_client_report(&path)?;
+                ensure(input.metadata()?.len() <= 65536, "native receipt bound")?;
+                let mut bytes = Vec::new();
+                (&mut input).take(65537).read_to_end(&mut bytes)?;
+                ensure(bytes.len() <= 65536, "native receipt bound")?;
+                let receipt: crate::two_warmup::NativeReceipt = serde_json::from_slice(&bytes)?;
+                receipt.validate(epoch, id)?;
+                let label = format!("warmup-op-{id}");
+                ensure(
+                    receipt.command["exe"] == json!(job.client)
+                        && receipt.command["args"]
+                            == json!(job
+                                .case
+                                .client_args("ingest", &contract::text(&job.enrollment)?)?)
+                        && receipt.command["stdout_file"]
+                            == json!(root.join(format!("scratch/{label}.stdout")))
+                        && receipt.command["stderr_file"]
+                            == json!(root.join(format!("scratch/{label}.stderr"))),
+                    "native installed command correlation mismatch",
+                )?;
+                let mut captured =
+                    open_client_report(&root.join(format!("scratch/{label}.result.json")))?;
+                ensure(
+                    read_client_report(&mut captured)? == receipt.command,
+                    "native captured command receipt mismatch",
+                )?;
+                let mut stdin = File::open(root.join(format!("scratch/{label}.stdin")))?;
+                let mut actual = Vec::new();
+                (&mut stdin).take(4098).read_to_end(&mut actual)?;
+                ensure(
+                    actual == receipt.warmup.payload,
+                    "native captured stdin payload mismatch",
+                )?;
+                report["metrics"]["native_intervals"][id as usize]["receipt_validated"] =
+                    json!(true);
+                report["metrics"]["native_intervals"][id as usize]["projection"] = json!({"same_identity":true,"before_bytes":file.length,"after_bytes":after_file.length,"volume_serial_number":after_file.identity.volume_serial_number,"file_id":after_file.identity.file_id});
+                // Own the complete validated command before returning to the ACK path.
+                retained_receipts.push(receipt.command);
+                report["metrics"]["controller_retained_receipts"] = json!(retained_receipts);
+                Ok(value)
+            }
+        },
+    )?;
+    report["metrics"]["operations"] = result["operations"].clone();
+    report["metrics"]["warmup_commands"] = crate::measure::summarize_stage(
+        crate::measure::CommandStage::Warmup,
+        &retained_receipts
+            .iter()
+            .map(|command| serde_json::from_value(command["measurement"].clone()))
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+    )?;
+    report["metrics"]["measured"] = json!(true);
+    report["metrics"]["native_handle_verified"] = json!(true);
+    report["metrics"]["warmups_complete"] = json!(true);
+    report["metrics"]["coverage"] = json!("beforeRelease/afterDone boundary samples per operation only; no cadence, interval peaks or full-workload claim");
+    report["metrics"]["hashing"] = json!("outside measured brackets; warm-cache evidence");
+    report["metrics"]["logical_io_semantics"] = json!("retained C/B process logical IO, not physical or store-only IO; CLI child lifetime IO separate");
+    report["metrics"]["memory_semantics"] = json!(
+        "boundary sampled lower bounds; lifetime peaks include startup; no simultaneous peak sum"
+    );
+    Ok(())
+}
+#[cfg(all(windows, feature = "experimental-broker"))]
 fn receipt_args(operation: &str, receipt: &Path) -> Result<Vec<String>> {
     Ok(vec![
         operation.into(),
@@ -552,10 +1075,142 @@ fn small_case(
     })
 }
 
+#[cfg(any(test, all(windows, feature = "experimental-broker")))]
+fn validate_final_warmup_commands(commands: &[Value], retained: &[Value]) -> Result<()> {
+    let measured: Vec<_> = commands
+        .iter()
+        .filter(|command| command.get("measurement").is_some())
+        .collect();
+    ensure(
+        retained.len() == 2 && measured == retained.iter().collect::<Vec<_>>(),
+        "final commands differ from exact controller-retained receipts",
+    )?;
+    for (id, command) in measured.iter().enumerate() {
+        validate_warmup_command(command, id as u32)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn final_two_warmup_report_rejects_exact_receipt_drift() {
+        // Synthetic wire input only, not native execution evidence.
+        let retained: Vec<Value> = (0..2)
+            .map(|id| {
+                let payload = data::TwoWarmupManifest.payload(id).unwrap();
+                let mut measurement = crate::measure::CommandMeasurement::new(
+                    &crate::measure::SamplePolicy::cli(u64::from(id) + 3, id),
+                    payload.len() as u64,
+                );
+                measurement.command_success = true;
+                measurement.child_exit_us = Some(1);
+                json!({"exe":"C:/fixture/client.exe","args":["ingest"],
+                    "stdout":"{\"inserted\":1,\"duplicates\":0}","stderr":"",
+                    "stdout_file":format!("C:/fixture/scratch/warmup-op-{id}.stdout"),
+                    "stderr_file":format!("C:/fixture/scratch/warmup-op-{id}.stderr"),
+                    "capture_complete":true,"success":true,"measurement":measurement})
+            })
+            .collect();
+        validate_final_warmup_commands(&retained, &retained).unwrap();
+        assert!(validate_final_warmup_commands(&retained, &[]).is_err());
+        assert!(validate_final_warmup_commands(&retained, &retained[..1]).is_err());
+        let mut reordered = retained.clone();
+        reordered.reverse();
+        assert!(validate_final_warmup_commands(&reordered, &retained).is_err());
+        for id in 0..2 {
+            for (field, value) in [
+                ("exe", json!("C:/unrelated/not-installed.exe")),
+                ("args", json!(["unrelated", "--not-ingest"])),
+                (
+                    "stdout_file",
+                    json!(format!("C:/unrelated/captures/warmup-op-{id}.stdout")),
+                ),
+                (
+                    "stderr_file",
+                    json!(format!("C:/unrelated/captures/warmup-op-{id}.stderr")),
+                ),
+                ("stdout", json!("{ \"inserted\": 1, \"duplicates\": 0 }")),
+                ("stderr", json!("drift")),
+                ("measurement", {
+                    let mut measurement = retained[id]["measurement"].clone();
+                    measurement["child_exit_us"] = json!(2);
+                    measurement
+                }),
+                ("capture_complete", json!(false)),
+            ] {
+                let mut commands = retained.clone();
+                commands[id][field] = value;
+                assert!(
+                    validate_final_warmup_commands(&commands, &retained).is_err(),
+                    "accepted final {field} drift for operation {id}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_two_warmup_command_receipts_bind_exact_operation_epoch_and_payload() {
+        for id in 0..2 {
+            let payload = data::TwoWarmupManifest.payload(id).unwrap();
+            let mut measurement = crate::measure::CommandMeasurement::new(
+                &crate::measure::SamplePolicy::cli(u64::from(id) + 3, id),
+                payload.len() as u64,
+            );
+            measurement.command_success = true;
+            measurement.child_exit_us = Some(1);
+            let value = json!({"success":true,"stdout":"{\"inserted\":1,\"duplicates\":0}","measurement":measurement});
+            validate_warmup_command(&value, id).unwrap();
+            for mutation in 0..5 {
+                let mut bad = value.clone();
+                match mutation {
+                    0 => bad["measurement"]["operation_id"] = json!(2),
+                    1 => bad["measurement"]["identity"]["epoch"] = json!(99),
+                    2 => bad["measurement"]["payload_bytes"] = json!(1),
+                    3 => bad["measurement"]["command_success"] = json!(false),
+                    _ => bad["stdout"] = json!("{\"inserted\":0,\"duplicates\":1}"),
+                }
+                assert!(validate_warmup_command(&bad, id).is_err());
+            }
+            assert!(validate_warmup_command(&value, 2).is_err());
+        }
+    }
+
+    #[test]
+    fn two_warmup_opt_in_is_explicit_and_preserves_refusal_outputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let result = temp.path().join("result.json");
+        fs::write(&result, b"keep me\n").unwrap();
+        let options = Options::try_parse_from([
+            "benchmark",
+            "--representative-two-warmup",
+            "--result",
+            result.to_str().unwrap(),
+        ])
+        .expect("two warmup CLI path must be admitted by parser");
+        assert!(run(options).is_err());
+        assert_eq!(fs::read(&result).unwrap(), b"keep me\n");
+        let options = Options::try_parse_from([
+            "benchmark",
+            "--representative-two-warmup",
+            "--large-mib",
+            "600",
+        ])
+        .unwrap();
+        assert!(validate(&options)
+            .unwrap_err()
+            .to_string()
+            .contains("--large-mib"));
+        assert!(Options::try_parse_from([
+            "benchmark",
+            "--representative-two-warmup",
+            "--representative-small-pilot",
+        ])
+        .is_err());
+    }
 
     #[test]
     fn client_report_enforces_consumed_boundary_and_json_eof() {

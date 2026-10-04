@@ -363,6 +363,26 @@ fn exact_record(reader: &mut impl Read, record: &hermes_memory::MemoryRecord) ->
 /// Final stopped projection oracle includes metadata, which Markdown omits.
 /// Canonical timestamp order lets us compare one record at a time without an ID set.
 pub fn verify_pilot_projection(path: &Path, source: &Path, seeds: u64) -> Result<Value> {
+    verify_representative_projection(path, source, seeds, &[known_record()])
+}
+#[allow(dead_code)] // Internal sandbox only; no native/workflow admission.
+pub fn verify_two_warmup_projection(path: &Path, source: &Path, seeds: u64) -> Result<Value> {
+    verify_representative_projection(
+        path,
+        source,
+        seeds,
+        &[
+            data::TwoWarmupManifest.record(0)?,
+            data::TwoWarmupManifest.record(1)?,
+        ],
+    )
+}
+fn verify_representative_projection(
+    path: &Path,
+    source: &Path,
+    seeds: u64,
+    additions: &[hermes_memory::MemoryRecord],
+) -> Result<Value> {
     ensure(
         (16..=data::MAX_SEED_RECORDS).contains(&seeds),
         "pilot seed count bound",
@@ -388,13 +408,15 @@ pub fn verify_pilot_projection(path: &Path, source: &Path, seeds: u64) -> Result
     for n in 0..seeds {
         record(&data::representative_record(n)?)?;
     }
-    record(&known_record())?;
+    for addition in additions {
+        record(addition)?;
+    }
     ensure(
         reader.read(&mut [0; 1])? == 0,
         "extra final projection record",
     )?;
     Ok(
-        json!({"records":seeds+2,"bytes":bytes,"exact_records_including_metadata_verified":true,"verification":"post-stop, sequential streaming, outside measurement"}),
+        json!({"records":seeds+1+additions.len() as u64,"bytes":bytes,"exact_records_including_metadata_verified":true,"verification":"post-stop, sequential streaming, outside measurement"}),
     )
 }
 // Fixture identifiers are already safe ASCII; match the renderer's SHA-256
@@ -415,6 +437,26 @@ fn pilot_sessions() -> Vec<String> {
     sessions
 }
 pub fn verify_pilot_export(vault: &Path, source: &Path, seeds: u64) -> Result<Value> {
+    verify_representative_export(vault, source, seeds, &[known_record()])
+}
+#[allow(dead_code)] // Internal sandbox only; no native/workflow admission.
+pub fn verify_two_warmup_export(vault: &Path, source: &Path, seeds: u64) -> Result<Value> {
+    verify_representative_export(
+        vault,
+        source,
+        seeds,
+        &[
+            data::TwoWarmupManifest.record(0)?,
+            data::TwoWarmupManifest.record(1)?,
+        ],
+    )
+}
+fn verify_representative_export(
+    vault: &Path,
+    source: &Path,
+    seeds: u64,
+    additions: &[hermes_memory::MemoryRecord],
+) -> Result<Value> {
     ensure(
         (16..=data::MAX_SEED_RECORDS).contains(&seeds),
         "pilot seed count bound",
@@ -511,7 +553,9 @@ pub fn verify_pilot_export(vault: &Path, source: &Path, seeds: u64) -> Result<Va
                     exact_record(&mut reader, &data::representative_record(n)?)?;
                 }
             } else if slot == 16 {
-                exact_record(&mut reader, &known_record())?;
+                for addition in additions {
+                    exact_record(&mut reader, addition)?;
+                }
             } else {
                 exact_record(&mut reader, &snapshot)?;
             }
@@ -524,8 +568,226 @@ pub fn verify_pilot_export(vault: &Path, source: &Path, seeds: u64) -> Result<Va
     }
     ensure(seen.iter().all(|v| *v), "missing pilot session")?;
     Ok(
-        json!({"records":seeds+2,"sessions":18,"files":files,"exact_payloads_verified":true,"snapshot_payload_verified":true,"index_sha256":data::hash_file(&vault.join("Index.md"))?}),
+        json!({"records":seeds+1+additions.len() as u64,"sessions":18,"files":files,"exact_payloads_verified":true,"snapshot_payload_verified":true,"index_sha256":data::hash_file(&vault.join("Index.md"))?}),
     )
+}
+/// Internal ordinary-file seam: no native lifecycle or CLI admission is implied.
+#[allow(dead_code)] // Awaiting separately reviewed native case integration.
+pub fn execute_two_warmup_sandbox(
+    root: &Path,
+    epoch: &str,
+    deadline: std::time::Instant,
+    cancelled: fn() -> bool,
+    mut insert: impl FnMut(u32, u64, &[u8]) -> Result<(u64, u64)>,
+) -> Result<()> {
+    use contract::PilotPhase;
+    let manifest = data::TwoWarmupManifest;
+    let mut barrier = contract::OperationBarrier::new(root, epoch, 2)?;
+    for id in 0..data::TwoWarmupManifest::OPERATIONS {
+        let payload = manifest.payload(id)?;
+        let cli_epoch = manifest.cli_epoch(id)?;
+        barrier.publish(id, PilotPhase::Ready)?;
+        barrier.wait(
+            id,
+            PilotPhase::Release,
+            deadline.min(std::time::Instant::now() + Duration::from_secs(60)),
+            cancelled,
+        )?;
+        ensure(
+            !cancelled() && std::time::Instant::now() < deadline,
+            "warmup cancelled/expired before mutation",
+        )?;
+        // Unknown commit errors propagate without retry, Done, or a next operation.
+        let (inserted, duplicates) = insert(id, cli_epoch, &payload)?;
+        let receipt = contract::WarmupReceipt {
+            schema: 3,
+            operation_id: id,
+            cli_epoch,
+            payload,
+            inserted,
+            duplicates,
+        };
+        receipt.validate(id)?;
+        let value = serde_json::to_value(receipt)?;
+        ensure(
+            serde_json::to_vec_pretty(&value)?.len() < 65536,
+            "warmup receipt bound",
+        )?;
+        contract::json_new(
+            &root.join(format!("scratch/workload-op-{id}-receipt.json")),
+            &value,
+        )?;
+        barrier.publish(id, PilotPhase::Done)?;
+        // No search/export/scan or second mutation while awaiting ACK.
+        barrier.wait(
+            id,
+            PilotPhase::Acknowledged,
+            deadline.min(std::time::Instant::now() + Duration::from_secs(60)),
+            cancelled,
+        )?;
+    }
+    Ok(())
+}
+#[cfg(all(test, windows))]
+mod two_warmup_tests {
+    use super::*;
+    #[test]
+    fn two_real_inserts_require_exact_final_payload_oracles() {
+        exact_roundtrip(32768, true);
+    }
+    #[test]
+    fn representative_six_mib_two_warmup_sandbox_not_native_lifecycle() {
+        exact_roundtrip(6 * 1024 * 1024, false);
+    }
+    fn exact_roundtrip(target: u64, mutations: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let staged = temp.path().join("staged");
+        let generation = data::generate_with_spec(
+            &staged,
+            &data::FixtureSpec {
+                shape: data::FixtureShape::RepresentativeV2,
+                target_jsonl_bytes: target,
+            },
+        )
+        .unwrap();
+        let imported = temp.path().join("imported");
+        let store = hermes_memory::MemoryStore::open(&imported).unwrap();
+        store
+            .import_logical_archive_once(
+                BufReader::new(File::open(staged.join("archive.jsonl")).unwrap()),
+                generation["logical_sha256"].as_str().unwrap(),
+            )
+            .unwrap();
+        std::fs::create_dir(temp.path().join("scratch")).unwrap();
+        std::fs::create_dir(temp.path().join("controller")).unwrap();
+        drop(store);
+        std::thread::scope(|scope| {
+            let root = temp.path();
+            let imported = &imported;
+            let child = scope.spawn(move || {
+                let store = hermes_memory::MemoryStore::open(imported).unwrap();
+                execute_two_warmup_sandbox(
+                    root,
+                    "exact-fixture",
+                    std::time::Instant::now() + Duration::from_secs(10),
+                    contract::never_cancel,
+                    |_, _, payload| {
+                        let records: Vec<hermes_memory::MemoryRecord> =
+                            serde_json::from_slice(payload)?;
+                        let (a, b) = store.ingest_many(&records)?;
+                        Ok((a as u64, b as u64))
+                    },
+                )
+                .map_err(|e| e.to_string())
+            });
+            crate::controller::two_warmup_sandbox_intervals(
+                root,
+                "exact-fixture",
+                &imported.join("events.jsonl"),
+                std::time::Instant::now() + Duration::from_secs(10),
+                contract::never_cancel,
+                |_, _| Ok(Value::Null),
+            )
+            .unwrap();
+            child.join().unwrap().unwrap();
+        });
+        let store = hermes_memory::MemoryStore::open(&imported).unwrap();
+        store.prepare_export_index().unwrap();
+        let vault = temp.path().join("vault");
+        hermes_memory::client_export::render_markdown(&vault, WORKSPACE, |r| {
+            store
+                .export_page(r, "two-warmup-test")
+                .map_err(|e| hermes_memory::MemoryError::Io(std::io::Error::other(e.to_string())))
+        })
+        .unwrap();
+        drop(store);
+        let seeds = generation["seed_records"].as_u64().unwrap();
+        verify_two_warmup_projection(
+            &imported.join("events.jsonl"),
+            &staged.join("source/events.jsonl"),
+            seeds,
+        )
+        .unwrap();
+        verify_two_warmup_export(&vault, &staged.join("source/events.jsonl"), seeds).unwrap();
+        let sqlite =
+            crate::fixtures::verify_stopped_two_warmup(&imported.join("memory.db"), &generation)
+                .unwrap();
+        assert_eq!(sqlite["final_read_only_export"]["records"], seeds + 3);
+        assert_eq!(
+            data::inventory(&staged.join("source")).unwrap(),
+            generation["source_before"]
+        );
+        println!("two-warmup ordinary oracle: target={target} seeds={seeds} final={} native_handle_verified=false", seeds + 3);
+        if !mutations {
+            return;
+        }
+        let projection = imported.join("events.jsonl");
+        let original = fs::read_to_string(&projection).unwrap(); // Tiny mutation fixture only.
+        let source = staged.join("source/events.jsonl");
+        let lines: Vec<_> = original.lines().collect();
+        for mutation in 0..6 {
+            let mut changed = lines.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+            let last = changed.len() - 1;
+            match mutation {
+                0..=2 => {
+                    let mut record: hermes_memory::MemoryRecord =
+                        serde_json::from_str(&changed[last]).unwrap();
+                    match mutation {
+                        0 => record.content.push('x'),
+                        1 => record.metadata = json!({"tampered":true}),
+                        _ => record.id.push('x'),
+                    }
+                    changed[last] = serde_json::to_string(&record).unwrap();
+                }
+                3 => {
+                    changed.pop();
+                }
+                4 => {
+                    changed.push(changed[last].clone());
+                }
+                _ => {
+                    changed[last] = changed[last - 1].clone();
+                }
+            }
+            fs::write(&projection, format!("{}\n", changed.join("\n"))).unwrap();
+            assert!(
+                verify_two_warmup_projection(&projection, &source, seeds).is_err(),
+                "mutation {mutation}"
+            );
+        }
+        fs::write(&projection, original).unwrap();
+        let index = vault.join("Index.md");
+        let original_index = fs::read(&index).unwrap();
+        fs::write(&index, b"# Hermes Memory Vault\n\n").unwrap();
+        assert!(verify_two_warmup_export(&vault, &source, seeds).is_err());
+        fs::write(&index, original_index).unwrap();
+        let note = vault
+            .join("Sessions")
+            .join(pilot_segment(WORKSPACE))
+            .join(format!("{}.md", pilot_segment("benchmark-client")));
+        let original_note = fs::read_to_string(&note).unwrap();
+        fs::write(
+            &note,
+            original_note.replace("deterministic warmup 000001", "deterministic warmup 999999"),
+        )
+        .unwrap();
+        assert!(verify_two_warmup_export(&vault, &source, seeds).is_err());
+        fs::write(&note, original_note).unwrap();
+        let connection = rusqlite::Connection::open(imported.join("memory.db")).unwrap();
+        connection
+            .execute(
+                "UPDATE records SET content=?1 WHERE id=?2",
+                rusqlite::params!["tampered", data::TwoWarmupManifest.record(1).unwrap().id],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(crate::fixtures::verify_stopped_two_warmup(
+            &imported.join("memory.db"),
+            &generation
+        )
+        .is_err());
+        assert!(verify_two_warmup_projection(&projection, &source, seeds).is_ok());
+    }
 }
 fn snapshot_bytes() -> Result<Vec<u8>> {
     let s = data::snapshot();
@@ -609,7 +871,23 @@ fn execute(root: &Path, report: &mut Value) -> Result<()> {
     if let Some(pilot) = &job.pilot {
         pilot.validate()?;
     }
-    let insert_record = known_record();
+    let two_warmup = if root.join("two-warmup-job.json").try_exists()? {
+        let reader = hermes_memory::windows_enrollment::open_admin_owned_file(
+            &root.join("two-warmup-job.json"),
+            65536,
+        )?;
+        let mode: crate::two_warmup::TwoWarmupJob = serde_json::from_reader(reader)?;
+        mode.validate()?;
+        ensure(job.pilot.is_none(), "pilot/two-warmup mode conflict")?;
+        Some(mode)
+    } else {
+        None
+    };
+    let insert_record = if two_warmup.is_some() {
+        data::TwoWarmupManifest.record(0)?
+    } else {
+        known_record()
+    };
     ensure(
         job.case.install_root == root.join("install-small")
             && job.case.legacy_root == root.join("small/source"),
@@ -690,7 +968,51 @@ fn execute(root: &Path, report: &mut Value) -> Result<()> {
         .as_ref()
         .map(|pilot| contract::PilotBarrier::new(root, &pilot.epoch))
         .transpose()?;
-    let ingest = if let Some(barrier) = &mut barrier {
+    let ingest = if let Some(mode) = &two_warmup {
+        let args = job.case.client_args("ingest", &enroll)?;
+        let mut last = Value::Null;
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        report["schema"] = json!(4);
+        report["case"] = json!("representative-6MiB-two-warmup");
+        execute_two_warmup_sandbox(
+            root,
+            &mode.epoch,
+            deadline,
+            crate::scm::stop_requested,
+            |id, _, payload| {
+                let label = format!("warmup-op-{id}");
+                let receipt = crate::two_warmup::measured_insert(
+                    &contract::CommandRequest {
+                        exe: &job.client,
+                        args: &args,
+                        input: payload,
+                        directory: &scratch,
+                        label: &label,
+                        timeout: deadline
+                            .saturating_duration_since(std::time::Instant::now())
+                            .min(Duration::from_secs(45)),
+                        cancelled: crate::scm::stop_requested,
+                    },
+                    &mode.epoch,
+                    id,
+                )?;
+                let value = serde_json::to_value(&receipt)?;
+                ensure(
+                    serde_json::to_vec_pretty(&value)?.len() < 65536,
+                    "native receipt bound",
+                )?;
+                contract::json_new(&scratch.join(format!("warmup-op-{id}-native.json")), &value)?;
+                report["commands"]
+                    .as_array_mut()
+                    .ok_or("commands array")?
+                    .push(receipt.command.clone());
+                last = receipt.command;
+                Ok((receipt.warmup.inserted, receipt.warmup.duplicates))
+            },
+        )?;
+        report["two_warmup"] = json!({"schema":4,"case_epoch":mode.epoch,"expected_additions":2,"sampling_complete":false,"full_workload_complete":false,"performance_policy_status":"unapproved"});
+        last
+    } else if let Some(barrier) = &mut barrier {
         use contract::PilotPhase;
         // No source scans, export or subsequent broker command until C end sample.
         barrier.publish(PilotPhase::Ready)?;
@@ -744,7 +1066,7 @@ fn execute(root: &Path, report: &mut Value) -> Result<()> {
         "duplicate",
         "ingest",
         &[],
-        serde_json::to_vec(&known_record())?,
+        serde_json::to_vec(&insert_record)?,
         report,
     )?;
     ensure(
@@ -765,12 +1087,21 @@ fn execute(root: &Path, report: &mut Value) -> Result<()> {
     let found = call(
         "known-search",
         "search",
-        &["--query", "hmvsmallcanary", "--workspace", WORKSPACE],
+        &[
+            "--query",
+            if two_warmup.is_some() {
+                "deterministic warmup 000000"
+            } else {
+                "hmvsmallcanary"
+            },
+            "--workspace",
+            WORKSPACE,
+        ],
         vec![],
         report,
     )?;
     let found = contract::output(&found)?;
-    let expected_record = serde_json::to_value(known_record())?;
+    let expected_record = serde_json::to_value(&insert_record)?;
     ensure(
         found
             .as_array()
@@ -856,10 +1187,17 @@ fn execute(root: &Path, report: &mut Value) -> Result<()> {
         report,
     )?;
     ensure(
-        contract::output(&export)? == json!({"sessions":if job.pilot.is_some() {18} else {3}}),
+        contract::output(&export)?
+            == json!({"sessions":if job.pilot.is_some() || two_warmup.is_some() {18} else {3}}),
         "export session count",
     )?;
-    report["export"] = if job.pilot.is_some() {
+    report["export"] = if two_warmup.is_some() {
+        verify_two_warmup_export(
+            &vault,
+            &job.case.legacy_root.join("events.jsonl"),
+            job.seed_records,
+        )?
+    } else if job.pilot.is_some() {
         verify_pilot_export(
             &vault,
             &job.case.legacy_root.join("events.jsonl"),

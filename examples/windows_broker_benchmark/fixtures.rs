@@ -249,8 +249,6 @@ use std::path::Path;
 /// seed payloads are additionally checked against the deterministic fixture.
 /// This is deliberately NOT an arbitrary-operation-manifest or 600 MiB oracle.
 fn pilot_expected_sqlite_digest(generation: &Value, additions: u64) -> Result<String> {
-    use sha2::{Digest, Sha256};
-    use std::io::{BufRead, Read};
     let spec: crate::data::FixtureSpec =
         serde_json::from_value(generation["fixture_spec"].clone())?;
     ensure(
@@ -260,6 +258,21 @@ fn pilot_expected_sqlite_digest(generation: &Value, additions: u64) -> Result<St
     ensure(
         additions == 1,
         "SQLite oracle requires single known pilot addition; broader manifest unavailable",
+    )?;
+    representative_expected_sqlite_digest(generation, &[crate::client::known_record()])
+}
+fn representative_expected_sqlite_digest(
+    generation: &Value,
+    additions: &[hermes_memory::MemoryRecord],
+) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::{BufRead, Read};
+    let spec: crate::data::FixtureSpec =
+        serde_json::from_value(generation["fixture_spec"].clone())?;
+    spec.validate()?;
+    ensure(
+        spec.target_jsonl_bytes <= 6 * 1024 * 1024,
+        "small oracle target bound",
     )?;
     let seeds = generation["seed_records"].as_u64().ok_or("pilot seeds")?;
     ensure(
@@ -352,14 +365,15 @@ fn pilot_expected_sqlite_digest(generation: &Value, additions: u64) -> Result<St
                     #[serde(flatten)]
                     record: &'a hermes_memory::MemoryRecord,
                 }
-                let known = crate::client::known_record();
-                let mut addition = serde_json::to_vec(&Record {
-                    tag: "record",
-                    record: &known,
-                })?;
-                addition.push(b'\n');
-                ensure(addition.len() <= 4096, "pilot addition line bound")?;
-                expected.update(&addition);
+                for record in additions {
+                    let mut addition = serde_json::to_vec(&Record {
+                        tag: "record",
+                        record,
+                    })?;
+                    addition.push(b'\n');
+                    ensure(addition.len() <= 4096, "pilot addition line bound")?;
+                    expected.update(&addition);
+                }
                 phase = 1;
                 counters += 1;
             }
@@ -408,6 +422,18 @@ pub fn verify_stopped_import_with_expected(
     generation: &Value,
     expected_additions: u64,
 ) -> Result<Value> {
+    verify_stopped_import_inner(database, generation, expected_additions, false)
+}
+#[allow(dead_code)] // Internal sandbox only; no native/workflow admission.
+pub fn verify_stopped_two_warmup(database: &Path, generation: &Value) -> Result<Value> {
+    verify_stopped_import_inner(database, generation, 2, true)
+}
+fn verify_stopped_import_inner(
+    database: &Path,
+    generation: &Value,
+    expected_additions: u64,
+    two_warmups: bool,
+) -> Result<Value> {
     let initial = generation["records"].as_u64().ok_or("generation count")?;
     let expected = initial
         .checked_add(expected_additions)
@@ -437,7 +463,15 @@ pub fn verify_stopped_import_with_expected(
             "broker sidecars remain after stop; refuse immutable inspection",
         )?;
     }
-    let expected_payload = if generation.get("fixture_spec").is_some() {
+    let expected_payload = if two_warmups {
+        Some(representative_expected_sqlite_digest(
+            generation,
+            &[
+                crate::data::TwoWarmupManifest.record(0)?,
+                crate::data::TwoWarmupManifest.record(1)?,
+            ],
+        )?)
+    } else if generation.get("fixture_spec").is_some() {
         Some(pilot_expected_sqlite_digest(
             generation,
             expected_additions,
