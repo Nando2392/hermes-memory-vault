@@ -9,6 +9,7 @@ Import/discovery never enables tests. No services, adapters or installed images.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -221,9 +222,15 @@ class NativeLifecycle(unittest.TestCase):
         return child
 
     def blocked(self) -> None:
-        with self.assertRaises(OSError) as caught:
+        # CRT-backed open reports errno, not authoritative Win32 sharing evidence.
+        with self.assertRaises(PermissionError) as caught:
             with self.backup.open("rb"):
                 self.fail("retained native handle allowed ordinary open")
+        self.assertEqual(caught.exception.errno, errno.EACCES)
+        # Independently require the real CreateFileW boundary's sharing violation.
+        with self.assertRaises(OSError) as caught:
+            with self.api._Native().exclusive(self.backup):
+                self.fail("retained native handle allowed native exclusive open")
         self.assertEqual(caught.exception.winerror, 32)
 
     def sharing_timeout(self, expected, children, records) -> None:

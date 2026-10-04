@@ -12,7 +12,7 @@
     },
     {
       "path": "native_tests/drain_guard_lifecycle.py",
-      "sha256": "cafb0e827cf46c483e0f0c77c6e7923ae8308f25fe3460b7046f67780bd98cde"
+      "sha256": "8f4c0d576eb945afa74794914af5a9873381ac3a1453cd814110d0a79c1b240e"
     },
     {
       "path": "native_tests/evidence_safety.py",
