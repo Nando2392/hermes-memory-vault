@@ -1,0 +1,184 @@
+# Publication candidate only; not activated by preparation.
+# Exact commit, workflow and inventory pins come from fresh independent review.
+name: Reviewed DrainGuard native lifecycle (disposable only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      reviewed:
+        description: Fresh independent immutable source/workflow safety review completed
+        required: true
+        type: boolean
+        default: false
+      reviewed_commit:
+        description: Exact reviewed 40-character lowercase commit SHA
+        required: true
+        type: string
+      inventory_sha256:
+        description: Independently reviewed exact native_tests/source_inventory.json SHA256
+        required: true
+        type: string
+      workflow_sha256:
+        description: Independently reviewed exact published workflow SHA256
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: drain-guard-native-proof
+  cancel-in-progress: false
+
+jobs:
+  native:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/review/drain-guard-native-proof' &&
+      inputs.reviewed == true && inputs.reviewed_commit == github.sha
+    # Trust anchor: independently reviewed immutable workflow/source, authorized
+    # GitHub manual dispatch, read-only token and immutable checkout. Input/env
+    # checks are consistency only. No new environment or human approval gate.
+    runs-on: windows-2022
+    timeout-minutes: 6
+    env:
+      REVIEWED_COMMIT: ${{ inputs.reviewed_commit }}
+      INVENTORY_SHA256: ${{ inputs.inventory_sha256 }}
+      WORKFLOW_SHA256: ${{ inputs.workflow_sha256 }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+          clean: true
+      - name: Preflight reviewed bytes before executing any candidate Python
+        id: preflight
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw 'Disposable hosted runner required' }
+          if ($env:REVIEWED_COMMIT -cnotmatch '^[0-9a-f]{40}$') { throw 'Invalid reviewed commit' }
+          foreach ($digest in @($env:INVENTORY_SHA256, $env:WORKFLOW_SHA256)) {
+            if ($digest -cnotmatch '^[0-9a-f]{64}$') { throw 'Invalid reviewed SHA256' }
+          }
+          if ((git rev-parse HEAD) -cne $env:REVIEWED_COMMIT) { throw 'Wrong checkout' }
+          $workflow = '.github/workflows/windows-drain-guard-native-proof.yml'
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $workflow).Hash.ToLowerInvariant() -cne $env:WORKFLOW_SHA256) { throw 'Wrong workflow' }
+          $manifest = 'native_tests/source_inventory.json'
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $manifest).Hash.ToLowerInvariant() -cne $env:INVENTORY_SHA256) { throw 'Wrong inventory' }
+          $inventory = Get-Content -Raw -LiteralPath $manifest | ConvertFrom-Json
+          foreach ($entry in $inventory.files) {
+            if ($entry.path -match '(^/|\\|:|(^|/)\.\.(/|$))') { throw 'Unsafe inventory path' }
+            if ((Get-FileHash -Algorithm SHA256 -LiteralPath $entry.path).Hash.ToLowerInvariant() -cne $entry.sha256) { throw "Source mismatch: $($entry.path)" }
+          }
+          if (-not (Get-Command rustc -ErrorAction SilentlyContinue)) { throw 'Existing offline rustc required' }
+          if (-not (Get-Command python -ErrorAction SilentlyContinue)) { throw 'Existing Python 3.11+ required' }
+          'admitted=true' >> $env:GITHUB_OUTPUT
+      - name: Bound isolated owned-image lifecycle to 180 seconds
+        id: controller
+        if: ${{ steps.preflight.outcome == 'success' && steps.preflight.outputs.admitted == 'true' }}
+        timeout-minutes: 4
+        shell: python
+        run: |
+          import json, os, pathlib, shutil, subprocess, sys
+          root = pathlib.Path.cwd().resolve()
+          status = {
+              'schema_version': 1, 'state': 'error', 'exit_code': None,
+              'deadline_seconds': 180, 'kill_wait_complete': False,
+              'python_path': str(pathlib.Path(sys.executable).resolve()),
+              'python_version': sys.version.splitlines()[0],
+              'rustc_path': str(pathlib.Path(shutil.which('rustc')).resolve()),
+              'rustc_version': 'unavailable',
+              'source_path': str(root / 'native_tests/drain_guard_lifecycle.py'),
+              'workflow_path': str(root / '.github/workflows/windows-drain-guard-native-proof.yml'),
+          }
+          sys.path.insert(0, str(root))
+          from native_tests.evidence_safety import write_json_evidence, report_evidence_failure
+          code = 1
+          output = None
+          evidence_errors = []
+          try:
+              version = subprocess.check_output([status['rustc_path'], '--version'], timeout=5)
+              if len(version) > 1024:
+                  raise ValueError('Compiler version cap')
+              status['rustc_version'] = version.decode('utf-8').strip()
+              # Do not place output finalization in the primary wait exception handler.
+              output = (root / 'drain-native-controller.log').open('xb')
+              child = subprocess.Popen([
+                  sys.executable, '-I', '-B', 'native_tests/drain_guard_lifecycle.py',
+                  '--run-native', '--reviewed-commit', os.environ['REVIEWED_COMMIT'],
+                  '--inventory-sha256', os.environ['INVENTORY_SHA256'],
+                  '--workflow-sha256', os.environ['WORKFLOW_SHA256'],
+              ], stdin=subprocess.DEVNULL, stdout=output, stderr=output, shell=False)
+              try:
+                  code = child.wait(timeout=180)
+                  status.update(state='exited', exit_code=code, kill_wait_complete=True)
+              except subprocess.TimeoutExpired:
+                  status['state'] = 'timeout'
+                  child.kill()  # Retained controller handle only; images self-expire.
+                  status['exit_code'] = child.wait(timeout=5)
+                  status['kill_wait_complete'] = True
+                  code = status['exit_code'] or 1  # Timeout cannot prove cleanup.
+          except BaseException:
+              code = status['exit_code'] or 1
+          finally:
+              if output is not None:
+                  try:
+                      output.flush()
+                  except BaseException:
+                      evidence_errors.append('log_flush')
+                  try:
+                      output.close()
+                  except BaseException:
+                      evidence_errors.append('log_close')
+              status['evidence_errors'] = list(evidence_errors)
+              evidence_errors += write_json_evidence(
+                  root / 'drain-native-controller-status.json', status, 8192)
+              status['evidence_errors'] = list(evidence_errors)
+              if evidence_errors:
+                  report_evidence_failure('controller', status['state'], status['exit_code'], evidence_errors)
+                  code = code or 1
+          sys.exit(code)
+      - name: Record rejected admission without executing checkout code
+        id: admission_failure
+        if: ${{ always() && (steps.preflight.outcome != 'success' || steps.preflight.outputs.admitted != 'true') }}
+        shell: python
+        run: |
+          print('{"schema_version":1,"state":"admission_rejected","proof_pass":false}')
+      - name: Always collect bounded exact synthetic evidence
+        id: collection
+        if: ${{ always() && steps.preflight.outcome == 'success' && steps.preflight.outputs.admitted == 'true' }}
+        env:
+          CONTROLLER_OUTCOME: ${{ steps.controller.outcome }}
+        timeout-minutes: 1
+        shell: python
+        run: |
+          import pathlib, subprocess, sys
+          # Independent 20s collector deadline; failure cannot mask controller status.
+          child = subprocess.Popen([sys.executable, '-I', '-B', 'native_tests/evidence_safety.py'],
+                                   stdin=subprocess.DEVNULL, shell=False)
+          try:
+              code = child.wait(timeout=20)
+          except subprocess.TimeoutExpired:
+              child.kill()
+              child.wait(timeout=5)
+              code = 1
+          sys.exit(code)
+      - name: Retain only validated allowlisted evidence (never fixtures)
+        if: ${{ always() && steps.preflight.outcome == 'success' && steps.preflight.outputs.admitted == 'true' && steps.collection.outputs.fresh == 'true' }}
+        timeout-minutes: 1
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2, authoritative upstream commit
+        with:
+          name: drain-guard-native-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            target/drain-native-collected/controller.log
+            target/drain-native-collected/controller-status.json
+            target/drain-native-collected/result.json
+            target/drain-native-collected/collection.json
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 6
+          overwrite: false
+          include-hidden-files: false

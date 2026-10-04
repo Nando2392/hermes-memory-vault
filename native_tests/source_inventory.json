@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "scope": "Minimum runtime execution closure; independent inventory/workflow/commit review pins required. Not authentication. Audit inventory retained separately.",
+  "files": [
+    {
+      "path": "installer/__init__.py",
+      "sha256": "5adb06e7893c0a404ecd2296f9460866e274f0b8fbc367a4f71f39b32a245e04"
+    },
+    {
+      "path": "installer/windows_image_cutover.py",
+      "sha256": "d2cbb40c2b1bebd6f5da66c0e112c6ab64de5c4af6d19132b6e207a97cd68ebe"
+    },
+    {
+      "path": "native_tests/drain_guard_lifecycle.py",
+      "sha256": "cafb0e827cf46c483e0f0c77c6e7923ae8308f25fe3460b7046f67780bd98cde"
+    },
+    {
+      "path": "native_tests/evidence_safety.py",
+      "sha256": "b242c0720a0a2a6235f3f274724306f4a29c45400282db5990022adce6194d4e"
+    },
+    {
+      "path": "native_tests/owned_image_child.rs",
+      "sha256": "e9c600f067ebf925b575330008d435abd8946725d2ca674ab2713d2e3f8a7a3f"
+    }
+  ]
+}
