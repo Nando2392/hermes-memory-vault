@@ -632,6 +632,54 @@ pub fn execute_two_warmup_sandbox(
 mod two_warmup_tests {
     use super::*;
     #[test]
+    fn known_search_remains_exact_after_two_warmups() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = hermes_memory::MemoryStore::open(temp.path()).unwrap();
+        let first = data::TwoWarmupManifest.record(0).unwrap();
+        let search = |query: &str| {
+            serde_json::to_value(
+                store
+                    .search(&hermes_memory::SearchRequest {
+                        query: query.into(),
+                        workspace: Some(WORKSPACE.into()),
+                        session_id: None,
+                        limit: 8,
+                        max_bytes: 4096,
+                    })
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let expected = json!([first]);
+        assert_eq!(
+            store.ingest_many(std::slice::from_ref(&first)).unwrap(),
+            (1, 0)
+        );
+        assert_eq!(search(known_search_query(true)), expected);
+        let second = data::TwoWarmupManifest.record(1).unwrap();
+        assert_eq!(store.ingest_many(&[second.clone()]).unwrap(), (1, 0));
+        // Match the native worker's whole-record and cardinality oracle, not just IDs.
+        let found = search(known_search_query(true));
+        assert_eq!(
+            found, expected,
+            "known search exact record mismatch after second warmup"
+        );
+        let broad = search("deterministic warmup 000000");
+        assert_eq!(broad.as_array().unwrap().len(), 2);
+        assert!(broad
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::to_value(&first).unwrap()));
+        assert!(broad
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::to_value(&second).unwrap()));
+        assert_eq!(store.ingest_many(&[first]).unwrap(), (0, 1));
+        assert_eq!(search(known_search_query(true)), expected);
+        assert_eq!(store.ingest_many(&[known_record()]).unwrap(), (1, 0));
+        assert_eq!(search(known_search_query(false)), json!([known_record()]));
+    }
+    #[test]
     fn two_real_inserts_require_exact_final_payload_oracles() {
         exact_roundtrip(32768, true);
     }
@@ -787,6 +835,15 @@ mod two_warmup_tests {
         )
         .is_err());
         assert!(verify_two_warmup_projection(&projection, &source, seeds).is_ok());
+    }
+}
+fn known_search_query(two_warmup: bool) -> &'static str {
+    if two_warmup {
+        // Search ORs tokens: shared "deterministic warmup" words match both
+        // records. The standalone ordinal selects only operation zero.
+        "000000"
+    } else {
+        "hmvsmallcanary"
     }
 }
 fn snapshot_bytes() -> Result<Vec<u8>> {
@@ -1089,11 +1146,7 @@ fn execute(root: &Path, report: &mut Value) -> Result<()> {
         "search",
         &[
             "--query",
-            if two_warmup.is_some() {
-                "deterministic warmup 000000"
-            } else {
-                "hmvsmallcanary"
-            },
+            known_search_query(two_warmup.is_some()),
             "--workspace",
             WORKSPACE,
         ],

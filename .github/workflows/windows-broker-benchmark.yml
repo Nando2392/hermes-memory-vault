@@ -89,7 +89,7 @@ jobs:
               provenance['source_sha256'] = source_digest
               # Frozen native two-warmup build-input inventory; NOT inherited approval.
               # This exact combined source/workflow requires independent review.
-              if source_digest != 'dd60d011325afdaa1deaba7b38778f011bee42e0a6f517a3bb447485086d76ca':
+              if source_digest != 'e6d8e65245bf5c5b09ad2aa16b77d68bc106165bb7b51cd81661f35fdfb2ee49':
                   raise RuntimeError('Build inputs differ from frozen native two-warmup snapshot')
               provenance['workflow_sha256'] = digest(root / '.github/workflows/windows-broker-benchmark.yml')
               provenance['gate_pass'] = True
