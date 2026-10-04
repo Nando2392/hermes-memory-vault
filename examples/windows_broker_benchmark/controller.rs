@@ -953,16 +953,21 @@ fn native_two_warmup_intervals(
                 let receipt: crate::two_warmup::NativeReceipt = serde_json::from_slice(&bytes)?;
                 receipt.validate(epoch, id)?;
                 let label = format!("warmup-op-{id}");
+                let mismatches = crate::two_warmup::installed_command_mismatches(
+                    &receipt.command,
+                    &job.client,
+                    &job.case
+                        .client_args("ingest", &contract::text(&job.enrollment)?)?,
+                    root,
+                    id,
+                );
+                if !mismatches.is_empty() {
+                    report["metrics"]["native_intervals"][id as usize]
+                        ["command_correlation_failure"] =
+                        json!({"operation_id":id,"mismatched_fields":mismatches});
+                }
                 ensure(
-                    receipt.command["exe"] == json!(job.client)
-                        && receipt.command["args"]
-                            == json!(job
-                                .case
-                                .client_args("ingest", &contract::text(&job.enrollment)?)?)
-                        && receipt.command["stdout_file"]
-                            == json!(root.join(format!("scratch/{label}.stdout")))
-                        && receipt.command["stderr_file"]
-                            == json!(root.join(format!("scratch/{label}.stderr"))),
+                    mismatches.is_empty(),
                     "native installed command correlation mismatch",
                 )?;
                 let mut captured =
