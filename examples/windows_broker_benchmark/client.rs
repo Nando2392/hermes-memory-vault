@@ -149,7 +149,7 @@ mod pilot_tests {
     #[test]
     fn ordinary_legacy_export_retains_permissive_index_and_root() {
         let temp = tempfile::tempdir().unwrap();
-        let store = hermes_memory::MemoryStore::open(&temp.path().join("source")).unwrap();
+        let store = hermes_memory::MemoryStore::open(temp.path().join("source")).unwrap();
         store.ingest_snapshot(&data::snapshot()).unwrap();
         for n in 0..16 {
             store.ingest(&data::record(n)).unwrap();
@@ -657,7 +657,10 @@ mod two_warmup_tests {
         );
         assert_eq!(search(known_search_query(true)), expected);
         let second = data::TwoWarmupManifest.record(1).unwrap();
-        assert_eq!(store.ingest_many(&[second.clone()]).unwrap(), (1, 0));
+        assert_eq!(
+            store.ingest_many(std::slice::from_ref(&second)).unwrap(),
+            (1, 0)
+        );
         // Match the native worker's whole-record and cardinality oracle, not just IDs.
         let found = search(known_search_query(true));
         assert_eq!(
@@ -910,11 +913,20 @@ pub fn verify_export(vault: &Path, seeds: u64) -> Result<Value> {
 pub fn worker(root: &Path) -> Result<()> {
     let scratch = root.join("scratch");
     let mut report = json!({"schema":1,"pass":false,"commands":[]});
+    let full_mode = root.join("full-workload-job.json").try_exists()?;
     let result = execute(root, &mut report);
     if let Err(ref e) = result {
         report["error"] = json!(e.to_string());
     }
     report["pass"] = json!(result.is_ok());
+    if full_mode {
+        let publication = (|| -> Result<()> {
+            let full = crate::full_native::FullReport::from_observations(&report, false)?;
+            crate::full_native::write_report_bounded(&scratch.join("client-result.json"), &full)?;
+            contract::json_new(&scratch.join("client-done.json"), &json!({"complete":true}))
+        })();
+        return crate::full_native::preserve_primary(result, publication);
+    }
     // Completion marker is separate: controller never consumes partially written JSON.
     contract::json_new(&scratch.join("client-result.json"), &report)?;
     contract::json_new(&scratch.join("client-done.json"), &json!({"complete":true}))?;
@@ -936,6 +948,18 @@ fn execute(root: &Path, report: &mut Value) -> Result<()> {
         let mode: crate::two_warmup::TwoWarmupJob = serde_json::from_reader(reader)?;
         mode.validate()?;
         ensure(job.pilot.is_none(), "pilot/two-warmup mode conflict")?;
+        Some(mode)
+    } else {
+        None
+    };
+    let full_workload = if root.join("full-workload-job.json").try_exists()? {
+        let reader = hermes_memory::windows_enrollment::open_admin_owned_file(
+            &root.join("full-workload-job.json"),
+            65536,
+        )?;
+        let mode: crate::full_native::FullWorkloadJob = serde_json::from_reader(reader)?;
+        mode.validate(&job)?;
+        ensure(two_warmup.is_none(), "full/two-warmup mode conflict")?;
         Some(mode)
     } else {
         None
@@ -982,6 +1006,42 @@ fn execute(root: &Path, report: &mut Value) -> Result<()> {
     let before = data::inventory(&job.case.legacy_root)?;
     let scratch = root.join("scratch");
     let enroll = contract::text(&job.enrollment)?;
+    if let Some(mode) = &full_workload {
+        let manifest =
+            crate::full_manifest::FullManifest::new(mode.workload_spec, mode.seed_records)?;
+        let adapter = crate::full_workload_receipt::Adapter {
+            root,
+            case: &job.case,
+            enrollment: &enroll,
+            epoch: &mode.case_epoch,
+            timeout: Duration::from_secs(45),
+            cancelled: crate::scm::stop_requested,
+        };
+        let mut commands = Vec::with_capacity(64);
+        let outcome = crate::full_native::execute_installed_peer(
+            &adapter,
+            &manifest,
+            std::time::Instant::now() + Duration::from_secs(300),
+            &mut commands,
+        );
+        report["schema"] = json!(5);
+        report["case"] = json!("representative-6MiB-full20x256-v1");
+        report["case_epoch"] = json!(mode.case_epoch);
+        report["seed_records"] = json!(mode.seed_records);
+        report["commands"] = json!(commands);
+        report["workload_complete"] = json!(outcome.is_ok());
+        report["measurement_complete"] = json!(false);
+        report["sampling_complete"] = json!(false);
+        report["performance_complete"] = json!(false);
+        report["performance_policy_status"] = json!("unapproved");
+        report["release_ready"] = json!(false);
+        outcome?;
+        ensure(
+            before == data::inventory(&job.case.legacy_root)?,
+            "full worker source changed",
+        )?;
+        return Ok(()); // Never append the legacy mutation/diagnostic tail to full64.
+    }
     let call = |label: &str,
                 operation: &str,
                 extra: &[&str],

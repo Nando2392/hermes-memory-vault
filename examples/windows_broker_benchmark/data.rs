@@ -7,7 +7,7 @@ const MAX_SEED_BATCH_RECORDS: u64 = 256;
 const MAX_SEED_FRAME_BYTES: u64 = 2_097_152;
 
 #[allow(dead_code)]
-fn validate_seed_batch(batch: &[MemoryRecord], prior: u64) -> Result<u64> {
+pub(crate) fn validate_seed_batch(batch: &[MemoryRecord], prior: u64) -> Result<u64> {
     let end = prior
         .checked_add(batch.len() as u64)
         .ok_or("seed count overflow")?;

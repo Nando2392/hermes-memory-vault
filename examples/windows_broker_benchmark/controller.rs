@@ -493,10 +493,15 @@ pub fn run(options: Options) -> Result<()> {
             "executable roles must be distinct",
         )?;
         let pins = json!({"broker":data::hash_file(&broker)?,"client":data::hash_file(&client)?,"admin":data::hash_file(&admin)?});
-        let mut result_file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(options.result.as_deref().ok_or("result path")?)?;
+        let result_path = options.result.as_deref().ok_or("result path")?;
+        let mut result_file = if options.representative_full_workload {
+            crate::full_native::reserve_report(result_path)?
+        } else {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(result_path)?
+        };
         let mut report = json!({"schema":1,"case":"small-6MiB","pass":false,"administrator":administrator,"executable_sha256":pins,"commands":[],"metrics":{"measured":false,"reason":"small correctness case; no 600 MiB or process-IO claim"},"fixture_disposal":"retained for hosted VM disposal; no recursive cleanup"});
         if options.representative_small_pilot {
             report["schema"] = json!(2);
@@ -515,11 +520,19 @@ pub fn run(options: Options) -> Result<()> {
             &mut report,
             options.representative_small_pilot,
             options.representative_two_warmup,
+            options.representative_full_workload,
         );
         if let Err(ref e) = outcome {
             report["error"] = json!(e.to_string());
         }
         report["pass"] = json!(outcome.is_ok());
+        if options.representative_full_workload {
+            let publication = (|| -> Result<()> {
+                let full = crate::full_native::FullReport::from_observations(&report, true)?;
+                crate::full_native::write_report_bounded(result_path, &full)
+            })();
+            return crate::full_native::preserve_primary(outcome, publication);
+        }
         serde_json::to_writer_pretty(&mut result_file, &report)?;
         result_file.write_all(b"\n")?;
         result_file.sync_all()?;
@@ -534,6 +547,7 @@ fn small(
     report: &mut Value,
     pilot: bool,
     two_warmup: bool,
+    full_workload: bool,
 ) -> Result<()> {
     let mut fixture = crate::scm::Fixture::create(true, true)?;
     let root = fixture.root().to_owned();
@@ -561,7 +575,7 @@ fn small(
     let mut observed = None;
     let mut generation = Value::Null;
     let operation = (|| -> Result<()> {
-        generation = if pilot || two_warmup {
+        generation = if pilot || two_warmup || full_workload {
             data::generate_with_spec(
                 &root.join("small"),
                 &data::FixtureSpec::representative_6_mib(),
@@ -666,8 +680,31 @@ fn small(
                 },
             )?;
         }
+        if full_workload {
+            let mode = crate::full_native::FullWorkloadJob {
+                schema: 1,
+                protocol: crate::full_native::FullJobProtocol::Full20x256NativeJobV1,
+                case_epoch: fixture.client_name().to_owned(),
+                fixture_spec: data::FixtureSpec::representative_6_mib(),
+                workload_spec: crate::full_manifest::WorkloadSpec::full20x256_v1(),
+                seed_records: job.seed_records,
+            };
+            mode.validate(&job)?;
+            contract::json_new(&root.join("full-workload-job.json"), &mode)?;
+        }
         contract::json_new(&root.join("job.json"), &job)?;
         report["client_start"] = fixture.start_client()?;
+        if full_workload {
+            crate::full_native::controller_native_intervals(
+                &root,
+                fixture.client_name(),
+                &fixture,
+                observed.as_ref().ok_or("missing retained C")?,
+                &job,
+                &generation,
+                report,
+            )?;
+        }
         if two_warmup {
             native_two_warmup_intervals(
                 &root,
@@ -687,7 +724,7 @@ fn small(
                 report,
             )?;
         }
-        let deadline = Instant::now() + Duration::from_secs(360);
+        let deadline = Instant::now() + Duration::from_secs(if full_workload { 60 } else { 360 });
         while !root.join("scratch/client-done.json").exists() {
             ensure(
                 Instant::now() < deadline,
@@ -700,8 +737,21 @@ fn small(
             )?;
             std::thread::sleep(Duration::from_millis(100));
         }
-        let mut file = open_client_report(&root.join("scratch/client-result.json"))?;
-        report["client"] = read_client_report(&mut file)?;
+        if full_workload {
+            report["client"] =
+                crate::full_native::read_report(&root.join("scratch/client-result.json"))?;
+            crate::full_native::validate_report(
+                &report["client"],
+                fixture.client_name(),
+                job.seed_records,
+                report["metrics"]["controller_retained_commands"]
+                    .as_array()
+                    .ok_or("full retained commands")?,
+            )?;
+        } else {
+            let mut file = open_client_report(&root.join("scratch/client-result.json"))?;
+            report["client"] = read_client_report(&mut file)?;
+        }
         report["client_observation"] = fixture.observe_client()?;
         if pilot || two_warmup {
             let commands = report["client"]["commands"]
@@ -782,7 +832,17 @@ fn small(
         report["broker_exit"]["exited"] == true && report["broker_exit"]["exit_code"] == 0,
         "C did not stop cleanly",
     )?;
-    report["startup_import"] = if two_warmup {
+    report["startup_import"] = if full_workload {
+        let manifest = crate::full_manifest::FullManifest::new(
+            crate::full_manifest::WorkloadSpec::full20x256_v1(),
+            generation["seed_records"].as_u64().ok_or("full seeds")?,
+        )?;
+        crate::full_oracles::verify_stopped_sqlite(
+            &install.join("store/memory.db"),
+            &generation,
+            &manifest,
+        )?
+    } else if two_warmup {
         crate::fixtures::verify_stopped_two_warmup(&install.join("store/memory.db"), &generation)?
     } else if pilot {
         crate::fixtures::verify_stopped_import_with_expected(
@@ -797,6 +857,24 @@ fn small(
         data::inventory(&root.join("small/source"))? == generation["source_before"],
         "source changed after shutdown",
     )?;
+    if full_workload {
+        let manifest = crate::full_manifest::FullManifest::new(
+            crate::full_manifest::WorkloadSpec::full20x256_v1(),
+            generation["seed_records"].as_u64().ok_or("full seeds")?,
+        )?;
+        report["final_payloads"] = crate::full_oracles::verify_projection(
+            &install.join("store/events.jsonl"),
+            &root.join("small/source/events.jsonl"),
+            &manifest,
+        )?;
+        report["export"] = crate::full_oracles::verify_export(
+            &root.join("scratch/export"),
+            &root.join("small/source/events.jsonl"),
+            &manifest,
+        )?;
+        report["workload_complete"] = json!(true);
+        report["correctness_complete"] = json!(true);
+    }
     if two_warmup {
         report["final_payloads"] = crate::client::verify_two_warmup_projection(
             &install.join("store/events.jsonl"),

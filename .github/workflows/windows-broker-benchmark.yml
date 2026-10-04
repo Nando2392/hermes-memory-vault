@@ -13,7 +13,7 @@ on:
         type: choice
         required: true
         default: small
-        options: [small, representative-small-pilot, representative-two-warmup]
+        options: [small, representative-small-pilot, representative-two-warmup, representative-full6]
       reviewed:
         description: 'Independent source AND workflow review completed; disposable 6 MiB only'
         type: boolean
@@ -55,7 +55,7 @@ jobs:
           def digest(path):
               return hashlib.sha256(path.read_bytes()).hexdigest()
           try:
-              if os.environ.get('BENCHMARK_CASE') not in ('small', 'representative-small-pilot', 'representative-two-warmup'):
+              if os.environ.get('BENCHMARK_CASE') not in ('small', 'representative-small-pilot', 'representative-two-warmup', 'representative-full6'):
                   raise RuntimeError('Unsupported benchmark case; only disposable 6 MiB allowed')
               expected = {
                   'GITHUB_ACTIONS': 'true', 'RUNNER_ENVIRONMENT': 'github-hosted',
@@ -87,10 +87,10 @@ jobs:
               provenance['source_files'] = inventory
               source_digest = hashlib.sha256(json.dumps(inventory, separators=(',', ':')).encode()).hexdigest()
               provenance['source_sha256'] = source_digest
-              # Frozen native two-warmup build-input inventory; NOT inherited approval.
+              # Frozen minimal full64 build-input inventory; NOT inherited approval.
               # This exact combined source/workflow requires independent review.
-              if source_digest != 'e6d8e65245bf5c5b09ad2aa16b77d68bc106165bb7b51cd81661f35fdfb2ee49':
-                  raise RuntimeError('Build inputs differ from frozen native two-warmup snapshot')
+              if source_digest != 'ce454dbb3ed455483752bcdc2ada21c8e9c4d573a255dea8b7a5ceecd5f9f2ed':
+                  raise RuntimeError('Build inputs differ from frozen full64 snapshot')
               provenance['workflow_sha256'] = digest(root / '.github/workflows/windows-broker-benchmark.yml')
               provenance['gate_pass'] = True
           except Exception as error:
@@ -154,7 +154,7 @@ jobs:
               require(exact_equal(inventory, provenance['source_files']) and digest == provenance['source_sha256'], 'Build source changed since pinned preflight')
               return digest
           def selected_case(value):
-              require(value in ('small', 'representative-small-pilot', 'representative-two-warmup'), 'Unsupported 6 MiB case')
+              require(value in ('small', 'representative-small-pilot', 'representative-two-warmup', 'representative-full6'), 'Unsupported 6 MiB case')
               return value
           def exact_equal(left, right):
               # Python structural equality aliases bool/int/float; preserve JSON representation.
@@ -322,8 +322,144 @@ jobs:
               final = report['final_payloads']
               require(final['exact_records_including_metadata_verified'] is True and uint(final['records']) and final['records'] == report['generation']['seed_records'] + 3 and uint(final['bytes']) and final['bytes'] == previous_projection['after_bytes'] and final['bytes'] <= 8388608 and final['verification'] == 'post-stop, sequential streaming, outside measurement', 'Final exact JSONL oracle')
               return {'correctness_pass': True, 'measurement_status': 'incomplete-two-warmup', 'sampling_complete': False, 'full_workload_complete': False, 'performance_policy_status': 'unapproved', 'performance_complete': False}
+          def closed(value, fields, context):
+              require(type(value) is dict and set(value) == set(fields.split()), context + ' closed fields')
+          def full_descriptor(id):
+              # Mirror the pinned Full20x256V1 producer, including JSON-array stdin vs JSONL.
+              source = id - 20 if 42 <= id < 62 else id
+              first, count = (source, 1) if source < 22 else (22 + (source - 22) * 256, 256) if source < 42 else (0, 0)
+              records = []
+              for ordinal in range(first, first + count):
+                  text = f'ordinary full20x256-v1 mutation {ordinal:06} '
+                  records.append({'id': f'benchmark-full20x256-v1-{ordinal:06}', 'session_id': 'benchmark-client', 'workspace': 'disposable-benchmark', 'kind': 'user', 'content': (text * (2048 // len(text) + 1))[:2048], 'timestamp': 1720000000.0 + ordinal, 'metadata': {'ordinal': ordinal, 'workload': 'full20x256-v1'}})
+              encode = lambda value: json.dumps(value, separators=(',', ':')).encode()
+              snapshot = {'items': [{'content': 'snapshot benchmark reference', 'kind': 'user', 'metadata': {'fixture': True}, 'timestamp': 1600000000.0}], 'session_id': 'benchmark-snapshot', 'workspace': 'disposable-benchmark'}
+              payload = encode(records) if id < 62 else encode(snapshot) if id == 62 else b''
+              inserted = count if id < 42 else 0
+              return {'id': id, 'cli_epoch': 3 + id, 'stage': 'warmup' if id < 2 else 'single' if id < 22 else 'batch' if id < 42 else 'dedup' if id < 62 else 'unchanged-snapshot' if id == 62 else 'export', 'records': count, 'inserted': inserted, 'duplicates': count if 42 <= id < 62 else 0, 'replay_source': id - 20 if 42 <= id < 62 else None, 'payload_bytes': len(payload), 'appended_jsonl_bytes': sum(len(encode(r)) + 1 for r in records) if inserted else 0, 'sessions': 18 if id == 63 else None}
+          def full_statistics(values):
+              values = sorted(values)
+              return None if not values else {'count': len(values), 'p50': values[(len(values)*50+99)//100-1], 'p95': values[(len(values)*95+99)//100-1], 'worst': values[-1]}
+          def strict_json(raw):
+              def pairs(items):
+                  result = {}
+                  for key, value in items:
+                      require(key not in result, 'Duplicate JSON key')
+                      result[key] = value
+                  return result
+              def constant(value):
+                  raise RuntimeError('Nonfinite JSON number')
+              return json.loads(raw, object_pairs_hook=pairs, parse_constant=constant)
+          def validate_full_report(report, pins):
+              closed(report, 'schema role case case_epoch workload_spec seed_records additions final_records sessions commands controller_retained_commands operations source_oracle import_oracle projection_oracle export_oracle correctness_complete workload_complete measurement_complete sampling_complete native_handle_verified performance_policy_status performance_complete release_ready pass error diagnostics', 'Full report')
+              require(exact_equal(report['schema'], 5) and report['role'] == 'Controller' and report['case'] == 'representative-6MiB-full20x256-v1', 'Full schema/role/case')
+              require(exact_equal(report['workload_spec'], {'schema': 1, 'kind': 'Full20x256V1'}), 'Full manifest namespace')
+              for key in ('correctness_complete', 'workload_complete', 'native_handle_verified', 'pass'):
+                  require(report[key] is True, 'Full required success evidence')
+              for key in ('measurement_complete', 'sampling_complete', 'performance_complete', 'release_ready'):
+                  require(report[key] is False, 'Full boundary-only measurement is incomplete')
+              require(report['performance_policy_status'] == 'unapproved' and report['error'] is None, 'Full error/policy')
+              seeds = report['seed_records']
+              require(uint(seeds) and 16 <= seeds <= 400000 and exact_equal(report['additions'], 5142) and exact_equal(report['sessions'], 18) and uint(report['final_records']) and report['final_records'] == seeds + 5143, 'Full record totals')
+              diag = report['diagnostics']
+              require(type(diag) is dict and diag.get('source_unchanged') is True and diag.get('client_registration_deleted') is True and 'error' not in diag, 'Full source/cleanup diagnostics')
+              require(exact_equal(diag['executable_sha256'], {role: pins[role] for role in ('admin', 'broker', 'client')}), 'Full executable pins')
+              root = diag['fixture']['root']
+              epoch = report['case_epoch']
+              require(isinstance(root, str) and 1 <= len(root.encode()) <= 32768 and isinstance(epoch, str) and 1 <= len(epoch.encode()) <= 256 and all(c.isascii() and (c.isalnum() or c == '-') for c in epoch) and epoch == diag['fixture']['client_service'], 'Full root/case epoch')
+              enroll = diag['plan']['enrollment']
+              require(isinstance(enroll, str) and 1 <= len(enroll.encode()) <= 32768, 'Full enrollment path')
+              generation = diag['generation']
+              require(exact_equal(generation['fixture_spec'], {'shape':'representative-v2', 'target_jsonl_bytes':6291456}) and exact_equal(generation['seed_records'], seeds) and exact_equal(generation['records'], seeds+1), 'Full6 fixture only')
+              for value in (diag['client_stop']['process']['exit_code'], diag['client_stop']['scm_exit_code'], diag['broker_exit']['exit_code'], diag['broker_after']['pinned_process']['exit_code']):
+                  require(exact_equal(value, 0), 'Full clean exit')
+              require(diag['client_stop']['process']['exited'] is True and diag['broker_exit']['exited'] is True and diag['broker_before']['pinned_process']['exited'] is False and diag['broker_after']['pinned_process']['exited'] is True, 'Full retained lifecycle')
+              require(bool(diag['broker_before']['initial_identity']) and exact_equal(diag['broker_before']['initial_identity'], diag['broker_after']['initial_identity']) and exact_equal(diag['broker_before']['name'], diag['broker_after']['name']), 'Full same retained broker')
+              commands, retained, operations = report['commands'], report['controller_retained_commands'], report['operations']
+              require(type(commands) is list and type(retained) is list and type(operations) is list and len(commands) == len(retained) == len(operations) == 64 and exact_equal(commands, retained), 'Full exact ordered64 preACK retention')
+              previous = None
+              appended = 0
+              for id, (command, evidence) in enumerate(zip(commands, operations)):
+                  descriptor = full_descriptor(id)
+                  closed(evidence, 'operation_id cli_epoch descriptor before_release after_done receipt_validated exact_append_verified', 'Full boundary')
+                  require(exact_equal(evidence['operation_id'], id) and exact_equal(evidence['cli_epoch'], 3+id) and exact_equal(evidence['descriptor'], descriptor) and evidence['receipt_validated'] is True and evidence['exact_append_verified'] is True, 'Full descriptor/receipt correlation')
+                  closed(command, 'exe args exit_code success child_exited capture_complete spawn_error capture_error kill_error wait_error stdout_overflow stderr_overflow timed_out stop_requested elapsed_us stdout stderr stdout_file stderr_file measurement', 'Full measured command')
+                  require(len(json.dumps(command, separators=(',', ':')).encode()) <= 131072, 'Full command byte cap')
+                  require(exact_equal(command['exit_code'], 0) and uint(command['elapsed_us']) and command['elapsed_us'] <= 60000000, 'Full command exit/time')
+                  for key in ('success','child_exited','capture_complete'):
+                      require(command[key] is True, 'Full command completeness')
+                  for key in ('stdout_overflow','stderr_overflow','timed_out','stop_requested'):
+                      require(command[key] is False, 'Full command timeout/capture')
+                  for key in ('spawn_error','capture_error','kill_error','wait_error'):
+                      require(command[key] is None, 'Full command infrastructure error')
+                  expected_args = ['--enrollment', enroll, 'snapshot' if id == 62 else 'export' if id == 63 else 'ingest', '--root', root + '\\small/source']
+                  if id == 63:
+                      expected_args += ['--workspace','disposable-benchmark','--vault',root + '\\scratch\\export']
+                  require(command['exe'] == root + '\\install-small\\bin/hermes-memory-client.exe' and exact_equal(command['args'], expected_args), 'Full exact installed executable/argv; no normalization')
+                  for stream in ('stdout','stderr'):
+                      require(isinstance(command[stream], str) and len(command[stream].encode()) <= 1048576 and command[stream+'_file'] == root + f'\\scratch\\full20x256-v1-op-{id}.{stream}', 'Full exact capture path/text')
+                  expected = {'sessions':18} if id == 63 else {'inserted':descriptor['inserted'], 'duplicates':descriptor['duplicates']}
+                  require(exact_equal(strict_json(command['stdout']), expected), 'Full stage acknowledgement')
+                  m = command['measurement']
+                  validate_measurement(m, descriptor['payload_bytes'], id)
+                  require(m['live_samples'] > 0 and m['live_errors'] == 0 and m['memory'] is not None and m['final_lifetime_logical_io'] is not None and m['final_io_error'] is None and m['child_exit_us'] <= min(command['elapsed_us'], 45000000), 'Full required complete CLI evidence')
+                  before, after = evidence['before_release'], evidence['after_done']
+                  for observation, is_after in ((before,False),(after,True)):
+                      closed(observation, 'broker_epoch supervisor_epoch cli_epoch broker supervisor broker_logical_io_delta supervisor_logical_io_delta handshake_span_us', 'Full observation')
+                      require(exact_equal(observation['broker_epoch'],1) and exact_equal(observation['supervisor_epoch'],2) and exact_equal(observation['cli_epoch'],3+id), 'Full retained epochs')
+                      for role in ('broker','supervisor'):
+                          process_sample(observation[role])
+                          delta = observation[role+'_logical_io_delta']
+                          if is_after:
+                              logical_io(delta)
+                              require(all(after[role]['logical_io'][key] >= before[role]['logical_io'][key] and delta[key] == after[role]['logical_io'][key]-before[role]['logical_io'][key] for key in delta), 'Full checked retained IO delta')
+                              if previous is not None:
+                                  require(all(before[role]['logical_io'][key] >= previous[role]['logical_io'][key] for key in delta), 'Full cross-operation retained counters')
+                          else:
+                              require(delta is None, 'Full baseline explicit null delta')
+                      require(uint(observation['handshake_span_us']) if is_after else observation['handshake_span_us'] is None, 'Full observation phase duration')
+                  previous = after
+                  appended += descriptor['appended_jsonl_bytes']
+              source, imported, projection, exported = (report[key] for key in ('source_oracle','import_oracle','projection_oracle','export_oracle'))
+              closed(source, 'source_unchanged archive_sha256 logical_sha256 records source_inventory', 'Full source oracle')
+              require(source['source_unchanged'] is True and exact_equal(source['records'], seeds+1) and sha(source['archive_sha256']) and sha(source['logical_sha256']), 'Full source identity')
+              inventory = source['source_inventory']
+              require(type(inventory) is dict and 1 <= len(inventory) <= 16 and all(isinstance(k,str) for k in inventory), 'Full source inventory')
+              for file in inventory.values():
+                  closed(file, 'bytes sha256', 'Full source file')
+                  require(uint(file['bytes']) and sha(file['sha256']), 'Full source file digest')
+              require(exact_equal(inventory,generation['source_before']) and exact_equal(inventory,generation['source_after']) and source['logical_sha256'] == generation['logical_sha256'] and source['archive_sha256'] == generation['archive_sha256'], 'Full source oracle/generation correlation')
+              initial = inventory['events.jsonl']['bytes']
+              require(6291456 <= initial <= 7340032, 'Full6 source projection bound')
+              closed(imported, 'persisted_startup_receipt final_read_only_export expected_final_logical_sha256', 'Full import oracle')
+              for name, count, digest in (('persisted_startup_receipt',seeds+1,source['logical_sha256']),('final_read_only_export',seeds+5143,imported['expected_final_logical_sha256'])):
+                  receipt = imported[name]
+                  closed(receipt, 'records snapshot_states snapshot_counters logical_sha256', 'Full logical receipt')
+                  require(exact_equal(receipt['records'],count) and exact_equal(receipt['snapshot_states'],1) and exact_equal(receipt['snapshot_counters'],1) and sha(digest) and receipt['logical_sha256'] == digest, 'Full streaming SQLite logical oracle')
+              closed(projection, 'records bytes exact_records_including_metadata_verified', 'Full projection oracle')
+              require(exact_equal(projection['records'],seeds+5143) and uint(projection['bytes']) and projection['bytes'] == initial+appended and projection['exact_records_including_metadata_verified'] is True, 'Full streaming JSONL bytes/records oracle')
+              closed(exported, 'records sessions files exact_payloads_verified snapshot_payload_verified index_sha256', 'Full export oracle')
+              require(exact_equal(exported['records'],seeds+5143) and exact_equal(exported['sessions'],18) and exported['exact_payloads_verified'] is True and exported['snapshot_payload_verified'] is True and sha(exported['index_sha256']), 'Full stopped export oracle')
+              files = exported['files']
+              require(type(files) is list and len(files) == 18, 'Full export membership count')
+              segment = lambda value: value+'-'+hashlib.sha256(value.encode()).hexdigest()[:16]
+              sessions = ['benchmark-client']+[f'benchmark-seed-{n:02}' for n in range(16)]+['benchmark-snapshot']
+              expected_paths = {root+'\\scratch/export\\Sessions\\'+segment('disposable-benchmark')+'\\'+segment(session)+'.md' for session in sessions}
+              actual_paths = []
+              for file in files:
+                  closed(file, 'path bytes sha256', 'Full export file')
+                  require(isinstance(file['path'],str) and uint(file['bytes']) and 0 < file['bytes'] <= 20971520 and sha(file['sha256']), 'Full export file digest')
+                  actual_paths.append(file['path'])
+              require(len(set(actual_paths)) == 18 and set(actual_paths) == expected_paths, 'Full exact canonical session path set')
+              stages = {}
+              for stage, ids in (('warmup',range(2)),('single',range(2,22)),('batch',range(22,42)),('dedup',range(42,62)),('unchanged-snapshot',range(62,63)),('export',range(63,64))):
+                  samples = [commands[id]['measurement'] for id in ids]
+                  stages[stage] = {'count':len(samples), 'child_exit_us':full_statistics([m['child_exit_us'] for m in samples]), 'logical_io':{key:full_statistics([m['final_lifetime_logical_io'][key] for m in samples]) for key in samples[0]['final_lifetime_logical_io']}}
+              return {'correctness_pass':True, 'measurement_status':'incomplete-full64-boundary-only', 'workload_complete':True, 'measurement_complete':False, 'sampling_complete':False, 'performance_policy_status':'unapproved', 'performance_complete':False, 'release_ready':False, 'stage_summaries':stages, 'streaming_oracles':{'source_records':source['records'], 'final_records':projection['records'], 'projection_bytes':projection['bytes'], 'final_logical_sha256':imported['expected_final_logical_sha256'], 'sessions':exported['sessions'], 'index_sha256':exported['index_sha256']}}
           def validate_report(report, case, pins):
               selected_case(case)
+              if case == 'representative-full6':
+                  return validate_full_report(report, pins)
               pilot = case == 'representative-small-pilot'
               two_warmup = case == 'representative-two-warmup'
               require(type(report.get('schema')) is int and report['schema'] == (4 if two_warmup else 2 if pilot else 1) and report.get('case') == ('representative-6MiB-two-warmup' if two_warmup else 'representative-6MiB-pilot' if pilot else 'small-6MiB'), 'Controller schema/case mismatch')
@@ -472,6 +608,8 @@ jobs:
                   args.append('--representative-small-pilot')
               elif case == 'representative-two-warmup':
                   args.append('--representative-two-warmup')
+              elif case == 'representative-full6':
+                  args.append('--representative-full-workload')
               status['argv'] = args
               # No shell, PID search, tree kill, service cleanup or ACL repair.
               # On Windows Popen.kill uses ONLY this retained direct-child handle.
@@ -515,7 +653,7 @@ jobs:
                   raise RuntimeError('Controller result exceeds 16 MiB evidence/validation cap')
               status['source_after_sha256'] = verify_source(root, provenance)
               require(status['source_before_sha256'] == status['source_after_sha256'], 'Source changed during invocation')
-              report = json.loads(raw)
+              report = strict_json(raw)
               status.update(validate_report(report, os.environ.get('BENCHMARK_CASE'), pins))
               status['case'] = report['case']
               status['validated'] = True

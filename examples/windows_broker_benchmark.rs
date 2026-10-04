@@ -16,6 +16,15 @@ mod controller;
 mod data;
 #[path = "windows_broker_benchmark/fixtures.rs"]
 mod fixtures;
+#[path = "windows_broker_benchmark/full_manifest.rs"]
+#[allow(dead_code)] // Retain the separately tested pure continuation helpers.
+mod full_manifest;
+#[path = "windows_broker_benchmark/full_workload_barrier.rs"]
+#[allow(dead_code)] // Full-only protocol; admission remains in controller/worker.
+mod full_workload_barrier;
+#[path = "windows_broker_benchmark/full_workload_receipt.rs"]
+#[allow(dead_code)] // Shared receipt validation for installed and injected runners.
+mod full_workload_receipt;
 #[path = "windows_broker_benchmark/policy.rs"]
 mod hosted_policy;
 #[path = "windows_broker_benchmark/two_warmup.rs"]
@@ -74,10 +83,17 @@ pub struct Options {
     /// Two measured deterministic warmups only; not the full steady-state workload.
     #[arg(long, conflicts_with = "representative_small_pilot")]
     representative_two_warmup: bool,
+    /// Exactly Full20x256V1 with a representative 6 MiB seed; no performance approval.
+    #[arg(long, conflicts_with_all = ["representative_small_pilot", "representative_two_warmup"])]
+    representative_full_workload: bool,
     /// Unsupported by this small-case controller; never silently ignored.
     #[arg(long)]
     large_mib: Option<u64>,
 }
+#[path = "windows_broker_benchmark/full_native.rs"]
+mod full_native;
+#[path = "windows_broker_benchmark/full_oracles.rs"]
+mod full_oracles;
 fn main() {
     if let Err(error) = entry() {
         eprintln!("benchmark refused/failed: {error}");
