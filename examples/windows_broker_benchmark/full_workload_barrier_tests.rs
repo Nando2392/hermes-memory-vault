@@ -30,6 +30,143 @@ fn wait(b: &mut FullBarrier<'_>, id: u32, phase: Phase) {
     .unwrap();
 }
 #[test]
+fn cadence_poll_fault_is_terminal_after_actual_missing_without_ack_or_retry() {
+    let dir = root();
+    let m = FullManifest::new(WorkloadSpec::full20x256_v1(), 16).unwrap();
+    let mut c = FullBarrier::new(dir.path(), "run", Role::Controller, &m).unwrap();
+    let mut calls = 0;
+    let error = c
+        .wait_with_poll(
+            0,
+            Phase::Ready,
+            Instant::now() + Duration::from_secs(5),
+            || false,
+            || {
+                calls += 1;
+                Err("injected retained query fault".into())
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.to_string(), "injected retained query fault");
+    assert_eq!(calls, 1);
+    assert_eq!(c.next, 0);
+    assert!(!c.path(0, Phase::ValidatedAck).exists());
+}
+
+#[test]
+fn cadence_callback_fault_checks_cancellation_before_sleep() {
+    use std::cell::Cell;
+    let dir = root();
+    let m = FullManifest::new(WorkloadSpec::full20x256_v1(), 16).unwrap();
+    let mut c = FullBarrier::new(dir.path(), "run", Role::Controller, &m).unwrap();
+    let cancelled = Cell::new(false);
+    let mut checks = 0;
+    let error = c
+        .wait_with_poll(
+            0,
+            Phase::Ready,
+            Instant::now() + Duration::from_secs(5),
+            || {
+                checks += 1;
+                cancelled.get()
+            },
+            || {
+                cancelled.set(true);
+                Err("injected late query fault".into())
+            },
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("cancelled"));
+    assert_eq!(checks, 3);
+    assert_eq!(c.next, 0);
+}
+
+#[test]
+fn cadence_cancellation_after_future_scan_prevents_observer_attempt() {
+    let dir = root();
+    let m = FullManifest::new(WorkloadSpec::full20x256_v1(), 16).unwrap();
+    let mut c = FullBarrier::new(dir.path(), "run", Role::Controller, &m).unwrap();
+    let mut checks = 0;
+    let result = c.wait_with_poll(
+        0,
+        Phase::Ready,
+        Instant::now() + Duration::from_secs(5),
+        || {
+            checks += 1;
+            checks > 1
+        },
+        || panic!("cancelled before observer acquisition"),
+    );
+    assert!(result.unwrap_err().to_string().contains("cancelled"));
+    assert_eq!(checks, 2);
+    assert_eq!(c.next, 0);
+}
+
+#[test]
+fn cadence_done_poll_timeout_dominates_late_query_failure_without_advancement() {
+    let dir = root();
+    let m = FullManifest::new(WorkloadSpec::full20x256_v1(), 16).unwrap();
+    let mut p = FullBarrier::new(dir.path(), "run", Role::Peer, &m).unwrap();
+    let mut c = FullBarrier::new(dir.path(), "run", Role::Controller, &m).unwrap();
+    p.publish(0, Phase::Ready).unwrap();
+    wait(&mut c, 0, Phase::Ready);
+    c.publish(0, Phase::Release).unwrap();
+    wait(&mut p, 0, Phase::Release);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut calls = 0;
+    let error = c
+        .wait_with_poll(
+            0,
+            Phase::Done,
+            deadline,
+            || false,
+            || {
+                calls += 1;
+                std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                Err("injected late query failure".into())
+            },
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("timed out"));
+    assert_eq!(calls, 1);
+    assert_eq!(c.next, 2);
+    assert!(!c.path(0, Phase::ValidatedAck).exists());
+    assert!(!c.path(1, Phase::Release).exists());
+}
+
+#[test]
+fn cadence_immediate_done_and_stale_done_never_call_missing_observer() {
+    for stale in [false, true] {
+        let dir = root();
+        let m = FullManifest::new(WorkloadSpec::full20x256_v1(), 16).unwrap();
+        let mut p = FullBarrier::new(dir.path(), "run", Role::Peer, &m).unwrap();
+        let mut c = FullBarrier::new(dir.path(), "run", Role::Controller, &m).unwrap();
+        p.publish(0, Phase::Ready).unwrap();
+        wait(&mut c, 0, Phase::Ready);
+        c.publish(0, Phase::Release).unwrap();
+        wait(&mut p, 0, Phase::Release);
+        p.publish(0, Phase::Done).unwrap();
+        if stale {
+            let path = p.path(0, Phase::Done);
+            let mut message: Message =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            message.epoch = "stale".into();
+            std::fs::write(path, serde_json::to_vec(&message).unwrap()).unwrap();
+        }
+        let result = c.wait_with_poll(
+            0,
+            Phase::Done,
+            Instant::now() + Duration::from_secs(5),
+            || false,
+            || panic!("existing Done is not NotFound"),
+        );
+        assert_eq!(result.is_err(), stale);
+        assert_eq!(c.next, if stale { 2 } else { 3 });
+        assert!(!c.path(0, Phase::ValidatedAck).exists());
+    }
+}
+
+#[test]
 fn exactly_64_operations_require_validated_receipt_before_next_release() {
     let dir = root();
     let m = FullManifest::new(WorkloadSpec::full20x256_v1(), 16).unwrap();
@@ -498,16 +635,32 @@ fn timeout_is_observed_after_real_missing_message_and_future_wait_fails_closed()
     let dir = root();
     let mut c = FullBarrier::new(dir.path(), "run", Role::Controller, &m).unwrap();
     let mut polls = 0;
+    let start = Instant::now();
+    let deadline = start + Duration::from_millis(40);
+    let missing_observed = std::cell::Cell::new(false);
     assert!(c
-        .wait(
+        .wait_with_clock(
             0,
             Phase::Ready,
-            Instant::now() + Duration::from_millis(40),
+            deadline,
             || false,
-            || polls += 1
+            || {
+                polls += 1;
+                missing_observed.set(true);
+                Ok(())
+            },
+            // Scheduling and the closed-namespace scan cannot consume this
+            // logical deadline before the actual NotFound callback. Expire
+            // exactly at the unchanged40ms boundary, not by cancellation.
+            || if missing_observed.get() {
+                deadline
+            } else {
+                start
+            },
         )
         .is_err());
-    assert!(polls > 0);
+    assert!(missing_observed.get());
+    assert_eq!(polls, 1);
     assert_eq!(c.next, 0);
     let future = c.path(63, Phase::Done);
     std::fs::write(&future, b"future").unwrap();

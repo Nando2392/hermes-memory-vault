@@ -23,6 +23,20 @@ pub enum Phase {
     Done,
     ValidatedAck,
 }
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PUBLICATION_FAULT: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+#[cfg(test)]
+fn publication_fixture(phase: Phase, edge: u8) -> Result<()> {
+    if phase == Phase::ValidatedAck && PUBLICATION_FAULT.with(|fault| fault.get() == Some(edge)) {
+        return Err(
+            std::io::Error::other(format!("owned ACK publication fixture edge {edge}")).into(),
+        );
+    }
+    Ok(())
+}
+
 const PHASES: [Phase; 4] = [
     Phase::Ready,
     Phase::Release,
@@ -181,10 +195,18 @@ impl<'a> FullBarrier<'a> {
             .write(true)
             .create_new(true)
             .open(&staging)?;
+        #[cfg(test)]
+        publication_fixture(phase, 0)?;
         file.write_all(&bytes)?;
+        #[cfg(test)]
+        publication_fixture(phase, 1)?;
         file.sync_all()?;
         drop(file);
+        #[cfg(test)]
+        publication_fixture(phase, 2)?;
         std::fs::hard_link(staging, destination)?;
+        #[cfg(test)]
+        publication_fixture(phase, 3)?;
         self.next += 1;
         Ok(())
     }
@@ -212,6 +234,16 @@ impl<'a> FullBarrier<'a> {
         validate_command: impl FnOnce(&Operation, &[u8], &R) -> Result<Ack>,
         mut cancelled: impl FnMut() -> bool,
     ) -> Result<()> {
+        self.acknowledge_observed(id, receipt, validate_command, &mut cancelled, |_| Ok(()))
+    }
+    pub fn acknowledge_observed<R>(
+        &mut self,
+        id: u32,
+        receipt: &R,
+        validate_command: impl FnOnce(&Operation, &[u8], &R) -> Result<Ack>,
+        mut cancelled: impl FnMut() -> bool,
+        mut publication: impl FnMut(crate::full_workload_receipt::AckEvent) -> Result<()>,
+    ) -> Result<()> {
         self.ordered(id, Phase::ValidatedAck)?;
         ensure(
             self.role == Role::Controller,
@@ -223,7 +255,16 @@ impl<'a> FullBarrier<'a> {
         let ack = validate_command(&op, &payload, receipt)?;
         ensure(ack == self.expected_ack(id)?, "full receipt ACK mismatch")?;
         ensure(!cancelled(), "full barrier cancelled")?;
-        self.publish_message(id, Phase::ValidatedAck, Some(ack))
+        use crate::full_workload_receipt::AckEvent;
+        publication(AckEvent::Attempt)?;
+        let result = self.publish_message(id, Phase::ValidatedAck, Some(ack));
+        let observation = publication(if result.is_ok() {
+            AckEvent::Confirmed
+        } else {
+            AckEvent::Unknown
+        });
+        result?;
+        observation
     }
     /// missing() runs ONLY after an actual NotFound observation; callers can use
     /// explicit events to prove withheld messages without sleep/startup guesses.
@@ -233,10 +274,37 @@ impl<'a> FullBarrier<'a> {
         id: u32,
         phase: Phase,
         deadline: Instant,
-        mut cancelled: impl FnMut() -> bool,
+        cancelled: impl FnMut() -> bool,
         mut missing: impl FnMut(),
     ) -> Result<()> {
-        let now = Instant::now();
+        self.wait_with_poll(id, phase, deadline, cancelled, || {
+            missing();
+            Ok(())
+        })
+    }
+    /// Fallible observer work is terminal: never retry it or advance the cursor.
+    pub fn wait_with_poll(
+        &mut self,
+        id: u32,
+        phase: Phase,
+        deadline: Instant,
+        cancelled: impl FnMut() -> bool,
+        missing: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        self.wait_with_clock(id, phase, deadline, cancelled, missing, Instant::now)
+    }
+    // Same filesystem/ordering/deadline checks; tests control only the clock,
+    // not admission, namespace scanning, or the missing-message observation.
+    fn wait_with_clock(
+        &mut self,
+        id: u32,
+        phase: Phase,
+        deadline: Instant,
+        mut cancelled: impl FnMut() -> bool,
+        mut missing: impl FnMut() -> Result<()>,
+        mut clock: impl FnMut() -> Instant,
+    ) -> Result<()> {
+        let now = clock();
         ensure(
             deadline > now && deadline.duration_since(now) <= Duration::from_secs(60),
             "full barrier deadline bound",
@@ -244,7 +312,7 @@ impl<'a> FullBarrier<'a> {
         ensure(phase.owner() != self.role, "full barrier wrong observer")?;
         loop {
             ensure(
-                !cancelled() && Instant::now() < deadline,
+                !cancelled() && clock() < deadline,
                 "full barrier cancelled or timed out",
             )?;
             self.validate_files(id, phase)?;
@@ -263,15 +331,27 @@ impl<'a> FullBarrier<'a> {
                     let message: Message = serde_json::from_slice(&bytes)?;
                     self.validate(&message, id, phase)?;
                     ensure(
-                        !cancelled() && Instant::now() < deadline,
+                        !cancelled() && clock() < deadline,
                         "full barrier cancelled or timed out",
                     )?;
                     self.next += 1;
                     return Ok(());
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    missing();
-                    thread::sleep(Duration::from_millis(2));
+                    ensure(
+                        !cancelled() && clock() < deadline,
+                        "full barrier cancelled or timed out",
+                    )?;
+                    let observation = missing();
+                    ensure(
+                        !cancelled() && clock() < deadline,
+                        "full barrier cancelled or timed out",
+                    )?;
+                    observation?;
+                    thread::sleep(
+                        Duration::from_millis(2)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
                 }
                 Err(e) => return Err(e.into()),
             }

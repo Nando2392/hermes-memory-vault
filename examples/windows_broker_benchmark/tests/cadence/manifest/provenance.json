@@ -1,0 +1,35 @@
+{
+  "schema": 1,
+  "classification": "Portable ordinary pre-setup observation conversions and exact genuine shared Unknown-ACK two-field mutation; validator proof only, not native lifecycle evidence",
+  "controls": {
+    "pre-setup.json": {
+      "producer": "FullReport::from_observations",
+      "input": {
+        "pass": false,
+        "error": "ordinary pre-setup failure"
+      },
+      "controller": true
+    },
+    "post-generation.json": {
+      "producer": "FullReport::from_observations",
+      "input": {
+        "pass": false,
+        "error": "ordinary post-generation setup failure",
+        "generation": {
+          "seed_records": 16
+        }
+      },
+      "controller": true
+    }
+  },
+  "retained-seed-null.json": {
+    "control": "../case-closure/owner-control.json",
+    "mutation": {
+      "seed_records": null,
+      "final_records": null
+    },
+    "sha256": "0e9fd44e2fc8585b6a07c4784ce4cb80c41473f4b0ed79812c7d8ff1a95cba2d",
+    "rust_error": "retained receipt manifest missing"
+  },
+  "no_runtime_fixture_environment_or_absolute_path_dependency": true
+}

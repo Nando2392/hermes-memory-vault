@@ -549,6 +549,7 @@ fn small(
     two_warmup: bool,
     full_workload: bool,
 ) -> Result<()> {
+    use crate::full_native::{observed_case_action, CaseAction};
     let mut fixture = crate::scm::Fixture::create(true, true)?;
     let root = fixture.root().to_owned();
     report["fixture"] = json!({"root":root,"client_service":fixture.client_name(),"client_sid":fixture.client_sid()});
@@ -724,35 +725,53 @@ fn small(
                 report,
             )?;
         }
-        let deadline = Instant::now() + Duration::from_secs(if full_workload { 60 } else { 360 });
-        while !root.join("scratch/client-done.json").exists() {
-            ensure(
-                Instant::now() < deadline,
-                "B worker completion deadline; evidence retained",
-            )?;
-            let current = fixture.observe_client()?;
-            ensure(
-                current["process"]["exited"] != true,
-                "B exited before completion",
-            )?;
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        observed_case_action(report, full_workload, CaseAction::WorkerWait, |_| {
+            let deadline =
+                Instant::now() + Duration::from_secs(if full_workload { 60 } else { 360 });
+            while !root.join("scratch/client-done.json").exists() {
+                ensure(
+                    Instant::now() < deadline,
+                    "B worker completion deadline; evidence retained",
+                )?;
+                let current = fixture.observe_client()?;
+                ensure(
+                    current["process"]["exited"] != true,
+                    "B exited before completion",
+                )?;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Ok(())
+        })?;
         if full_workload {
-            report["client"] =
-                crate::full_native::read_report(&root.join("scratch/client-result.json"))?;
-            crate::full_native::validate_report(
-                &report["client"],
-                fixture.client_name(),
-                job.seed_records,
-                report["metrics"]["controller_retained_commands"]
-                    .as_array()
-                    .ok_or("full retained commands")?,
-            )?;
+            observed_case_action(report, true, CaseAction::WorkerRead, |report| {
+                report["client"] =
+                    crate::full_native::read_report(&root.join("scratch/client-result.json"))?;
+                crate::full_native::validate_report(
+                    &report["client"],
+                    fixture.client_name(),
+                    job.seed_records,
+                    report["metrics"]["controller_retained_commands"]
+                        .as_array()
+                        .ok_or("full retained commands")?,
+                )?;
+                Ok(())
+            })?;
         } else {
             let mut file = open_client_report(&root.join("scratch/client-result.json"))?;
             report["client"] = read_client_report(&mut file)?;
         }
-        report["client_observation"] = fixture.observe_client()?;
+        observed_case_action(
+            report,
+            full_workload,
+            CaseAction::WorkerObservation,
+            |report| {
+                report["client_observation"] = fixture.observe_client()?;
+                ensure(
+                    report["client"]["pass"] == true,
+                    "B client validation failed; see nested report",
+                )
+            },
+        )?;
         if pilot || two_warmup {
             let commands = report["client"]["commands"]
                 .as_array()
@@ -780,40 +799,59 @@ fn small(
             report["client"]["pass"] == true,
             "B client validation failed; see nested report",
         )?;
-        ensure(
-            data::inventory(&root.join("small/source"))? == generation["source_before"],
-            "source changed during broker/client operations",
+        observed_case_action(
+            report,
+            full_workload,
+            CaseAction::SourceBeforeStop,
+            |report| {
+                ensure(
+                    data::inventory(&root.join("small/source"))? == generation["source_before"],
+                    "source changed during broker/client operations",
+                )?;
+                report["source_unchanged"] = json!(true);
+                Ok(())
+            },
         )?;
-        report["source_unchanged"] = json!(true);
         Ok(())
     })();
+    crate::full_native::observed_case_operation_failure(
+        report,
+        full_workload,
+        operation.as_ref().err().map(|e| &**e),
+    )?;
     // Always attempt bounded cooperative stops using only owned service capabilities.
-    let b_stop = fixture.stop_client();
+    let b_stop = observed_case_action(report, full_workload, CaseAction::StopClient, |_| {
+        fixture.stop_client()
+    });
     report["client_stop"] = match &b_stop {
         Ok(v) => v.clone(),
         Err(e) => json!({"error":e.to_string()}),
     };
-    let c_stop = if prepared {
-        admin_call(
-            &admin,
-            &receipt_args("stop", &receipt)?,
-            &logs,
-            "stop",
-            report,
-        )
-        .map(Some)
-    } else {
-        Ok(None)
-    };
+    let c_stop = observed_case_action(report, full_workload, CaseAction::StopBroker, |report| {
+        if prepared {
+            admin_call(
+                &admin,
+                &receipt_args("stop", &receipt)?,
+                &logs,
+                "stop",
+                report,
+            )
+            .map(Some)
+        } else {
+            Ok(None)
+        }
+    });
     report["broker_stop"] = match &c_stop {
         Ok(v) => json!(v),
         Err(e) => json!({"error":e.to_string()}),
     };
-    let c_exit = if let Some(tracked) = &observed {
-        tracked.wait_exit(Duration::from_secs(30)).map(Some)
-    } else {
-        Ok(None)
-    };
+    let c_exit = observed_case_action(report, full_workload, CaseAction::WaitBrokerExit, |_| {
+        if let Some(tracked) = &observed {
+            tracked.wait_exit(Duration::from_secs(30)).map(Some)
+        } else {
+            Ok(None)
+        }
+    });
     report["broker_exit"] = match &c_exit {
         Ok(v) => json!(v),
         Err(e) => json!({"error":e.to_string()}),
@@ -822,58 +860,76 @@ fn small(
     b_stop?;
     c_stop?;
     c_exit?;
-    ensure(
-        report["client_stop"]["process"]["exited"] == true
-            && report["client_stop"]["process"]["exit_code"] == 0
-            && report["client_stop"]["scm_exit_code"] == 0,
-        "B did not stop cleanly",
-    )?;
-    ensure(
-        report["broker_exit"]["exited"] == true && report["broker_exit"]["exit_code"] == 0,
-        "C did not stop cleanly",
-    )?;
-    report["startup_import"] = if full_workload {
-        let manifest = crate::full_manifest::FullManifest::new(
-            crate::full_manifest::WorkloadSpec::full20x256_v1(),
-            generation["seed_records"].as_u64().ok_or("full seeds")?,
+    observed_case_action(report, full_workload, CaseAction::CleanExits, |report| {
+        ensure(
+            report["client_stop"]["process"]["exited"] == true
+                && report["client_stop"]["process"]["exit_code"] == 0
+                && report["client_stop"]["scm_exit_code"] == 0,
+            "B did not stop cleanly",
         )?;
-        crate::full_oracles::verify_stopped_sqlite(
-            &install.join("store/memory.db"),
-            &generation,
-            &manifest,
-        )?
-    } else if two_warmup {
-        crate::fixtures::verify_stopped_two_warmup(&install.join("store/memory.db"), &generation)?
-    } else if pilot {
-        crate::fixtures::verify_stopped_import_with_expected(
-            &install.join("store/memory.db"),
-            &generation,
-            1,
-        )?
-    } else {
-        crate::fixtures::verify_stopped_import(&install.join("store/memory.db"), &generation)?
-    };
-    ensure(
-        data::inventory(&root.join("small/source"))? == generation["source_before"],
-        "source changed after shutdown",
-    )?;
+        ensure(
+            report["broker_exit"]["exited"] == true && report["broker_exit"]["exit_code"] == 0,
+            "C did not stop cleanly",
+        )?;
+        Ok(())
+    })?;
+    report["startup_import"] =
+        observed_case_action(report, full_workload, CaseAction::StoppedSqlite, |_| {
+            Ok(if full_workload {
+                let manifest = crate::full_manifest::FullManifest::new(
+                    crate::full_manifest::WorkloadSpec::full20x256_v1(),
+                    generation["seed_records"].as_u64().ok_or("full seeds")?,
+                )?;
+                crate::full_oracles::verify_stopped_sqlite(
+                    &install.join("store/memory.db"),
+                    &generation,
+                    &manifest,
+                )?
+            } else if two_warmup {
+                crate::fixtures::verify_stopped_two_warmup(
+                    &install.join("store/memory.db"),
+                    &generation,
+                )?
+            } else if pilot {
+                crate::fixtures::verify_stopped_import_with_expected(
+                    &install.join("store/memory.db"),
+                    &generation,
+                    1,
+                )?
+            } else {
+                crate::fixtures::verify_stopped_import(
+                    &install.join("store/memory.db"),
+                    &generation,
+                )?
+            })
+        })?;
+    observed_case_action(report, full_workload, CaseAction::SourceAfterStop, |_| {
+        ensure(
+            data::inventory(&root.join("small/source"))? == generation["source_before"],
+            "source changed after shutdown",
+        )
+    })?;
     if full_workload {
         let manifest = crate::full_manifest::FullManifest::new(
             crate::full_manifest::WorkloadSpec::full20x256_v1(),
             generation["seed_records"].as_u64().ok_or("full seeds")?,
         )?;
-        report["final_payloads"] = crate::full_oracles::verify_projection(
-            &install.join("store/events.jsonl"),
-            &root.join("small/source/events.jsonl"),
-            &manifest,
-        )?;
-        report["export"] = crate::full_oracles::verify_export(
-            &root.join("scratch/export"),
-            &root.join("small/source/events.jsonl"),
-            &manifest,
-        )?;
+        report["final_payloads"] =
+            observed_case_action(report, true, CaseAction::Projection, |_| {
+                crate::full_oracles::verify_projection(
+                    &install.join("store/events.jsonl"),
+                    &root.join("small/source/events.jsonl"),
+                    &manifest,
+                )
+            })?;
+        report["export"] = observed_case_action(report, true, CaseAction::Export, |_| {
+            crate::full_oracles::verify_export(
+                &root.join("scratch/export"),
+                &root.join("small/source/events.jsonl"),
+                &manifest,
+            )
+        })?;
         report["workload_complete"] = json!(true);
-        report["correctness_complete"] = json!(true);
     }
     if two_warmup {
         report["final_payloads"] = crate::client::verify_two_warmup_projection(
@@ -889,13 +945,25 @@ fn small(
             generation["seed_records"].as_u64().ok_or("seed count")?,
         )?;
     }
-    report["broker_after"] = observed
-        .as_ref()
-        .ok_or("no broker observation")?
-        .observation()?;
+    report["broker_after"] = observed_case_action(
+        report,
+        full_workload,
+        CaseAction::FinalBrokerObservation,
+        |_| {
+            observed
+                .as_ref()
+                .ok_or("no broker observation")?
+                .observation()
+        },
+    )?;
     // Delete only the retained stopped B registration; files and C remain for VM disposal.
-    fixture.delete_client()?;
+    observed_case_action(report, full_workload, CaseAction::DeleteClient, |_| {
+        fixture.delete_client()
+    })?;
     report["client_registration_deleted"] = json!(true);
+    if full_workload {
+        report["correctness_complete"] = json!(true);
+    }
     Ok(())
 }
 #[cfg(all(windows, feature = "experimental-broker"))]

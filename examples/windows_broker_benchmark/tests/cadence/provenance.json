@@ -1,0 +1,82 @@
+{
+  "synthetic_test_assets_only": true,
+  "assets": [
+    {
+      "path": "examples/windows_broker_benchmark/tests/cadence/clock-oracle.json",
+      "source": "C:\\Users\\fjmn2\\Dev\\hr-final-001\\home\\profiles\\coding-devops\\cache\\scratch\\cadence-correctness-review\\clock-oracle.json",
+      "bytes": 792069,
+      "sha256": "14419deeba1cd13b509ac8291ecabb6741dc3071b7719b79420106986fa47893",
+      "scan": "JSON parsed; credential-pattern scan clear; synthetic ordinary/fixture report or seeded clock oracle, no live userdata"
+    },
+    {
+      "path": "examples/windows_broker_benchmark/tests/cadence/actual_genuine_retained_unknown_ack.json",
+      "source": "C:\\Users\\fjmn2\\Dev\\hr-final-001\\home\\profiles\\coding-devops\\cache\\scratch\\cadence-state-machine-correctness-review\\independent-witnesses\\actual_genuine_retained_unknown_ack.json",
+      "bytes": 11752,
+      "sha256": "48b6ce82e5c5f731e75297b98ac1b66eda2029869c31b5ba4dc4c5527cd37e93",
+      "scan": "JSON parsed; credential-pattern scan clear; synthetic ordinary/fixture report or seeded clock oracle, no live userdata"
+    },
+    {
+      "path": "examples/windows_broker_benchmark/tests/cadence/malformed_retained_prefix_success.json",
+      "source": "C:\\Users\\fjmn2\\Dev\\hr-final-001\\home\\profiles\\coding-devops\\cache\\scratch\\cadence-state-machine-correctness-review\\independent-witnesses\\malformed_retained_prefix_success.json",
+      "bytes": 11753,
+      "sha256": "8752b184c5dabc0e47f400da192755f859112f42ed0ac480f52dc5f93a861c7b",
+      "scan": "JSON parsed; credential-pattern scan clear; synthetic ordinary/fixture report or seeded clock oracle, no live userdata"
+    },
+    {
+      "path": "examples/windows_broker_benchmark/tests/cadence/malformed_retained_prefix_exit_code.json",
+      "source": "C:\\Users\\fjmn2\\Dev\\hr-final-001\\home\\profiles\\coding-devops\\cache\\scratch\\cadence-state-machine-correctness-review\\independent-witnesses\\malformed_retained_prefix_exit_code.json",
+      "bytes": 11753,
+      "sha256": "a2dcbbb3b5ca7bfebce2f347081b95f01f6ca9632c78ebea362841b63968e3c5",
+      "scan": "JSON parsed; credential-pattern scan clear; synthetic ordinary/fixture report or seeded clock oracle, no live userdata"
+    },
+    {
+      "path": "examples/windows_broker_benchmark/tests/cadence/malformed_retained_prefix_capture_complete.json",
+      "source": "C:\\Users\\fjmn2\\Dev\\hr-final-001\\home\\profiles\\coding-devops\\cache\\scratch\\cadence-state-machine-correctness-review\\independent-witnesses\\malformed_retained_prefix_capture_complete.json",
+      "bytes": 11753,
+      "sha256": "f3eb8cf424b032a13c34b2928ad7b8fb2c04863dfe7b8140f0023b5f2df9387f",
+      "scan": "JSON parsed; credential-pattern scan clear; synthetic ordinary/fixture report or seeded clock oracle, no live userdata"
+    },
+    {
+      "path": "examples/windows_broker_benchmark/tests/cadence/malformed_retained_prefix_stdout.json",
+      "source": "C:\\Users\\fjmn2\\Dev\\hr-final-001\\home\\profiles\\coding-devops\\cache\\scratch\\cadence-state-machine-correctness-review\\independent-witnesses\\malformed_retained_prefix_stdout.json",
+      "bytes": 11752,
+      "sha256": "dd98eca26ad0480f15eba98a0c6d58e9ff6ffd44e112b2d529798286d2f8fbfb",
+      "scan": "JSON parsed; credential-pattern scan clear; synthetic ordinary/fixture report or seeded clock oracle, no live userdata"
+    },
+    {
+      "path": "examples/windows_broker_benchmark/tests/cadence/workload_complete_without_last_ack.json",
+      "source": "C:\\Users\\fjmn2\\Dev\\hr-final-001\\home\\profiles\\coding-devops\\cache\\scratch\\cadence-state-machine-correctness-review\\independent-witnesses\\workload_complete_without_last_ack.json",
+      "bytes": 1325899,
+      "sha256": "16ab71918b6d465a92603a4180ff2f1794988d1f772b6896ee89f1ec91c90db1",
+      "scan": "JSON parsed; credential-pattern scan clear; synthetic ordinary/fixture report or seeded clock oracle, no live userdata"
+    },
+    {
+      "path": "examples/windows_broker_benchmark/tests/cadence/original_full64.json",
+      "source": "C:\\Users\\fjmn2\\Dev\\hr-final-001\\home\\profiles\\coding-devops\\cache\\scratch\\cadence-state-machine-correctness-review\\independent-witnesses\\original_full64.json",
+      "bytes": 1325903,
+      "sha256": "1b202742b38bdf5c0fb455ad5cd474bd60b7ae677fd382164d085beb6aacf6f7",
+      "scan": "JSON parsed; credential-pattern scan clear; synthetic ordinary/fixture report or seeded clock oracle, no live userdata"
+    },
+    {
+      "path": "examples/windows_broker_benchmark/tests/cadence/cause-mutation-0.json",
+      "source": "C:\\Users\\fjmn2\\Dev\\hr-final-001\\home\\profiles\\coding-devops\\cache\\scratch\\cadence-postfix-security-sol-fresh\\cause-mutation-0.json",
+      "bytes": 20745,
+      "sha256": "f3c3e846f39fae0dc559c2af0632c297b284f31b9956d0936d05fd2e2b555df8",
+      "scan": "JSON parsed; credential-pattern scan clear; synthetic ordinary/fixture report or seeded clock oracle, no live userdata"
+    },
+    {
+      "path": "examples/windows_broker_benchmark/tests/cadence/cause-mutation-1.json",
+      "source": "C:\\Users\\fjmn2\\Dev\\hr-final-001\\home\\profiles\\coding-devops\\cache\\scratch\\cadence-postfix-security-sol-fresh\\cause-mutation-1.json",
+      "bytes": 20393,
+      "sha256": "89f5be2f951b99399cb894c4a4d2ff175bbd284fbe948c75b9ecf6a81e555dd4",
+      "scan": "JSON parsed; credential-pattern scan clear; synthetic ordinary/fixture report or seeded clock oracle, no live userdata"
+    },
+    {
+      "path": "examples/windows_broker_benchmark/tests/cadence/cause-mutation-4.json",
+      "source": "C:\\Users\\fjmn2\\Dev\\hr-final-001\\home\\profiles\\coding-devops\\cache\\scratch\\cadence-postfix-security-sol-fresh\\cause-mutation-4.json",
+      "bytes": 20741,
+      "sha256": "e37b3d0699d560b4799883c2ee4d8902b30bc96280c6723f0753309e2f1c23cc",
+      "scan": "JSON parsed; credential-pattern scan clear; synthetic ordinary/fixture report or seeded clock oracle, no live userdata"
+    }
+  ]
+}

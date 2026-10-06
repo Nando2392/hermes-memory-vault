@@ -1,0 +1,712 @@
+{
+  "additions": 5142,
+  "case": "representative-6MiB-full20x256-v1",
+  "case_actions": {
+    "entered": null,
+    "operation_failure": "foreign operation outcome",
+    "records": [
+      {
+        "action": "StopClient",
+        "error": null
+      },
+      {
+        "action": "StopBroker",
+        "error": null
+      },
+      {
+        "action": "WaitBrokerExit",
+        "error": null
+      }
+    ]
+  },
+  "case_epoch": "independent-security",
+  "case_stop": {
+    "acknowledged_prefix": 0,
+    "cause": {
+      "Operation": "Ack"
+    },
+    "position": 0,
+    "primary": "The file exists. (os error 80)"
+  },
+  "commands": [],
+  "controller_retained_commands": [
+    {
+      "args": [
+        "--enrollment",
+        "Enrollment",
+        "ingest",
+        "--root",
+        "C:\\Users\\fjmn2\\Dev\\hr-final-001\\home\\profiles\\coding-devops\\cache\\scratch\\operation-seal-security-independent\\.tmpKEZPuB\\seed/source"
+      ],
+      "capture_complete": true,
+      "capture_error": null,
+      "child_exited": true,
+      "elapsed_us": 3,
+      "exe": "C:\\Users\\fjmn2\\Dev\\hr-final-001\\home\\profiles\\coding-devops\\cache\\scratch\\operation-seal-security-independent\\.tmpKEZPuB\\install\\bin/hermes-memory-client.exe",
+      "exit_code": 0,
+      "kill_error": null,
+      "measurement": {
+        "child_exit_us": 2,
+        "command_success": true,
+        "exit_races": 0,
+        "final_io_error": null,
+        "final_lifetime_logical_io": {
+          "other_bytes": 6,
+          "other_operations": 3,
+          "read_bytes": 4,
+          "read_operations": 1,
+          "write_bytes": 5,
+          "write_operations": 2
+        },
+        "first_live_error": null,
+        "first_sample_us": 1,
+        "identity": {
+          "epoch": 3,
+          "role": "cli-child"
+        },
+        "last_sample_us": 1,
+        "live_attempts": 1,
+        "live_errors": 0,
+        "live_samples": 1,
+        "max_sample_gap_us": 0,
+        "memory": {
+          "observed_lifetime_peak_private_bytes": 1,
+          "observed_lifetime_peak_working_set_bytes": 1,
+          "sampled_private_bytes": 1,
+          "sampled_working_set_bytes": 1
+        },
+        "omitted_timepoints": 0,
+        "operation_id": 0,
+        "payload_bytes": 2260,
+        "schema": 2,
+        "timepoints": [
+          {
+            "lifetime_peak_private_bytes": 1,
+            "lifetime_peak_working_set_bytes": 1,
+            "logical_io": {
+              "other_bytes": 6,
+              "other_operations": 3,
+              "read_bytes": 4,
+              "read_operations": 1,
+              "write_bytes": 5,
+              "write_operations": 2
+            },
+            "private_bytes": 1,
+            "since_spawn_start_us": 1,
+            "working_set_bytes": 1
+          }
+        ]
+      },
+      "spawn_error": null,
+      "stderr": "",
+      "stderr_file": "C:\\Users\\fjmn2\\Dev\\hr-final-001\\home\\profiles\\coding-devops\\cache\\scratch\\operation-seal-security-independent\\.tmpKEZPuB\\scratch\\full20x256-v1-op-0.stderr",
+      "stderr_overflow": false,
+      "stdout": "{\"duplicates\":0,\"inserted\":1}",
+      "stdout_file": "C:\\Users\\fjmn2\\Dev\\hr-final-001\\home\\profiles\\coding-devops\\cache\\scratch\\operation-seal-security-independent\\.tmpKEZPuB\\scratch\\full20x256-v1-op-0.stdout",
+      "stdout_overflow": false,
+      "stop_requested": false,
+      "success": true,
+      "timed_out": false,
+      "wait_error": null
+    }
+  ],
+  "correctness_complete": false,
+  "diagnostics": {
+    "case_epoch": "independent-security",
+    "error": "The file exists. (os error 80)",
+    "generation": {
+      "seed_records": 16
+    },
+    "pass": false
+  },
+  "error": "The file exists. (os error 80)",
+  "export_oracle": null,
+  "final_records": 5159,
+  "import_oracle": null,
+  "measurement_complete": false,
+  "native_handle_verified": false,
+  "operations": [
+    {
+      "after_done": {
+        "broker": {
+          "lifetime_peak_private_bytes": 1,
+          "lifetime_peak_working_set_bytes": 1,
+          "logical_io": {
+            "other_bytes": 1,
+            "other_operations": 1,
+            "read_bytes": 1,
+            "read_operations": 1,
+            "write_bytes": 1,
+            "write_operations": 1
+          },
+          "private_bytes": 1,
+          "working_set_bytes": 1
+        },
+        "broker_epoch": 1,
+        "broker_logical_io_delta": {
+          "other_bytes": 0,
+          "other_operations": 0,
+          "read_bytes": 0,
+          "read_operations": 0,
+          "write_bytes": 0,
+          "write_operations": 0
+        },
+        "cli_epoch": 3,
+        "handshake_span_us": 89345,
+        "supervisor": {
+          "lifetime_peak_private_bytes": 1,
+          "lifetime_peak_working_set_bytes": 1,
+          "logical_io": {
+            "other_bytes": 1,
+            "other_operations": 1,
+            "read_bytes": 1,
+            "read_operations": 1,
+            "write_bytes": 1,
+            "write_operations": 1
+          },
+          "private_bytes": 1,
+          "working_set_bytes": 1
+        },
+        "supervisor_epoch": 2,
+        "supervisor_logical_io_delta": {
+          "other_bytes": 0,
+          "other_operations": 0,
+          "read_bytes": 0,
+          "read_operations": 0,
+          "write_bytes": 0,
+          "write_operations": 0
+        }
+      },
+      "before_release": {
+        "broker": {
+          "lifetime_peak_private_bytes": 1,
+          "lifetime_peak_working_set_bytes": 1,
+          "logical_io": {
+            "other_bytes": 1,
+            "other_operations": 1,
+            "read_bytes": 1,
+            "read_operations": 1,
+            "write_bytes": 1,
+            "write_operations": 1
+          },
+          "private_bytes": 1,
+          "working_set_bytes": 1
+        },
+        "broker_epoch": 1,
+        "broker_logical_io_delta": null,
+        "cli_epoch": 3,
+        "handshake_span_us": null,
+        "supervisor": {
+          "lifetime_peak_private_bytes": 1,
+          "lifetime_peak_working_set_bytes": 1,
+          "logical_io": {
+            "other_bytes": 1,
+            "other_operations": 1,
+            "read_bytes": 1,
+            "read_operations": 1,
+            "write_bytes": 1,
+            "write_operations": 1
+          },
+          "private_bytes": 1,
+          "working_set_bytes": 1
+        },
+        "supervisor_epoch": 2,
+        "supervisor_logical_io_delta": null
+      },
+      "cadence": {
+        "accounted_slots": 44,
+        "baseline_coverage": {
+          "both_live": 1,
+          "broker_aborted": 0,
+          "broker_live": 1,
+          "pairs": 1,
+          "supervisor_aborted": 0,
+          "supervisor_live": 1
+        },
+        "both_live_pairs": 2,
+        "broker": {
+          "attempts": 2,
+          "baseline": {
+            "class": "Baseline",
+            "ordinal": 1,
+            "read": {
+              "epoch": 1,
+              "role": "BrokerC",
+              "sample": {
+                "lifetime_peak_private_bytes": 1,
+                "lifetime_peak_working_set_bytes": 1,
+                "logical_io": {
+                  "other_bytes": 1,
+                  "other_operations": 1,
+                  "read_bytes": 1,
+                  "read_operations": 1,
+                  "write_bytes": 1,
+                  "write_operations": 1
+                },
+                "private_bytes": 1,
+                "working_set_bytes": 1
+              }
+            },
+            "requested_slot": null,
+            "sample_begin_us": 34,
+            "sample_end_us": 41
+          },
+          "baseline_to_end_io": {
+            "other_bytes": 0,
+            "other_operations": 0,
+            "read_bytes": 0,
+            "read_operations": 0,
+            "write_bytes": 0,
+            "write_operations": 0
+          },
+          "counter_regressions": 0,
+          "end": {
+            "class": "End",
+            "ordinal": 2,
+            "read": {
+              "epoch": 1,
+              "role": "BrokerC",
+              "sample": {
+                "lifetime_peak_private_bytes": 1,
+                "lifetime_peak_working_set_bytes": 1,
+                "logical_io": {
+                  "other_bytes": 1,
+                  "other_operations": 1,
+                  "read_bytes": 1,
+                  "read_operations": 1,
+                  "write_bytes": 1,
+                  "write_operations": 1
+                },
+                "private_bytes": 1,
+                "working_set_bytes": 1
+              }
+            },
+            "requested_slot": null,
+            "sample_begin_us": 89327,
+            "sample_end_us": 89335
+          },
+          "epoch": 1,
+          "error": null,
+          "exit_observations": 0,
+          "first_sample_us": 41,
+          "forced_baseline_attempts": 1,
+          "forced_end_attempts": 1,
+          "last": {
+            "class": "End",
+            "ordinal": 2,
+            "read": {
+              "epoch": 1,
+              "role": "BrokerC",
+              "sample": {
+                "lifetime_peak_private_bytes": 1,
+                "lifetime_peak_working_set_bytes": 1,
+                "logical_io": {
+                  "other_bytes": 1,
+                  "other_operations": 1,
+                  "read_bytes": 1,
+                  "read_operations": 1,
+                  "write_bytes": 1,
+                  "write_operations": 1
+                },
+                "private_bytes": 1,
+                "working_set_bytes": 1
+              }
+            },
+            "requested_slot": null,
+            "sample_begin_us": 89327,
+            "sample_end_us": 89335
+          },
+          "last_attempt_span": {
+            "sample_begin_us": 89327,
+            "sample_end_us": 89335
+          },
+          "max_acquisition_span_us": 8,
+          "max_attempt_span_us": 8,
+          "max_consecutive_gap_us": 89294,
+          "maxima": {
+            "lifetime_peak_private_bytes": 1,
+            "lifetime_peak_working_set_bytes": 1,
+            "logical_io": {
+              "other_bytes": 1,
+              "other_operations": 1,
+              "read_bytes": 1,
+              "read_operations": 1,
+              "write_bytes": 1,
+              "write_operations": 1
+            },
+            "private_bytes": 1,
+            "working_set_bytes": 1
+          },
+          "not_attempted_due_to_abort": 0,
+          "observation_max_gap_us": 89294,
+          "omitted_points": 0,
+          "operational_max_gap_us": 89221,
+          "prefix": [
+            {
+              "class": "Baseline",
+              "ordinal": 1,
+              "read": {
+                "epoch": 1,
+                "role": "BrokerC",
+                "sample": {
+                  "lifetime_peak_private_bytes": 1,
+                  "lifetime_peak_working_set_bytes": 1,
+                  "logical_io": {
+                    "other_bytes": 1,
+                    "other_operations": 1,
+                    "read_bytes": 1,
+                    "read_operations": 1,
+                    "write_bytes": 1,
+                    "write_operations": 1
+                  },
+                  "private_bytes": 1,
+                  "working_set_bytes": 1
+                }
+              },
+              "requested_slot": null,
+              "sample_begin_us": 34,
+              "sample_end_us": 41
+            },
+            {
+              "class": "End",
+              "ordinal": 2,
+              "read": {
+                "epoch": 1,
+                "role": "BrokerC",
+                "sample": {
+                  "lifetime_peak_private_bytes": 1,
+                  "lifetime_peak_working_set_bytes": 1,
+                  "logical_io": {
+                    "other_bytes": 1,
+                    "other_operations": 1,
+                    "read_bytes": 1,
+                    "read_operations": 1,
+                    "write_bytes": 1,
+                    "write_operations": 1
+                  },
+                  "private_bytes": 1,
+                  "working_set_bytes": 1
+                }
+              },
+              "requested_slot": null,
+              "sample_begin_us": 89327,
+              "sample_end_us": 89335
+            }
+          ],
+          "query_errors": 0,
+          "role": "BrokerC",
+          "successful_live_samples": 2
+        },
+        "cadence_target_met": false,
+        "case_epoch": "independent-security",
+        "cli_epoch": 3,
+        "done_validated_us": 89284,
+        "end_coverage": {
+          "both_live": 1,
+          "broker_aborted": 0,
+          "broker_live": 1,
+          "pairs": 1,
+          "supervisor_aborted": 0,
+          "supervisor_live": 1
+        },
+        "evidence_complete": false,
+        "failure": {
+          "kind": "controller",
+          "os_code": 80,
+          "role": null,
+          "text": "The file exists. (os error 80)"
+        },
+        "last_pair_end_us": 89335,
+        "max_pair_span_us": 47,
+        "missed_slots": 44,
+        "nominal_period_us": 2000,
+        "observation_envelope_end_us": 89345,
+        "operation_id": 0,
+        "origin_us": 0,
+        "pair_attempts": 2,
+        "partial_pairs": 0,
+        "release_begin_us": 63,
+        "release_end_us": 10464,
+        "requested_coverage": {
+          "both_live": 0,
+          "broker_aborted": 0,
+          "broker_live": 0,
+          "pairs": 0,
+          "supervisor_aborted": 0,
+          "supervisor_live": 0
+        },
+        "requested_samples": 0,
+        "schema": 3,
+        "state": {
+          "ack": "Unknown",
+          "action": {
+            "Phase": "Ack"
+          },
+          "append_verified": true,
+          "classes": [
+            1,
+            0,
+            1
+          ],
+          "clock_fault": null,
+          "command_retained": true,
+          "done_observed": true,
+          "last_attempt": [
+            2,
+            2
+          ],
+          "last_live": [
+            2,
+            2
+          ],
+          "last_pair": {
+            "abort_check_span": null,
+            "class": "End",
+            "ordinal": 2,
+            "outcomes": [
+              "Live",
+              "Live"
+            ],
+            "slot": null,
+            "spans": [
+              [
+                89288,
+                89327
+              ],
+              [
+                89327,
+                89335
+              ]
+            ]
+          },
+          "last_slot": 0,
+          "pairs": 2,
+          "peer_consumption": "NotObserved",
+          "pending_slot": null,
+          "post_ack_checked": false,
+          "primary_finalized": true,
+          "receipt_validated": true,
+          "release": "Confirmed",
+          "sealed": false,
+          "stage": "Ack",
+          "terminal": {
+            "action": {
+              "Phase": "Ack"
+            },
+            "cause": "PublicationUnknown",
+            "pair_count": 2,
+            "pending_slot": null,
+            "primary": "The file exists. (os error 80)",
+            "stage": "Ack"
+          }
+        },
+        "supervisor": {
+          "attempts": 2,
+          "baseline": {
+            "class": "Baseline",
+            "ordinal": 1,
+            "read": {
+              "epoch": 2,
+              "role": "SupervisorB",
+              "sample": {
+                "lifetime_peak_private_bytes": 1,
+                "lifetime_peak_working_set_bytes": 1,
+                "logical_io": {
+                  "other_bytes": 1,
+                  "other_operations": 1,
+                  "read_bytes": 1,
+                  "read_operations": 1,
+                  "write_bytes": 1,
+                  "write_operations": 1
+                },
+                "private_bytes": 1,
+                "working_set_bytes": 1
+              }
+            },
+            "requested_slot": null,
+            "sample_begin_us": 2,
+            "sample_end_us": 34
+          },
+          "baseline_to_end_io": {
+            "other_bytes": 0,
+            "other_operations": 0,
+            "read_bytes": 0,
+            "read_operations": 0,
+            "write_bytes": 0,
+            "write_operations": 0
+          },
+          "counter_regressions": 0,
+          "end": {
+            "class": "End",
+            "ordinal": 2,
+            "read": {
+              "epoch": 2,
+              "role": "SupervisorB",
+              "sample": {
+                "lifetime_peak_private_bytes": 1,
+                "lifetime_peak_working_set_bytes": 1,
+                "logical_io": {
+                  "other_bytes": 1,
+                  "other_operations": 1,
+                  "read_bytes": 1,
+                  "read_operations": 1,
+                  "write_bytes": 1,
+                  "write_operations": 1
+                },
+                "private_bytes": 1,
+                "working_set_bytes": 1
+              }
+            },
+            "requested_slot": null,
+            "sample_begin_us": 89288,
+            "sample_end_us": 89327
+          },
+          "epoch": 2,
+          "error": null,
+          "exit_observations": 0,
+          "first_sample_us": 34,
+          "forced_baseline_attempts": 1,
+          "forced_end_attempts": 1,
+          "last": {
+            "class": "End",
+            "ordinal": 2,
+            "read": {
+              "epoch": 2,
+              "role": "SupervisorB",
+              "sample": {
+                "lifetime_peak_private_bytes": 1,
+                "lifetime_peak_working_set_bytes": 1,
+                "logical_io": {
+                  "other_bytes": 1,
+                  "other_operations": 1,
+                  "read_bytes": 1,
+                  "read_operations": 1,
+                  "write_bytes": 1,
+                  "write_operations": 1
+                },
+                "private_bytes": 1,
+                "working_set_bytes": 1
+              }
+            },
+            "requested_slot": null,
+            "sample_begin_us": 89288,
+            "sample_end_us": 89327
+          },
+          "last_attempt_span": {
+            "sample_begin_us": 89288,
+            "sample_end_us": 89327
+          },
+          "max_acquisition_span_us": 39,
+          "max_attempt_span_us": 39,
+          "max_consecutive_gap_us": 89293,
+          "maxima": {
+            "lifetime_peak_private_bytes": 1,
+            "lifetime_peak_working_set_bytes": 1,
+            "logical_io": {
+              "other_bytes": 1,
+              "other_operations": 1,
+              "read_bytes": 1,
+              "read_operations": 1,
+              "write_bytes": 1,
+              "write_operations": 1
+            },
+            "private_bytes": 1,
+            "working_set_bytes": 1
+          },
+          "not_attempted_due_to_abort": 0,
+          "observation_max_gap_us": 89293,
+          "omitted_points": 0,
+          "operational_max_gap_us": 89221,
+          "prefix": [
+            {
+              "class": "Baseline",
+              "ordinal": 1,
+              "read": {
+                "epoch": 2,
+                "role": "SupervisorB",
+                "sample": {
+                  "lifetime_peak_private_bytes": 1,
+                  "lifetime_peak_working_set_bytes": 1,
+                  "logical_io": {
+                    "other_bytes": 1,
+                    "other_operations": 1,
+                    "read_bytes": 1,
+                    "read_operations": 1,
+                    "write_bytes": 1,
+                    "write_operations": 1
+                  },
+                  "private_bytes": 1,
+                  "working_set_bytes": 1
+                }
+              },
+              "requested_slot": null,
+              "sample_begin_us": 2,
+              "sample_end_us": 34
+            },
+            {
+              "class": "End",
+              "ordinal": 2,
+              "read": {
+                "epoch": 2,
+                "role": "SupervisorB",
+                "sample": {
+                  "lifetime_peak_private_bytes": 1,
+                  "lifetime_peak_working_set_bytes": 1,
+                  "logical_io": {
+                    "other_bytes": 1,
+                    "other_operations": 1,
+                    "read_bytes": 1,
+                    "read_operations": 1,
+                    "write_bytes": 1,
+                    "write_operations": 1
+                  },
+                  "private_bytes": 1,
+                  "working_set_bytes": 1
+                }
+              },
+              "requested_slot": null,
+              "sample_begin_us": 89288,
+              "sample_end_us": 89327
+            }
+          ],
+          "query_errors": 0,
+          "role": "SupervisorB",
+          "successful_live_samples": 2
+        },
+        "unacquired_requests": 0
+      },
+      "cli_epoch": 3,
+      "descriptor": {
+        "appended_jsonl_bytes": 2259,
+        "cli_epoch": 3,
+        "duplicates": 0,
+        "id": 0,
+        "inserted": 1,
+        "payload_bytes": 2260,
+        "records": 1,
+        "replay_source": null,
+        "sessions": null,
+        "stage": "warmup"
+      },
+      "exact_append_verified": true,
+      "operation_id": 0,
+      "receipt_validated": true
+    }
+  ],
+  "pass": false,
+  "performance_complete": false,
+  "performance_policy_status": "unapproved",
+  "projection_oracle": null,
+  "release_ready": false,
+  "role": "Controller",
+  "sampling_complete": false,
+  "schema": 8,
+  "seed_records": 16,
+  "sessions": 18,
+  "source_oracle": null,
+  "workload_complete": false,
+  "workload_spec": {
+    "kind": "Full20x256V1",
+    "schema": 1
+  }
+}

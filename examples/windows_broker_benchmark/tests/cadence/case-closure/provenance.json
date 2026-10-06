@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "kind": "RETAINED_ACTUAL_MODULE_CASE_CLOSURE_REVIEW_WITNESSES",
+  "classification": "Retained ordinary shared-controller/SQLite operation evidence and actually invoked ordinary case-action observer fault; not native SCM/process/ACL custody",
+  "source_reviews": [
+    "target/full-workload-cadence-operation-seal-security-review.json",
+    "target/full-workload-cadence-operation-seal-correctness-review.json"
+  ],
+  "assets": [
+    {"file": "owner-control.json", "sha256": "415f638bf0060e6659604cfe3b644b867bf8e5402506e49e1bb84ab8d7e553c7", "expect": "accept"},
+    {"file": "owner-contradiction.json", "sha256": "64a4a4ad72418bea3d5761f2a315b0ee37082223a3336ef447131a9880096a9b", "expect": "reject", "changed_paths": ["/case_actions/operation_failure"]},
+    {"file": "delete-control.json", "sha256": "356762ad1e29ed7184836c4038bf3399ccd0f7c6c4b8388ab2ffe58c345d22a4", "expect": "accept"},
+    {"file": "delete-erased.json", "sha256": "a84a583263b35b9a7956a2af02a8fe3321ac537e014552ab8a0cb468e5ba2b91", "expect": "reject", "changed_paths": ["/error", "/case_stop"]}
+  ],
+  "historical_bytes_preserved": true,
+  "runtime_fixture_inputs": "Repository-relative files only; embedded historical namespace strings are inert report data, not fixture files to open",
+  "ingresses": ["validate", "encode_report", "write_report_bounded", "read_report"]
+}

@@ -1,0 +1,45 @@
+{
+  "case_actions": null,
+  "case_stop": {
+    "position": 0,
+    "acknowledged_prefix": 0,
+    "cause": "ExternalObservation",
+    "primary": "ordinary post-generation setup failure"
+  },
+  "schema": 8,
+  "role": "Controller",
+  "case": "representative-6MiB-full20x256-v1",
+  "case_epoch": null,
+  "workload_spec": {
+    "schema": 1,
+    "kind": "Full20x256V1"
+  },
+  "seed_records": 16,
+  "additions": 5142,
+  "final_records": 5159,
+  "sessions": 18,
+  "commands": [],
+  "controller_retained_commands": null,
+  "operations": null,
+  "source_oracle": null,
+  "import_oracle": null,
+  "projection_oracle": null,
+  "export_oracle": null,
+  "correctness_complete": false,
+  "workload_complete": false,
+  "measurement_complete": false,
+  "sampling_complete": false,
+  "native_handle_verified": false,
+  "performance_policy_status": "unapproved",
+  "performance_complete": false,
+  "release_ready": false,
+  "pass": false,
+  "error": "ordinary post-generation setup failure",
+  "diagnostics": {
+    "error": "ordinary post-generation setup failure",
+    "generation": {
+      "seed_records": 16
+    },
+    "pass": false
+  }
+}

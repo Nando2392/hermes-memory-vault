@@ -80,7 +80,9 @@ jobs:
               paths = sorted([p.relative_to(root).as_posix()
                               for folder in ('src', 'examples')
                               for p in (root / folder).rglob('*') if p.is_file()]
-                             + ['Cargo.toml', 'Cargo.lock'])
+                             + ['Cargo.toml', 'Cargo.lock', 'scripts/__init__.py',
+                                'scripts/windows_broker_full8_validator.py',
+                                'python_tests/test_windows_broker_full8_validator.py'])
               if any((root / p).is_symlink() for p in paths):
                   raise RuntimeError('Source symlink refused')
               inventory = [{'path': p, 'sha256': digest(root / p)} for p in paths]
@@ -89,9 +91,12 @@ jobs:
               provenance['source_sha256'] = source_digest
               # Frozen minimal full64 build-input inventory; NOT inherited approval.
               # This exact combined source/workflow requires independent review.
-              if source_digest != 'ce454dbb3ed455483752bcdc2ada21c8e9c4d573a255dea8b7a5ceecd5f9f2ed':
+              if source_digest != '38ee993d29de935122f9427c05a556ba34d8d4a1fc2845e8dc0419867684e698':
                   raise RuntimeError('Build inputs differ from frozen full64 snapshot')
               provenance['workflow_sha256'] = digest(root / '.github/workflows/windows-broker-benchmark.yml')
+              # Diagnostic admission only; runtime correctness is not release approval.
+              if os.environ.get('BENCHMARK_CASE') != 'representative-full6':
+                  raise RuntimeError('Diagnostic Schema8 admission permits representative-full6 only')
               provenance['gate_pass'] = True
           except Exception as error:
               provenance['error'] = str(error)[:4096]
@@ -123,6 +128,7 @@ jobs:
         run: |
           import hashlib, json, os, pathlib, subprocess, sys, threading, time
           root = pathlib.Path.cwd()
+          sys.path.insert(0, str(root))
           evidence = root / 'target/ci-small-raw'
           result_path = evidence / 'result.json'
           stream_limit = 1024 * 1024
@@ -145,7 +151,9 @@ jobs:
               paths = sorted([p.relative_to(root).as_posix()
                               for folder in ('src', 'examples')
                               for p in (root / folder).rglob('*') if p.is_file()]
-                             + ['Cargo.toml', 'Cargo.lock'])
+                             + ['Cargo.toml', 'Cargo.lock', 'scripts/__init__.py',
+                                'scripts/windows_broker_full8_validator.py',
+                                'python_tests/test_windows_broker_full8_validator.py'])
               require(not any((root / p).is_symlink() for p in paths), 'Source symlink refused')
               for name in ('.cargo', 'build.rs', 'rust-toolchain', 'rust-toolchain.toml'):
                   require(not (root / name).exists(), 'Unreviewed build override')
@@ -456,10 +464,18 @@ jobs:
                   samples = [commands[id]['measurement'] for id in ids]
                   stages[stage] = {'count':len(samples), 'child_exit_us':full_statistics([m['child_exit_us'] for m in samples]), 'logical_io':{key:full_statistics([m['final_lifetime_logical_io'][key] for m in samples]) for key in samples[0]['final_lifetime_logical_io']}}
               return {'correctness_pass':True, 'measurement_status':'incomplete-full64-boundary-only', 'workload_complete':True, 'measurement_complete':False, 'sampling_complete':False, 'performance_policy_status':'unapproved', 'performance_complete':False, 'release_ready':False, 'stage_summaries':stages, 'streaming_oracles':{'source_records':source['records'], 'final_records':projection['records'], 'projection_bytes':projection['bytes'], 'final_logical_sha256':imported['expected_final_logical_sha256'], 'sessions':exported['sessions'], 'index_sha256':exported['index_sha256']}}
+          def validate_full8_report(report, pins):
+              from scripts.windows_broker_full8_validator import validate_full8_report as full8
+              return full8(report, pins)
           def validate_report(report, case, pins):
               selected_case(case)
               if case == 'representative-full6':
-                  return validate_full_report(report, pins)
+                  require(type(report.get('schema')) is int, 'Exact full report schema')
+                  if report['schema'] == 5:
+                      return validate_full_report(report, pins)
+                  if report['schema'] == 8:
+                      return validate_full8_report(report, pins)
+                  raise RuntimeError('Unsupported full report version')
               pilot = case == 'representative-small-pilot'
               two_warmup = case == 'representative-two-warmup'
               require(type(report.get('schema')) is int and report['schema'] == (4 if two_warmup else 2 if pilot else 1) and report.get('case') == ('representative-6MiB-two-warmup' if two_warmup else 'representative-6MiB-pilot' if pilot else 'small-6MiB'), 'Controller schema/case mismatch')
@@ -654,6 +670,8 @@ jobs:
               status['source_after_sha256'] = verify_source(root, provenance)
               require(status['source_before_sha256'] == status['source_after_sha256'], 'Source changed during invocation')
               report = strict_json(raw)
+              require(type(report.get('schema')) is int and report['schema'] == 8,
+                      'Schema8 diagnostic admission requires schema8 report')
               status.update(validate_report(report, os.environ.get('BENCHMARK_CASE'), pins))
               status['case'] = report['case']
               status['validated'] = True

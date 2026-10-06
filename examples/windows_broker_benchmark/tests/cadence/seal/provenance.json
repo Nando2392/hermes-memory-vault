@@ -1,0 +1,82 @@
+[
+  {
+    "original": "examples\\windows_broker_benchmark\\tests\\cadence\\actual_genuine_retained_unknown_ack.json",
+    "original_sha256": "48b6ce82e5c5f731e75297b98ac1b66eda2029869c31b5ba4dc4c5527cd37e93",
+    "new": "examples\\windows_broker_benchmark\\tests\\cadence\\seal\\actual_genuine_retained_unknown_ack.json",
+    "new_sha256": "85c0d4003ec7e39b81d2ae709d76974fcfab84544fbe60ddfc2d967bdc18ccd3",
+    "new_bytes": 20999,
+    "classification": "Explicit synthetic current-schema structural rebase; historical source bytes retained unchanged. Not native finalization evidence."
+  },
+  {
+    "original": "examples\\windows_broker_benchmark\\tests\\cadence\\cause-mutation-0.json",
+    "original_sha256": "f3c3e846f39fae0dc559c2af0632c297b284f31b9956d0936d05fd2e2b555df8",
+    "new": "examples\\windows_broker_benchmark\\tests\\cadence\\seal\\cause-mutation-0.json",
+    "new_sha256": "eda15973bc78c2032ad81839eef72be07ebc41fd71e8be891e4b818141e9966c",
+    "new_bytes": 21001,
+    "classification": "Explicit synthetic current-schema structural rebase; historical source bytes retained unchanged. Not native finalization evidence."
+  },
+  {
+    "original": "examples\\windows_broker_benchmark\\tests\\cadence\\cause-mutation-1.json",
+    "original_sha256": "89f5be2f951b99399cb894c4a4d2ff175bbd284fbe948c75b9ecf6a81e555dd4",
+    "new": "examples\\windows_broker_benchmark\\tests\\cadence\\seal\\cause-mutation-1.json",
+    "new_sha256": "0d418a4559f3c275f70abf7a03dce970f1e1299fd0dae14e8a312189ee17799b",
+    "new_bytes": 20582,
+    "classification": "Explicit synthetic current-schema structural rebase; historical source bytes retained unchanged. Not native finalization evidence."
+  },
+  {
+    "original": "examples\\windows_broker_benchmark\\tests\\cadence\\cause-mutation-4.json",
+    "original_sha256": "e37b3d0699d560b4799883c2ee4d8902b30bc96280c6723f0753309e2f1c23cc",
+    "new": "examples\\windows_broker_benchmark\\tests\\cadence\\seal\\cause-mutation-4.json",
+    "new_sha256": "402c98419af7bf0f9ee2c81755cee74652c9b7e1edffddbc07dc13561cfc8f93",
+    "new_bytes": 20997,
+    "classification": "Explicit synthetic current-schema structural rebase; historical source bytes retained unchanged. Not native finalization evidence."
+  },
+  {
+    "original": "examples\\windows_broker_benchmark\\tests\\cadence\\malformed_retained_prefix_capture_complete.json",
+    "original_sha256": "f3eb8cf424b032a13c34b2928ad7b8fb2c04863dfe7b8140f0023b5f2df9387f",
+    "new": "examples\\windows_broker_benchmark\\tests\\cadence\\seal\\malformed_retained_prefix_capture_complete.json",
+    "new_sha256": "5124c569ede4dfe6b576d26938c99c6acabef7d8d2a4800b0d4108f8489847ce",
+    "new_bytes": 21000,
+    "classification": "Explicit synthetic current-schema structural rebase; historical source bytes retained unchanged. Not native finalization evidence."
+  },
+  {
+    "original": "examples\\windows_broker_benchmark\\tests\\cadence\\malformed_retained_prefix_exit_code.json",
+    "original_sha256": "a2dcbbb3b5ca7bfebce2f347081b95f01f6ca9632c78ebea362841b63968e3c5",
+    "new": "examples\\windows_broker_benchmark\\tests\\cadence\\seal\\malformed_retained_prefix_exit_code.json",
+    "new_sha256": "fce8ddf7b42803cb5dc61862c9eb79765d1b529fa3715cd3ca7d09049e2e9d14",
+    "new_bytes": 21000,
+    "classification": "Explicit synthetic current-schema structural rebase; historical source bytes retained unchanged. Not native finalization evidence."
+  },
+  {
+    "original": "examples\\windows_broker_benchmark\\tests\\cadence\\malformed_retained_prefix_stdout.json",
+    "original_sha256": "dd98eca26ad0480f15eba98a0c6d58e9ff6ffd44e112b2d529798286d2f8fbfb",
+    "new": "examples\\windows_broker_benchmark\\tests\\cadence\\seal\\malformed_retained_prefix_stdout.json",
+    "new_sha256": "bf612d61c1a2ea8095d9e4a2980e383a6aa1470555735f64a416881f735827be",
+    "new_bytes": 20999,
+    "classification": "Explicit synthetic current-schema structural rebase; historical source bytes retained unchanged. Not native finalization evidence."
+  },
+  {
+    "original": "examples\\windows_broker_benchmark\\tests\\cadence\\malformed_retained_prefix_success.json",
+    "original_sha256": "8752b184c5dabc0e47f400da192755f859112f42ed0ac480f52dc5f93a861c7b",
+    "new": "examples\\windows_broker_benchmark\\tests\\cadence\\seal\\malformed_retained_prefix_success.json",
+    "new_sha256": "04bf45a86163cdd4f6c749aec7b560633b0e9eb9299f6cfa094681d7ca663c85",
+    "new_bytes": 21000,
+    "classification": "Explicit synthetic current-schema structural rebase; historical source bytes retained unchanged. Not native finalization evidence."
+  },
+  {
+    "original": "examples\\windows_broker_benchmark\\tests\\cadence\\original_full64.json",
+    "original_sha256": "1b202742b38bdf5c0fb455ad5cd474bd60b7ae677fd382164d085beb6aacf6f7",
+    "new": "examples\\windows_broker_benchmark\\tests\\cadence\\seal\\original_full64.json",
+    "new_sha256": "74408eace8f78f2fbbd5ed1518b75616aa4ff89b125e4ba47f8fe62c807db0b3",
+    "new_bytes": 2514530,
+    "classification": "Explicit synthetic current-schema structural rebase; historical source bytes retained unchanged. Not native finalization evidence."
+  },
+  {
+    "original": "examples\\windows_broker_benchmark\\tests\\cadence\\workload_complete_without_last_ack.json",
+    "original_sha256": "16ab71918b6d465a92603a4180ff2f1794988d1f772b6896ee89f1ec91c90db1",
+    "new": "examples\\windows_broker_benchmark\\tests\\cadence\\seal\\workload_complete_without_last_ack.json",
+    "new_sha256": "27f2bccf06a53522611df4f9b4bae378596d9d9d6756f6d87262cfc7d36d7b8a",
+    "new_bytes": 2514564,
+    "classification": "Explicit synthetic current-schema structural rebase; historical source bytes retained unchanged. Not native finalization evidence."
+  }
+]

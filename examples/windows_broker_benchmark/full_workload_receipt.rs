@@ -54,6 +54,14 @@ pub struct MeasuredCommand {
     pub stderr_file: String,
     pub measurement: CommandMeasurement,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AckEvent {
+    Validated,
+    Retained,
+    Attempt,
+    Confirmed,
+    Unknown,
+}
 pub struct Adapter<'a> {
     pub root: &'a Path,
     pub case: &'a crate::commands::Case,
@@ -85,6 +93,18 @@ impl Adapter<'_> {
         retained: &mut Vec<Value>,
         deadline: Instant,
     ) -> Result<()> {
+        self.acknowledge_observed(barrier, manifest, id, retained, deadline, |_| Ok(()))
+    }
+    pub fn acknowledge_observed(
+        &self,
+        barrier: &mut crate::full_workload_barrier::FullBarrier<'_>,
+        manifest: &FullManifest,
+        id: u32,
+        retained: &mut Vec<Value>,
+        deadline: Instant,
+        observer: impl FnMut(AckEvent) -> Result<()>,
+    ) -> Result<()> {
+        let observer = std::cell::RefCell::new(observer);
         ensure(
             id < FullManifest::OPERATIONS && retained.len() == id as usize,
             "retained command sequence",
@@ -97,19 +117,24 @@ impl Adapter<'_> {
             "controller receipt deadline/cancelled",
         )?;
         let receipt: Receipt = decode(&read_bounded(&self.receipt_path(id), RECEIPT_LIMIT)?)?;
-        barrier.acknowledge(
+        barrier.acknowledge_observed(
             id,
             &receipt,
             |op, payload, actual| {
                 let ack = self.validate(manifest, op, payload, actual)?;
+                observer.borrow_mut()(AckEvent::Validated)?;
                 ensure(
                     Instant::now() < deadline && !(self.cancelled)(),
                     "controller receipt deadline/cancelled",
                 )?;
-                retained.push(serde_json::to_value(&actual.command)?);
+                let command = serde_json::to_value(&actual.command)?;
+                crate::full_native::command_bound(&command)?;
+                retained.push(command);
+                observer.borrow_mut()(AckEvent::Retained)?;
                 Ok(ack)
             },
             self.cancelled,
+            |event| observer.borrow_mut()(event),
         )
     }
     pub fn receipt_path(&self, id: u32) -> PathBuf {
@@ -293,45 +318,12 @@ impl Adapter<'_> {
                 && c.stderr_file == crate::contract::text(&prefix.with_extension("stderr"))?,
             "installed executable/argv/capture spelling",
         )?;
+        validate_retained_command(c, op)?;
         ensure(
-            c.success
-                && c.exit_code == Some(0)
-                && c.child_exited
-                && c.capture_complete
-                && !c.stdout_overflow
-                && !c.stderr_overflow
-                && !c.timed_out
-                && !c.stop_requested
-                && c.spawn_error.is_none()
-                && c.capture_error.is_none()
-                && c.kill_error.is_none()
-                && c.wait_error.is_none(),
-            "command failed/unknown commit",
-        )?;
-        let m = &c.measurement;
-        m.validate()?;
-        ensure(
-            m.identity == SamplePolicy::cli(op.cli_epoch, op.id).identity
-                && m.operation_id == op.id
-                && m.payload_bytes == payload.len() as u64
-                && m.command_success
-                && m.child_exit_us
-                    .is_some_and(|t| t <= c.elapsed_us && t <= self.timeout.as_micros() as u64)
-                && m.final_lifetime_logical_io.is_some()
-                && m.final_io_error.is_none()
-                && m.live_errors == 0
-                && m.live_samples > 0
-                && m.memory.is_some(),
-            "complete correlated measurement required",
-        )?;
-        let expected = if op.stage == Stage::Export {
-            serde_json::json!({"sessions":op.sessions})
-        } else {
-            serde_json::json!({"inserted":op.inserted,"duplicates":op.duplicates})
-        };
-        ensure(
-            semantic(&c.stdout, op.stage)? == expected,
-            "exact stage output",
+            c.measurement
+                .child_exit_us
+                .is_some_and(|t| t <= self.timeout.as_micros() as u64),
+            "command measurement exceeds adapter timeout",
         )?;
         ensure(
             read_bounded(&prefix.with_extension("stdin"), 2 * 1024 * 1024)? == payload,
@@ -372,6 +364,52 @@ impl Adapter<'_> {
             sessions: op.sessions,
         })
     }
+}
+
+/// Intrinsic receipt semantics shared by live validation and persisted prefixes.
+/// Disk captures, installed argv and timeout remain live adapter checks; reports
+/// cannot authenticate missing external evidence or an executable's origin.
+pub(crate) fn validate_retained_command(c: &MeasuredCommand, op: &Operation) -> Result<()> {
+    ensure(
+        c.success
+            && c.exit_code == Some(0)
+            && c.child_exited
+            && c.capture_complete
+            && !c.stdout_overflow
+            && !c.stderr_overflow
+            && !c.timed_out
+            && !c.stop_requested
+            && c.spawn_error.is_none()
+            && c.capture_error.is_none()
+            && c.kill_error.is_none()
+            && c.wait_error.is_none(),
+        "command failed/unknown commit",
+    )?;
+    let m = &c.measurement;
+    m.validate()?;
+    ensure(
+        m.identity == SamplePolicy::cli(op.cli_epoch, op.id).identity
+            && m.operation_id == op.id
+            && m.payload_bytes == op.payload_bytes
+            && m.command_success
+            && m.child_exit_us.is_some_and(|t| t <= c.elapsed_us)
+            && m.final_lifetime_logical_io.is_some()
+            && m.final_io_error.is_none()
+            && m.live_errors == 0
+            && m.live_samples > 0
+            && m.memory.is_some(),
+        "complete correlated measurement required",
+    )?;
+    let expected = if op.stage == Stage::Export {
+        serde_json::json!({"sessions":op.sessions})
+    } else {
+        serde_json::json!({"inserted":op.inserted,"duplicates":op.duplicates})
+    };
+    ensure(
+        semantic(&c.stdout, op.stage)? == expected,
+        "exact stage output",
+    )?;
+    Ok(())
 }
 
 /// Serialize fully before create_new; sync owned staging then no-replace link.

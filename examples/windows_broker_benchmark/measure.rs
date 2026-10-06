@@ -164,31 +164,279 @@ mod tests {
         assert_eq!(missing.max_sample_gap_us, 0);
     }
 
+    #[cfg(windows)]
+    mod ordinary_fixture {
+        use std::{
+            path::PathBuf,
+            process::{Child, Command, Stdio},
+            sync::{Arc, Mutex},
+            time::{Duration, Instant},
+        };
+
+        pub const COMPLETION: Duration = Duration::from_secs(5);
+        const STARTUP: Duration = Duration::from_secs(10);
+        const POLL: Duration = Duration::from_millis(2);
+        pub type Witness = Arc<Mutex<Option<bool>>>;
+
+        pub struct Owned {
+            pub child: Child,
+            pub start: Instant,
+            channel: Option<tempfile::TempDir>,
+            witness: Witness,
+        }
+        impl Owned {
+            pub fn spawn(
+                pre_ready: u64,
+                post_ready: u64,
+                mode: &str,
+                witness: Witness,
+            ) -> std::io::Result<Self> {
+                let channel = tempfile::tempdir()?;
+                let start = Instant::now();
+                let child = Command::new(std::env::current_exe()?)
+                    .args([
+                        "measure::tests::ordinary_fixture_child",
+                        "--exact",
+                        "--nocapture",
+                    ])
+                    .env("MEASURE_ORDINARY_CHANNEL", channel.path())
+                    .env("MEASURE_ORDINARY_PRE", pre_ready.to_string())
+                    .env("MEASURE_ORDINARY_POST", post_ready.to_string())
+                    .env("MEASURE_ORDINARY_MODE", mode)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()?;
+                // Install retained-child ownership before any fallible handshake action.
+                Ok(Self {
+                    child,
+                    start,
+                    channel: Some(channel),
+                    witness,
+                })
+            }
+            pub(super) fn path(&self, name: &str) -> PathBuf {
+                self.channel.as_ref().unwrap().path().join(name)
+            }
+            pub fn ready(&mut self) -> std::io::Result<()> {
+                loop {
+                    if self.start.elapsed() >= STARTUP {
+                        return Err(std::io::ErrorKind::TimedOut.into());
+                    }
+                    if self.child.try_wait()?.is_some() {
+                        return Err(std::io::ErrorKind::UnexpectedEof.into());
+                    }
+                    match std::fs::read(self.path("ready")) {
+                        Ok(bytes) if bytes == b"READY" => return Ok(()),
+                        Ok(_) => return Err(std::io::ErrorKind::InvalidData.into()),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e),
+                    }
+                    std::thread::sleep(POLL);
+                }
+            }
+            pub fn release_and_complete(&mut self) -> std::io::Result<()> {
+                // READY is emitted by the child, which stays live until this owned release.
+                self.ready()?;
+                let completion_start = Instant::now();
+                std::fs::write(self.path("release.pending"), b"RELEASE")?;
+                std::fs::rename(self.path("release.pending"), self.path("release"))?;
+                loop {
+                    if completion_start.elapsed() >= COMPLETION {
+                        return Err(std::io::ErrorKind::TimedOut.into());
+                    }
+                    if let Some(status) = self.child.try_wait()? {
+                        return if status.success() {
+                            Ok(())
+                        } else {
+                            Err(std::io::ErrorKind::Other.into())
+                        };
+                    }
+                    std::thread::sleep(POLL);
+                }
+            }
+            fn cleanup(&mut self) -> bool {
+                // Include termination in the cleanup clock; never use blocking wait or PID lookup.
+                let deadline = Instant::now() + Duration::from_secs(2);
+                if matches!(self.child.try_wait(), Ok(Some(_))) {
+                    return true;
+                }
+                let _ = self.child.kill();
+                while Instant::now() < deadline {
+                    if matches!(self.child.try_wait(), Ok(Some(_))) {
+                        return true;
+                    }
+                    std::thread::sleep(POLL);
+                }
+                false
+            }
+        }
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                let confirmed = self.cleanup();
+                *self.witness.lock().unwrap_or_else(|e| e.into_inner()) = Some(confirmed);
+                if !confirmed {
+                    // Do not remove a still-live child's channel, or hide cleanup failure on unwind.
+                    if let Some(channel) = self.channel.take() {
+                        let _ = channel.keep();
+                    }
+                    if !std::thread::panicking() {
+                        panic!("ordinary child cleanup incomplete");
+                    }
+                }
+            }
+        }
+        pub fn witness() -> Witness {
+            Arc::new(Mutex::new(None))
+        }
+        pub fn confirmed(witness: &Witness) {
+            assert_eq!(*witness.lock().unwrap(), Some(true));
+        }
+
+        pub fn child() {
+            let Some(path) = std::env::var_os("MEASURE_ORDINARY_CHANNEL") else {
+                return;
+            };
+            let path = PathBuf::from(path);
+            let pre: u64 = std::env::var("MEASURE_ORDINARY_PRE")
+                .unwrap()
+                .parse()
+                .unwrap();
+            let post: u64 = std::env::var("MEASURE_ORDINARY_POST")
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(pre <= 6 && post <= 6);
+            if std::env::var("MEASURE_ORDINARY_MODE").unwrap() == "exit-before-ready" {
+                return;
+            }
+            std::thread::sleep(Duration::from_secs(pre));
+            std::fs::write(path.join("ready.pending"), b"READY").unwrap();
+            std::fs::rename(path.join("ready.pending"), path.join("ready")).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                match std::fs::read(path.join("release")) {
+                    Ok(bytes) => {
+                        assert_eq!(bytes, b"RELEASE");
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => panic!("release channel: {e}"),
+                }
+                assert!(Instant::now() < deadline, "ordinary release deadline");
+                std::thread::sleep(POLL);
+            }
+            std::thread::sleep(Duration::from_secs(post));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ordinary_fixture_child() {
+        ordinary_fixture::child();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ordinary_fixture_six_second_startup_is_not_completion() {
+        let witness = ordinary_fixture::witness();
+        let mut owner = ordinary_fixture::Owned::spawn(6, 0, "normal", witness.clone()).unwrap();
+        owner.ready().unwrap();
+        assert!(owner.start.elapsed() >= std::time::Duration::from_secs(6));
+        owner
+            .release_and_complete()
+            .expect("startup must not consume completion budget");
+        drop(owner);
+        ordinary_fixture::confirmed(&witness);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ordinary_fixture_post_ready_delay_keeps_five_second_deadline() {
+        let witness = ordinary_fixture::witness();
+        let mut owner = ordinary_fixture::Owned::spawn(0, 6, "normal", witness.clone()).unwrap();
+        owner.ready().unwrap();
+        let start = std::time::Instant::now();
+        assert_eq!(
+            owner.release_and_complete().unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        assert!(start.elapsed() >= ordinary_fixture::COMPLETION);
+        assert!(
+            owner.child.try_wait().unwrap().is_none(),
+            "six-second post-READY child still live at five seconds"
+        );
+        drop(owner);
+        ordinary_fixture::confirmed(&witness);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ordinary_fixture_exit_before_ready_fails_closed() {
+        let witness = ordinary_fixture::witness();
+        let mut owner =
+            ordinary_fixture::Owned::spawn(0, 0, "exit-before-ready", witness.clone()).unwrap();
+        assert_eq!(
+            owner.release_and_complete().unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        assert!(!owner.path("release").exists());
+        drop(owner);
+        ordinary_fixture::confirmed(&witness);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ordinary_fixture_release_failure_and_unwind_clean_retained_child() {
+        let witness = ordinary_fixture::witness();
+        let start = std::time::Instant::now();
+        let result = std::panic::catch_unwind({
+            let witness = witness.clone();
+            move || {
+                let mut owner = ordinary_fixture::Owned::spawn(0, 0, "normal", witness).unwrap();
+                owner.ready().unwrap();
+                std::fs::create_dir(owner.path("release.pending")).unwrap();
+                assert!(owner.release_and_complete().is_err());
+                assert!(!owner.path("release").exists());
+                assert!(owner.child.try_wait().unwrap().is_none());
+                panic!("injected caller unwind after genuine channel write refusal");
+            }
+        });
+        assert!(result.is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(15));
+        ordinary_fixture::confirmed(&witness);
+    }
+
+    #[cfg(all(windows, feature = "experimental-broker"))]
+    #[test]
+    fn ordinary_fixture_live_coverage_precedes_release() {
+        let witness = ordinary_fixture::witness();
+        let mut owner = ordinary_fixture::Owned::spawn(0, 0, "normal", witness.clone()).unwrap();
+        owner.ready().unwrap();
+        let mut sampler = ChildSampler::new(&SamplePolicy::cli(1, 63), 0);
+        sampler.poll(&owner.child, owner.start);
+        assert_eq!(sampler.evidence.live_samples, 1);
+        assert_eq!(sampler.evidence.exit_races, 0);
+        assert!(sampler.evidence.memory.is_some());
+        owner.release_and_complete().unwrap();
+        sampler.exited(&owner.child, owner.start);
+        sampler.evidence.validate().unwrap();
+        assert!(sampler.evidence.final_lifetime_logical_io.is_some());
+        drop(owner);
+        ordinary_fixture::confirmed(&witness);
+    }
+
     #[cfg(all(windows, feature = "experimental-broker"))]
     #[test]
     fn exited_child_with_no_live_coverage_keeps_memory_missing() {
-        use std::{
-            process::{Command, Stdio},
-            time::{Duration, Instant},
-        };
-        let start = Instant::now();
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .arg("--help")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        while child.try_wait().unwrap().is_none() {
-            if start.elapsed() > Duration::from_secs(5) {
-                child.kill().unwrap();
-                child.wait().unwrap();
-                panic!("ordinary child deadline");
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        let witness = ordinary_fixture::witness();
+        let mut owner = ordinary_fixture::Owned::spawn(0, 0, "normal", witness.clone()).unwrap();
+        let start = owner.start; // Evidence still includes spawn/startup, not just completion.
+        owner
+            .release_and_complete()
+            .expect("ordinary child deadline");
         let mut sampler = ChildSampler::new(&SamplePolicy::cli(1, 63), 0);
-        sampler.poll(&child, start);
-        sampler.exited(&child, start);
+        sampler.poll(&owner.child, start);
+        sampler.exited(&owner.child, start);
         sampler.evidence.validate().unwrap();
         assert_eq!(sampler.evidence.live_samples, 0);
         assert_eq!(sampler.evidence.exit_races, 1);
@@ -198,6 +446,8 @@ mod tests {
         assert_eq!(report["logical_io_complete"], true);
         assert_eq!(report["sampled_memory_available"], false);
         assert!(report["samples"][0]["memory"].is_null());
+        drop(owner);
+        ordinary_fixture::confirmed(&witness);
     }
     #[test]
     fn closed_policy_bounds_case_wide_raw_timepoints() {
