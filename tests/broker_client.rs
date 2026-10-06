@@ -294,13 +294,17 @@ fn binary_mutations_never_fall_back_to_local_store() {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input.as_bytes())
-            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        // Non-Windows rejects before reading stdin. Keep this detached writer alive
+        // until refusal is terminal, so this regression exercises BrokenPipe reliably.
+        #[cfg(not(windows))]
+        assert_eq!(child.wait().unwrap().code(), Some(1));
+        let input_result = stdin.write_all(input.as_bytes());
+        drop(stdin);
         let result = child.wait_with_output().unwrap();
+        if let Err(error) = input_result {
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        }
         assert_eq!(result.status.code(), Some(1));
         assert!(result.stdout.is_empty());
         assert!(!root.exists());
