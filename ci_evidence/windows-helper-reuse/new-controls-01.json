@@ -1,0 +1,23 @@
+{
+  "argv": [
+    "C:/Users/fjmn2/Dev/hermes-harness-update-lab/python-env/Scripts/python.exe",
+    "-B",
+    "-m",
+    "unittest",
+    "python_tests.test_ci_test_shards.IgnoredFixtureAdmissionTests",
+    "-v"
+  ],
+  "exit": 0,
+  "elapsed_seconds": 0.3129999999946449,
+  "pins": {
+    "scripts/ci_test_shards.py": "7a652ff4c3b393738c9eadd35709e1751290ac5f8637106bdb3030e9e40a659b",
+    "python_tests/test_ci_test_shards.py": "3d6e8a5ba3f2c507a5f06f8f95f2440704a51ed80a04ab019d0ddd99b54d154e",
+    "src/windows_enrollment.rs": "67bb075e23690e7c06a171e93e2bcebc98a1e175b99b4a9232d689dbe8582346"
+  },
+  "pins_after": {
+    "scripts/ci_test_shards.py": "7a652ff4c3b393738c9eadd35709e1751290ac5f8637106bdb3030e9e40a659b",
+    "python_tests/test_ci_test_shards.py": "3d6e8a5ba3f2c507a5f06f8f95f2440704a51ed80a04ab019d0ddd99b54d154e",
+    "src/windows_enrollment.rs": "67bb075e23690e7c06a171e93e2bcebc98a1e175b99b4a9232d689dbe8582346"
+  },
+  "scope": "Only three newly added IgnoredFixtureAdmissionTests methods; no prior controls, Cargo, product or native harness executed"
+}

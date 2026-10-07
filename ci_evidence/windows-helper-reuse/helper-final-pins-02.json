@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "state": "SOURCE_READY_FOR_INDEPENDENT_REVIEW",
+  "sources": [
+    {
+      "path": "scripts/ci_test_shards.py",
+      "bytes": 29036,
+      "sha256": "9bbf9bcb39e3d97db6f379c8562da3663f46ee17148042fd4d5b7d32eb884e9d"
+    },
+    {
+      "path": "python_tests/test_ci_test_shards.py",
+      "bytes": 10432,
+      "sha256": "0e3c8085f28b74f2ecc0b9cfd42ea9a8f09712ad7e14f434a5e10d5e10caba5d"
+    }
+  ],
+  "controls_receipts": [
+    "helper-controls-01.json",
+    "helper-controls-02.json",
+    "helper-controls-03.json"
+  ],
+  "real_build_executed": false,
+  "real_harness_executed": false,
+  "cargo_transport_demonstrated": false
+}

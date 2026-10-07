@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "kind": "NEW_PURE_PLANNER_AGGREGATOR_CONTROLS",
+  "command": "python -B -m unittest python_tests.test_ci_test_shards -v",
+  "actual_exit_code": 0,
+  "tests_run": 7,
+  "unittest_elapsed_seconds": 0.003,
+  "native_harness_executed": false,
+  "product_imported": false,
+  "source_stage": "Before later static capture-lock/source-inventory/transport corrections; covered planner/receipt functions unchanged afterward",
+  "tests_repeated": false,
+  "runtime_capability_demonstrated": false
+}

@@ -1,0 +1,183 @@
+name: Controlled Windows ordinary integration
+
+on:
+  push:
+    branches: [test/windows-ordinary-controlled]
+    paths:
+      - scripts/ci_windows_ordinary.py
+      - .github/workflows/windows-ordinary-controlled.yml
+      - ci_evidence/windows-helper-reuse/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/test/windows-ordinary-controlled'
+    runs-on: windows-2022
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [debug, release]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Provision job-owned scratch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $own = Join-Path $env:RUNNER_TEMP ('ordinary-' + [guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $own | Out-Null
+          foreach ($name in @('TEMP', 'TMP', 'TMPDIR')) { "$name=$own" | Out-File -LiteralPath $env:GITHUB_ENV -Append -Encoding utf8 }
+          'PYTHONDONTWRITEBYTECODE=1' | Out-File -LiteralPath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Build exactly one default ordinary binary
+        run: python -B -m scripts.ci_windows_ordinary build --profile ${{ matrix.profile }} --output "${{ runner.temp }}/ordinary-build-${{ matrix.profile }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ordinary-build-${{ matrix.profile }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ordinary-build-${{ matrix.profile }}/
+          if-no-files-found: error
+          retention-days: 7
+
+  python:
+    if: success() && github.ref == 'refs/heads/test/windows-ordinary-controlled'
+    needs: build
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: 53fefae5d74312a534063e1b1ef932c0cf98e1e9
+          path: .hermes-agent
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Provision job-owned scratch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $own = Join-Path $env:RUNNER_TEMP ('ordinary-' + [guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $own | Out-Null
+          foreach ($name in @('TEMP', 'TMP', 'TMPDIR')) { "$name=$own" | Out-File -LiteralPath $env:GITHUB_ENV -Append -Encoding utf8 }
+          'PYTHONDONTWRITEBYTECODE=1' | Out-File -LiteralPath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Install and record Python dependencies
+        shell: pwsh
+        run: |
+          python -m pip install pytest==8.4.2 pyyaml==6.0.2 ruamel.yaml==0.18.17
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/download-artifact@v4
+        with:
+          name: ordinary-build-debug-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ordinary-debug-capsule
+      - name: Run all pending Python bases and every parameter
+        run: python -B -m scripts.ci_windows_ordinary python --capsule "${{ runner.temp }}/ordinary-debug-capsule" --host .hermes-agent --output "${{ runner.temp }}/ordinary-python"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ordinary-python-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/ordinary-python/*.json
+            ${{ runner.temp }}/ordinary-python/*.stdout
+            ${{ runner.temp }}/ordinary-python/*.stderr
+          if-no-files-found: error
+          retention-days: 7
+
+  package:
+    if: success() && github.ref == 'refs/heads/test/windows-ordinary-controlled'
+    needs: build
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Provision job-owned scratch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $own = Join-Path $env:RUNNER_TEMP ('ordinary-' + [guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $own | Out-Null
+          foreach ($name in @('TEMP', 'TMP', 'TMPDIR')) { "$name=$own" | Out-File -LiteralPath $env:GITHUB_ENV -Append -Encoding utf8 }
+          'PYTHONDONTWRITEBYTECODE=1' | Out-File -LiteralPath $env:GITHUB_ENV -Append -Encoding utf8
+      - uses: actions/download-artifact@v4
+        with:
+          name: ordinary-build-release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ordinary-release-capsule
+      - name: Package without rebuilding, then exercise disposable install
+        run: python -B -m scripts.ci_windows_ordinary package --capsule "${{ runner.temp }}/ordinary-release-capsule" --output "${{ runner.temp }}/ordinary-package"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ordinary-package-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/ordinary-package/*.json
+            ${{ runner.temp }}/ordinary-package/*.stdout
+            ${{ runner.temp }}/ordinary-package/*.stderr
+            ${{ runner.temp }}/ordinary-package/dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  aggregate:
+    if: success() && github.ref == 'refs/heads/test/windows-ordinary-controlled'
+    needs: [build, python, package]
+    runs-on: windows-2022
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Provision job-owned scratch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $own = Join-Path $env:RUNNER_TEMP ('ordinary-' + [guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $own | Out-Null
+          foreach ($name in @('TEMP', 'TMP', 'TMPDIR')) { "$name=$own" | Out-File -LiteralPath $env:GITHUB_ENV -Append -Encoding utf8 }
+          'PYTHONDONTWRITEBYTECODE=1' | Out-File -LiteralPath $env:GITHUB_ENV -Append -Encoding utf8
+      - uses: actions/download-artifact@v4
+        with:
+          name: ordinary-build-debug-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ordinary-stage-proofs/debug
+      - uses: actions/download-artifact@v4
+        with:
+          name: ordinary-build-release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ordinary-stage-proofs/release
+      - uses: actions/download-artifact@v4
+        with:
+          name: ordinary-python-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ordinary-stage-proofs/python
+      - uses: actions/download-artifact@v4
+        with:
+          name: ordinary-package-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ordinary-stage-proofs/package
+      - name: Admit the complete bounded gate, without release approval
+        run: python -B -m scripts.ci_windows_ordinary aggregate --inputs "${{ runner.temp }}/ordinary-stage-proofs" --output "${{ runner.temp }}/ordinary-summary"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ordinary-summary-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ordinary-summary/
+          if-no-files-found: error
+          retention-days: 7

@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "kind": "NEW_OWNED_TRANSPORT_AND_SOURCE_INVENTORY_CONTROLS",
+  "command": "python -B -m unittest python_tests.test_ci_test_shards.ShardGateTests.test_new_transport_allows_readonly_source_alias_and_rejects_restored_alias python_tests.test_ci_test_shards.ShardGateTests.test_new_source_inventory_excludes_generated_cache_not_reviewed_inputs -v",
+  "actual_exit_code": 0,
+  "tests_run": 2,
+  "unittest_elapsed_seconds": 0.436,
+  "native_harness_executed": false,
+  "product_imported": false,
+  "fixture": "Own synthetic plaintext files under D4/proof/helper-transport-temp; no executable fixture",
+  "source_hardlink_read_allowed": true,
+  "staging_breaks_hardlink": true,
+  "restored_alias_rejected": true,
+  "generated_pycache_excluded": true,
+  "old_seven_tests_repeated": false,
+  "runtime_capability_demonstrated": false
+}

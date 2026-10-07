@@ -1,0 +1,39 @@
+{
+  "schema": 1,
+  "scope": "Windows-local-13-reviewed-controls",
+  "tests_reexecuted": false,
+  "hosted_execution_claimed": false,
+  "review_basis": "Coordinator accepted reuse of the ten retained D4 controls and three D5 controls in the same Windows domain; old receipts remain attributed to their actual source stages, not relabelled as final-source or hosted executions.",
+  "homology": {
+    "D4_7_pure": "Planner, receipt and terminal validation covered by helper-controls-01; retained before later capture and transport corrections. D5 payload classification is additionally covered by the three new controls.",
+    "D4_2_transport": "Readonly source hardlink permission, restored alias rejection and generated cache exclusion remain the reviewed functions; same Windows filesystem scope.",
+    "D4_1_fixture": "Included JSON source binding and Windows directory-junction rejection retain their implementation and platform scope.",
+    "D5_3_payload": "Exact six fixture classifications, runtime ignored rejection and required parent witnesses; actual before/after source pins retained in new-controls-01."
+  },
+  "receipt_sha256": {
+    "helper-controls-01.json": "ac8827160d342200d3556a618617f0d6b97ab8fb986dc2d5e8084d604dda79d5",
+    "helper-controls-02.json": "99eb292a0d7d6be1e19d9fadc004de8318389994547bb9141c7599885f48ae33",
+    "helper-controls-03.json": "4cb0d877fbae2ff42295101fddaaf913b5c9e6112001bb004fd9df2267a94baa",
+    "helper-final-pins-02.json": "3255471fe1310a40b68777354891b13a699489b892649e8c3d946032d6210c2a",
+    "new-controls-01.json": "97a7b5c532794baf418bce01f1522ba9947ebb53278351b7b27f9727239f48c3"
+  },
+  "current_source_sha256": {
+    "scripts/ci_test_shards.py": "7a652ff4c3b393738c9eadd35709e1751290ac5f8637106bdb3030e9e40a659b",
+    "python_tests/test_ci_test_shards.py": "3d6e8a5ba3f2c507a5f06f8f95f2440704a51ed80a04ab019d0ddd99b54d154e"
+  },
+  "base_nodeids": [
+    "python_tests/test_ci_test_shards.py::IgnoredFixtureAdmissionTests::test_new_exact_payload_classification_preserves_parent_and_foreign_target",
+    "python_tests/test_ci_test_shards.py::IgnoredFixtureAdmissionTests::test_new_runtime_ignored_is_still_rejected",
+    "python_tests/test_ci_test_shards.py::IgnoredFixtureAdmissionTests::test_new_missing_fixture_parent_is_not_a_positive",
+    "python_tests/test_ci_test_shards.py::ShardGateTests::test_new_included_json_changes_source_fingerprint_and_fixture_alias_is_rejected",
+    "python_tests/test_ci_test_shards.py::ShardGateTests::test_new_transport_allows_readonly_source_alias_and_rejects_restored_alias",
+    "python_tests/test_ci_test_shards.py::ShardGateTests::test_new_source_inventory_excludes_generated_cache_not_reviewed_inputs",
+    "python_tests/test_ci_test_shards.py::ShardGateTests::test_same_name_different_targets_remains_distinct_in_deterministic_union",
+    "python_tests/test_ci_test_shards.py::ShardGateTests::test_missing_duplicate_nonterminal_and_wrong_identity_receipts_rejected",
+    "python_tests/test_ci_test_shards.py::ShardGateTests::test_missing_test_duplicate_test_and_fake_zero_coverage_rejected",
+    "python_tests/test_ci_test_shards.py::ShardGateTests::test_runtime_requires_positive_exact_names_and_terminal_not_ignored",
+    "python_tests/test_ci_test_shards.py::ShardGateTests::test_false_terminal_timeout_bool_exit_and_wrong_path_rejected",
+    "python_tests/test_ci_test_shards.py::ShardGateTests::test_original_witness_absence_is_not_inherited_from_generic_green",
+    "python_tests/test_ci_test_shards.py::ShardGateTests::test_writer_timeout_and_isolation_are_actual_execution_requirements"
+  ]
+}

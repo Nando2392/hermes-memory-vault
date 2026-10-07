@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "kind": "NEW_INCLUDED_FIXTURE_INPUT_AND_REPARSE_CONTROL",
+  "command": "python -B -m unittest python_tests.test_ci_test_shards.ShardGateTests.test_new_included_json_changes_source_fingerprint_and_fixture_alias_is_rejected -v",
+  "actual_exit_code": 0,
+  "tests_run": 1,
+  "unittest_elapsed_seconds": 0.096,
+  "included_json_change_changes_fingerprint": true,
+  "own_fixture_directory_junction_rejected": true,
+  "fixture_junction_removed_before_temp_cleanup": true,
+  "product_or_harness_executed": false,
+  "old_nine_tests_repeated": false,
+  "runtime_capability_demonstrated": false
+}
