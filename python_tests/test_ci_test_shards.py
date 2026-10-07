@@ -9,6 +9,36 @@ import unittest
 from scripts import ci_test_shards as gate
 
 
+class IgnoredFixtureAdmissionTests(unittest.TestCase):
+    def test_new_exact_payload_classification_preserves_parent_and_foreign_target(self):
+        payload = "contract::tests::capture_sleeper"
+        parent = "contract::tests::measured_command_retains_real_child_io_and_memory_without_changing_legacy"
+        inventory = sorted([[gate.FIXTURE_TARGET, payload], [gate.FIXTURE_TARGET, parent],
+                            ["test:foreign:tests/foreign.rs", payload]])
+        planned = sorted(item for shard in gate.plan(inventory) for item in shard)
+        self.assertEqual(planned, sorted([[gate.FIXTURE_TARGET, parent],
+                                         ["test:foreign:tests/foreign.rs", payload]]))
+        self.assertEqual(gate.validate_ignored_listing(gate.FIXTURE_TARGET, [payload, parent], [payload]), [payload])
+        for target, ignored in [(gate.FIXTURE_TARGET, []), (gate.FIXTURE_TARGET, ["unknown_ignored"]),
+                                ("test:foreign:tests/foreign.rs", [payload])]:
+            with self.assertRaises(ValueError):
+                gate.validate_ignored_listing(target, [payload, parent], ignored)
+
+    def test_new_runtime_ignored_is_still_rejected(self):
+        raw = ("test parent ... ok\ntest payload ... ignored, fixture\n"
+               "test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out\n").encode()
+        with self.assertRaises(ValueError):
+            gate.positive(raw, ["parent", "payload"])
+
+    def test_new_missing_fixture_parent_is_not_a_positive(self):
+        value = {"binding": {"os": "Windows", "configuration": "all-features"},
+                 "inventory": [[gate.FIXTURE_TARGET, "contract::tests::capture_sleeper"],
+                               [gate.FIXTURE_TARGET, "contract::tests::measured_command_retains_real_child_io_and_memory_without_changing_legacy"]],
+                 "ignored_fixtures": [[gate.FIXTURE_TARGET, "contract::tests::capture_sleeper"]]}
+        with self.assertRaisesRegex(ValueError, "Missing fixture parent"):
+            gate.required_witnesses(value, [])
+
+
 def fixture(inventory=None, configuration="featureless"):
     inventory = sorted(inventory or [["test:first:tests/first.rs", "same_name"],
                         ["test:second:tests/second.rs", "same_name"],

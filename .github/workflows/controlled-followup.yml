@@ -1,0 +1,156 @@
+name: Controlled remaining correctness gates
+
+on:
+  push:
+    branches: [test/full64-controlled-followup]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  reconcile-prior:
+    if: github.ref == 'refs/heads/test/full64-controlled-followup'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: Linux
+            runner: ubuntu-latest
+            configuration: featureless
+            run: '37550081745'
+          - os: Linux
+            runner: ubuntu-latest
+            configuration: all-features
+            run: '37550081745'
+          - os: Windows
+            runner: windows-2022
+            configuration: all-features
+            run: '37550081788'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/checkout@v4
+        with:
+          ref: 7a0803c71bb13b6317540411b0f85fb838726502
+          path: prior-source
+          persist-credentials: false
+      - name: Fetch original terminal producer metadata and named artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/ci_missing_gates.py fetch-prior --os ${{ matrix.os }} --configuration ${{ matrix.configuration }} --output evidence
+      - name: Prepare pinned original request without changing producer environment
+        run: python scripts/ci_reconcile_prior.py --prepare --evidence-root "${{ github.workspace }}/evidence" --source-root "${{ github.workspace }}/prior-source" --run-id ${{ matrix.run }} --run-attempt 1 --os ${{ matrix.os }} --configuration ${{ matrix.configuration }} --output request.json
+      - name: Reconcile retained positives, ignored fixtures and actual failures
+        run: python scripts/ci_missing_gates.py consume --request request.json --output reconciled.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: prior-${{ matrix.os }}-${{ matrix.configuration }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            reconciled.json
+            reconciled.json-reader-proof/
+            request.json
+            request.json.sha256.json
+            evidence/api-*.json
+            evidence/downloads/*.json
+            evidence/fetch-scope.json
+          if-no-files-found: error
+          retention-days: 7
+
+  new-owner-fixture:
+    needs: reconcile-prior
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Provision exclusive job scratch
+        shell: pwsh
+        run: |
+          $base = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
+          if (-not (Test-Path -LiteralPath $base -PathType Container)) { throw 'Runner temp missing' }
+          if ((Get-Item -LiteralPath $base).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Runner temp alias' }
+          $own = Join-Path $base ('controlled-' + [Guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $own -ErrorAction Stop | Out-Null
+          foreach ($key in @('TMPDIR','TEMP','TMP')) { "$key=$own" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append }
+      - name: Compile and run only the changed negative owner fixture
+        run: python scripts/ci_missing_gates.py windows-fixture --output fixture-proof
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: owner-fixture-${{ github.run_id }}-${{ github.run_attempt }}
+          path: fixture-proof/
+          if-no-files-found: error
+          retention-days: 7
+
+  identity-proof:
+    needs: [reconcile-prior, new-owner-fixture]
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Provision exclusive job scratch
+        shell: pwsh
+        run: |
+          $base = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
+          if (-not (Test-Path -LiteralPath $base -PathType Container)) { throw 'Runner temp missing' }
+          if ((Get-Item -LiteralPath $base).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Runner temp alias' }
+          $own = Join-Path $base ('controlled-' + [Guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $own -ErrorAction Stop | Out-Null
+          foreach ($key in @('TMPDIR','TEMP','TMP')) { "$key=$own" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append }
+      - uses: actions/download-artifact@v4
+        with:
+          name: prior-Linux-featureless-${{ github.run_id }}-${{ github.run_attempt }}
+          path: prior-linux-featureless
+      - uses: actions/download-artifact@v4
+        with:
+          name: prior-Linux-all-features-${{ github.run_id }}-${{ github.run_attempt }}
+          path: prior-linux-all-features
+      - uses: actions/download-artifact@v4
+        with:
+          name: prior-Windows-all-features-${{ github.run_id }}-${{ github.run_attempt }}
+          path: prior-windows
+      - uses: actions/download-artifact@v4
+        with:
+          name: owner-fixture-${{ github.run_id }}-${{ github.run_attempt }}
+          path: fixture-proof
+      - name: Require exact original coverage plus the one changed fixture
+        run: python scripts/ci_missing_gates.py admit --prior prior-linux-featureless/reconciled.json prior-linux-all-features/reconciled.json prior-windows/reconciled.json --repaired fixture-proof/result.json --output admission.json
+      - name: Acquire the pending disposable identity proof only
+        run: python scripts/ci_missing_gates.py identity --admission admission.json --output identity-proof
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: controlled-identity-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            admission.json
+            identity-proof/
+          if-no-files-found: error
+          retention-days: 7
+
+# Python/installer/default-binary/release packaging gates remain future scope.
+# This workflow never executes the closed FULL6 workload or installs an active home.

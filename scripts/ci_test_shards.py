@@ -34,6 +34,37 @@ EXAMPLE_REQUIRED = ["data::tests::owned_store_seed_preserves_records_source_and_
                     "full_native::tests::shared_peer_unknown_real_commit_has_no_done_or_retry",
                     "full_oracles::tests::stopped_streaming_oracles_bind_same_count_fields_order_state_and_notes"]
 WRITER = "concurrent_ingest_projects_complete_parseable_jsonl"
+FIXTURE_TARGET = "example:windows_broker_benchmark:examples/windows_broker_benchmark.rs"
+FIXTURE_SOURCES = {
+    "examples/windows_broker_benchmark/contract.rs": "b178b99b81c5664e08bf0a04b662cbc43b3f6c317734482ec20d8baebb99ff37",
+    "examples/windows_broker_benchmark/metrics_tests.rs": "4bb913d076e1ccb7c779c3dbae996a72580bbebb8d989f5a529f74e950daa610",
+}
+FIXTURE_NAMES = {
+    "contract::tests::capture_sleeper",
+    "contract::tests::capture_fixture",
+    "contract::tests::capture_writer_holder",
+    "contract::tests::descendant::direct_fixture",
+    "contract::tests::descendant::descendant_fixture",
+    "scm::metrics::tests::logical_io_child_payload",
+}
+
+
+def ordinary_inventory(inventory):
+    return [item for item in inventory if not (item[0] == FIXTURE_TARGET and item[1] in FIXTURE_NAMES)]
+
+
+def verify_fixture_sources(workspace):
+    for name, expected in FIXTURE_SOURCES.items():
+        path = workspace / name
+        no_reparse(path)
+        require(path.is_file() and path.stat().st_size <= META, "Fixture source type/size")
+        require(sha(path.read_bytes()) == expected, "Fixture source drift")
+
+
+def validate_ignored_listing(target, inventory_names, ignored_names):
+    expected = sorted(set(inventory_names) & FIXTURE_NAMES) if target == FIXTURE_TARGET else []
+    require(ignored_names == expected, "Unknown ignored test or fixture classification drift")
+    return expected
 
 
 def require(value, text):
@@ -249,6 +280,7 @@ def positive(raw, expected):
 
 def plan(inventory):
     require(len(inventory) == len(set(map(tuple, inventory))), "Duplicate inventory tuple")
+    inventory = ordinary_inventory(inventory)
     shards, weights = [[] for _ in range(8)], [0] * 8
     isolated = set()
     for index, name in enumerate(ISOLATED):
@@ -272,6 +304,9 @@ def capsule(path, configuration, require_temp=True):
             and value["binding"] == binding(configuration, require_temp), "Capsule identity mismatch")
     require(digest(value["inventory"]) == value["inventory_sha256"] and digest(value["plan"]) == value["plan_sha256"], "Inventory/plan drift")
     require(value["plan"] == plan(value["inventory"]), "Plan mismatch")
+    verify_fixture_sources(Path(value["binding"]["workspace"]))
+    expected_ignored = sorted(item for item in value["inventory"] if item not in ordinary_inventory(value["inventory"]))
+    require(value.get("ignored_fixtures") == expected_ignored, "Fixture classification mismatch")
     members = value["members"]
     require(0 < len(members) <= 64 and sum(m["bytes"] for m in members) <= TOTAL, "Transport bounds")
     seen = set()
@@ -334,10 +369,18 @@ def build(configuration, output):
                 relative(name)
                 members[name] = "library"
     inventory = []
+    ignored_fixtures = []
+    verify_fixture_sources(workspace)
     for index, (key, name) in enumerate(sorted(targets.items())):
         receipt, stdout, _ = execute([str(workspace / name), "--list", "--format", "terse"], proof, "list-" + str(index), 30)
         require(success(receipt), "Inventory failed")
-        inventory.extend([[key, name] for name in listed(stdout)])
+        names = listed(stdout)
+        ignored_receipt, ignored_stdout, _ = execute([str(workspace / name), "--ignored", "--list", "--format", "terse"], proof, "ignored-list-" + str(index), 30)
+        require(success(ignored_receipt), "Ignored inventory failed")
+        save(proof / ("ignored-list-" + str(index) + ".json"), ignored_receipt)
+        ignored_names = validate_ignored_listing(key, names, listed(ignored_stdout))
+        inventory.extend([[key, test_name] for test_name in names])
+        ignored_fixtures.extend([[key, test_name] for test_name in ignored_names])
     require(inventory, "Empty inventory")
     manifest = []
     for name, role in sorted(members.items()):
@@ -356,6 +399,7 @@ def build(configuration, output):
          "compiler_version": subprocess.check_output(["rustc", "--version"], text=True, timeout=15).strip(),
          "producer_image_version": os.environ.get("ImageVersion"),
          "members": manifest, "inventory": sorted(inventory), "inventory_sha256": digest(sorted(inventory)),
+         "ignored_fixtures": sorted(ignored_fixtures),
          "plan": plan(sorted(inventory)), "plan_sha256": digest(plan(sorted(inventory)))})
 
 
@@ -466,11 +510,20 @@ def validate_receipts(value, capsule_sha, receipts):
             actual_executions.extend([[target, name] for name in names])
         require(sorted(actual_executions) == expected, "Missing, duplicate or fabricated execution coverage")
         covered.extend(receipt["positive"])
-    require(sorted(covered) == value["inventory"] and len(covered) == len(set(map(tuple, covered))), "Union coverage mismatch")
+    require(sorted(covered) == ordinary_inventory(value["inventory"]) and len(covered) == len(set(map(tuple, covered))), "Union coverage mismatch")
     return covered
 
 
 def required_witnesses(value, covered):
+    if value.get("ignored_fixtures"):
+        # All ordinary contract tests remain mandatory; this includes every
+        # parent of the five contract payloads, not an arbitrary single witness.
+        parents = [item for item in ordinary_inventory(value["inventory"])
+                   if item[0] == FIXTURE_TARGET and item[1].startswith("contract::tests::")]
+        require(parents and all(item in covered for item in parents), "Missing fixture parent coverage")
+        metrics_parent = [FIXTURE_TARGET, "scm::metrics::tests::retained_ordinary_child_final_logical_io_includes_terminal_writes"]
+        if [FIXTURE_TARGET, "scm::metrics::tests::logical_io_child_payload"] in value["ignored_fixtures"]:
+            require(metrics_parent in covered, "Missing logical IO fixture parent")
     require(all(any(target.startswith("example:windows_broker_benchmark:") and name == required
                     for target, name in covered) for required in EXAMPLE_REQUIRED), "Missing original example witness")
     if value["binding"]["os"] != "Linux":

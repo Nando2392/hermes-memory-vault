@@ -610,13 +610,101 @@ mod tests {
     }
     #[test]
     fn user_owned_open_handle_is_rejected_without_acl_changes() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        let result = audit_handle(
-            file.as_file().as_raw_handle(),
-            file.path().to_str().unwrap(),
-            false,
-            65536,
+        let user = process_user().unwrap();
+        assert!(
+            !trusted(&user),
+            "negative fixture requires an untrusted TokenUser"
         );
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("explicit-user-owned-enrollment.json");
+        let mut descriptor = null_mut();
+        let sddl = format!("O:{user}D:P(A;;FA;;;{user})(A;;FA;;;SY)(A;;FA;;;BA)");
+        // SAFETY: parser owns the descriptor until Local drops it; CreateFileW
+        // consumes it during creation of this exclusive test-owned path only.
+        unsafe {
+            win(ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide(&sddl).as_ptr(),
+                1,
+                &mut descriptor,
+                null_mut(),
+            ))
+            .unwrap();
+        }
+        let _descriptor = Local(descriptor);
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        };
+        // SAFETY: all input buffers remain alive; success transfers a unique
+        // handle, and CREATE_NEW cannot modify an existing file or its ACL.
+        let raw = unsafe {
+            CreateFileW(
+                wide(path.to_str().unwrap()).as_ptr(),
+                GENERIC_READ | GENERIC_WRITE | READ_CONTROL,
+                0,
+                &attributes,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL,
+                null_mut(),
+            )
+        };
+        assert_ne!(
+            raw,
+            INVALID_HANDLE_VALUE,
+            "explicit fixture creation failed: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: checked successful CreateFileW returned this owned handle.
+        let file = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let snapshot = || {
+            let mut sd = null_mut();
+            let mut owner = null_mut();
+            let mut defaulted = 0;
+            // SAFETY: file remains owned, output allocation and its owner SID
+            // remain alive through conversion; nothing mutates the descriptor.
+            unsafe {
+                assert_eq!(
+                    GetSecurityInfo(
+                        file.as_raw_handle(),
+                        SE_FILE_OBJECT,
+                        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                        null_mut(),
+                        null_mut(),
+                        null_mut(),
+                        null_mut(),
+                        &mut sd
+                    ),
+                    ERROR_SUCCESS
+                );
+                let _sd = Local(sd);
+                win(GetSecurityDescriptorOwner(sd, &mut owner, &mut defaulted)).unwrap();
+                let owner = sid_text(owner).unwrap();
+                let mut text = null_mut();
+                win(ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                    sd,
+                    1,
+                    OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                    &mut text,
+                    null_mut(),
+                ))
+                .unwrap();
+                let _text = Local(text.cast());
+                let mut length = 0;
+                while *text.add(length) != 0 {
+                    length += 1;
+                }
+                let sddl = String::from_utf16(std::slice::from_raw_parts(text, length)).unwrap();
+                (owner, sddl)
+            }
+        };
+        let before = snapshot();
+        assert_eq!(
+            before.0, user,
+            "fixture owner differs from explicit TokenUser"
+        );
+        let result = audit_handle(file.as_raw_handle(), path.to_str().unwrap(), false, 65536);
+        assert_eq!(snapshot(), before, "admission changed fixture security");
         assert!(result.is_err(), "user-owned enrollment must fail admission");
     }
     fn sddl_check(sddl: &str) -> io::Result<()> {
