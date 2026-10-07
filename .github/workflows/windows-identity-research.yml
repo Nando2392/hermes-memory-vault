@@ -11,17 +11,22 @@ on:
       - examples/windows_identity_probe.rs
       - examples/windows_identity_probe/**
       - .github/workflows/windows-identity-research.yml
+      - scripts/ci_test_shards.py
+      - python_tests/test_ci_test_shards.py
 
 permissions:
   contents: read
 
 jobs:
-  identity-proof:
+  correctness-build:
     if: github.ref == 'refs/heads/test/posix-sqlite-hardening'
     runs-on: windows-2022
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -57,8 +62,192 @@ jobs:
           fi
           printf 'TMPDIR=%s\nTEMP=%s\nTMP=%s\n' "$scratch" "$scratch" "$scratch" >> "$GITHUB_ENV"
       - run: cargo fmt --all -- --check
-      - run: cargo test --locked --all-targets --all-features
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Compile once and seal exact test inventory
+        run: python scripts/ci_test_shards.py build --configuration all-features --output capsule
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-build-proof-Windows-all-features-${{ github.run_id }}-${{ github.run_attempt }}
+          path: capsule-build-proof/
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-capsule-Windows-all-features-${{ github.run_id }}-${{ github.run_attempt }}
+          path: capsule/
+          if-no-files-found: error
+          retention-days: 7
+
+  correctness-shards:
+    needs: correctness-build
+    runs-on: windows-2022
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Provision job-owned test scratch
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${RUNNER_TEMP:?RUNNER_TEMP is required}" "${GITHUB_ENV:?GITHUB_ENV is required}"
+          case "$RUNNER_TEMP$GITHUB_ENV" in
+            *$'\n'*|*$'\r'*) printf 'Invalid runner path\n' >&2; exit 1 ;;
+          esac
+          case "$RUNNER_OS" in
+            Linux) root="$RUNNER_TEMP" ;;
+            Windows) root="$(cygpath -u "$RUNNER_TEMP")" ;;
+            *) printf 'Unsupported runner OS\n' >&2; exit 1 ;;
+          esac
+          case "$root" in
+            /) exit 1 ;;
+            /*) ;;
+            *) printf 'RUNNER_TEMP must be absolute\n' >&2; exit 1 ;;
+          esac
+          test -d "$root"
+          test ! -L "$root"
+          test -w "$root"
+          test -f "$GITHUB_ENV"
+          test -w "$GITHUB_ENV"
+          root="$(cd -- "$root" && pwd -P)"
+          scratch="$(mktemp -d "$root/hermes-tests.XXXXXXXX")"
+          mkdir -- "$scratch/tmp"
+          scratch="$scratch/tmp"
+          if [ "$RUNNER_OS" = Windows ]; then
+            scratch="$(cygpath -m "$scratch")"
+          fi
+          printf 'TMPDIR=%s\nTEMP=%s\nTMP=%s\n' "$scratch" "$scratch" "$scratch" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: test-capsule-Windows-all-features-${{ github.run_id }}-${{ github.run_attempt }}
+          path: capsule
+      - name: Execute exact assigned tests without rebuilding
+        run: python scripts/ci_test_shards.py run --configuration all-features --shard ${{ matrix.shard }} --capsule capsule --output receipts
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-receipt-Windows-all-features-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.shard }}
+          path: receipts/
+          if-no-files-found: error
+          retention-days: 7
+
+  correctness-aggregate:
+    if: ${{ always() && github.ref == 'refs/heads/test/posix-sqlite-hardening' }}
+    needs: [correctness-build, correctness-shards]
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Provision job-owned test scratch
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${RUNNER_TEMP:?RUNNER_TEMP is required}" "${GITHUB_ENV:?GITHUB_ENV is required}"
+          case "$RUNNER_TEMP$GITHUB_ENV" in
+            *$'\n'*|*$'\r'*) printf 'Invalid runner path\n' >&2; exit 1 ;;
+          esac
+          case "$RUNNER_OS" in
+            Linux) root="$RUNNER_TEMP" ;;
+            Windows) root="$(cygpath -u "$RUNNER_TEMP")" ;;
+            *) printf 'Unsupported runner OS\n' >&2; exit 1 ;;
+          esac
+          case "$root" in
+            /) exit 1 ;;
+            /*) ;;
+            *) printf 'RUNNER_TEMP must be absolute\n' >&2; exit 1 ;;
+          esac
+          test -d "$root"
+          test ! -L "$root"
+          test -w "$root"
+          test -f "$GITHUB_ENV"
+          test -w "$GITHUB_ENV"
+          root="$(cd -- "$root" && pwd -P)"
+          scratch="$(mktemp -d "$root/hermes-tests.XXXXXXXX")"
+          mkdir -- "$scratch/tmp"
+          scratch="$scratch/tmp"
+          if [ "$RUNNER_OS" = Windows ]; then
+            scratch="$(cygpath -m "$scratch")"
+          fi
+          printf 'TMPDIR=%s\nTEMP=%s\nTMP=%s\n' "$scratch" "$scratch" "$scratch" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: test-capsule-Windows-all-features-${{ github.run_id }}-${{ github.run_attempt }}
+          path: capsule
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: test-receipt-Windows-all-features-${{ github.run_id }}-${{ github.run_attempt }}-*
+          path: receipts
+          merge-multiple: true
+      - name: Require exact positive union
+        run: python scripts/ci_test_shards.py aggregate --configuration all-features --capsule capsule --receipts receipts --output summary.json
+      - name: Require successful terminal producer jobs
+        shell: pwsh
+        env:
+          BUILD_RESULT: ${{ needs.correctness-build.result }}
+          SHARD_RESULT: ${{ needs.correctness-shards.result }}
+        run: |
+          if ($env:BUILD_RESULT -ne 'success' -or $env:SHARD_RESULT -ne 'success') { throw 'Producer correctness jobs did not complete successfully' }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-summary-Windows-all-features-${{ github.run_id }}-${{ github.run_attempt }}
+          path: summary.json
+          if-no-files-found: error
+          retention-days: 7
+
+  identity-proof:
+    if: ${{ success() && github.ref == 'refs/heads/test/posix-sqlite-hardening' }}
+    needs: [correctness-build, correctness-aggregate]
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Provision job-owned test scratch
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${RUNNER_TEMP:?RUNNER_TEMP is required}" "${GITHUB_ENV:?GITHUB_ENV is required}"
+          case "$RUNNER_TEMP$GITHUB_ENV" in
+            *$'\n'*|*$'\r'*) printf 'Invalid runner path\n' >&2; exit 1 ;;
+          esac
+          case "$RUNNER_OS" in
+            Linux) root="$RUNNER_TEMP" ;;
+            Windows) root="$(cygpath -u "$RUNNER_TEMP")" ;;
+            *) printf 'Unsupported runner OS\n' >&2; exit 1 ;;
+          esac
+          case "$root" in
+            /) exit 1 ;;
+            /*) ;;
+            *) printf 'RUNNER_TEMP must be absolute\n' >&2; exit 1 ;;
+          esac
+          test -d "$root"
+          test ! -L "$root"
+          test -w "$root"
+          test -f "$GITHUB_ENV"
+          test -w "$GITHUB_ENV"
+          root="$(cd -- "$root" && pwd -P)"
+          scratch="$(mktemp -d "$root/hermes-tests.XXXXXXXX")"
+          mkdir -- "$scratch/tmp"
+          scratch="$scratch/tmp"
+          if [ "$RUNNER_OS" = Windows ]; then
+            scratch="$(cygpath -m "$scratch")"
+          fi
+          printf 'TMPDIR=%s\nTEMP=%s\nTMP=%s\n' "$scratch" "$scratch" "$scratch" >> "$GITHUB_ENV"
       - run: cargo build --locked --release --features experimental-broker --example windows-identity-probe --bin hermes-memory-broker --bin hermes-memory-client
       - name: Disposable SCM identities and SQLite ACL proof
         shell: pwsh

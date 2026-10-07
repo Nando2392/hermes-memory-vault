@@ -91,7 +91,7 @@ jobs:
               provenance['source_sha256'] = source_digest
               # Frozen minimal full64 build-input inventory; NOT inherited approval.
               # This exact combined source/workflow requires independent review.
-              if source_digest != '38ee993d29de935122f9427c05a556ba34d8d4a1fc2845e8dc0419867684e698':
+              if source_digest != '5bfa0b20820c537226854c4af09ed4d2e22d2884e8e86d7236529788a7bc1d48':
                   raise RuntimeError('Build inputs differ from frozen full64 snapshot')
               provenance['workflow_sha256'] = digest(root / '.github/workflows/windows-broker-benchmark.yml')
               # Diagnostic admission only; runtime correctness is not release approval.

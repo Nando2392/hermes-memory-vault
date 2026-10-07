@@ -300,10 +300,30 @@ impl<'a> FullBarrier<'a> {
         id: u32,
         phase: Phase,
         deadline: Instant,
+        cancelled: impl FnMut() -> bool,
+        missing: impl FnMut() -> Result<()>,
+        clock: impl FnMut() -> Instant,
+    ) -> Result<()> {
+        self.wait_with_clock_and_wait(
+            id,
+            phase,
+            deadline,
+            cancelled,
+            missing,
+            (clock, thread::sleep),
+        )
+    }
+    // The wait seam controls only scheduling; all real namespace and message checks remain.
+    fn wait_with_clock_and_wait(
+        &mut self,
+        id: u32,
+        phase: Phase,
+        deadline: Instant,
         mut cancelled: impl FnMut() -> bool,
         mut missing: impl FnMut() -> Result<()>,
-        mut clock: impl FnMut() -> Instant,
+        schedule: (impl FnMut() -> Instant, impl FnMut(Duration)),
     ) -> Result<()> {
+        let (mut clock, mut wait) = schedule;
         let now = clock();
         ensure(
             deadline > now && deadline.duration_since(now) <= Duration::from_secs(60),
@@ -311,8 +331,10 @@ impl<'a> FullBarrier<'a> {
         )?;
         ensure(phase.owner() != self.role, "full barrier wrong observer")?;
         loop {
+            ensure(!cancelled(), "full barrier cancelled or timed out")?;
+            let iteration_start = clock();
             ensure(
-                !cancelled() && clock() < deadline,
+                iteration_start < deadline,
                 "full barrier cancelled or timed out",
             )?;
             self.validate_files(id, phase)?;
@@ -343,15 +365,23 @@ impl<'a> FullBarrier<'a> {
                         "full barrier cancelled or timed out",
                     )?;
                     let observation = missing();
+                    ensure(!cancelled(), "full barrier cancelled or timed out")?;
+                    let after_observation = clock();
                     ensure(
-                        !cancelled() && clock() < deadline,
+                        after_observation < deadline,
                         "full barrier cancelled or timed out",
                     )?;
                     observation?;
-                    thread::sleep(
-                        Duration::from_millis(2)
-                            .min(deadline.saturating_duration_since(Instant::now())),
-                    );
+                    ensure(
+                        after_observation >= iteration_start,
+                        "full barrier clock regression",
+                    )?;
+                    let next_poll = iteration_start
+                        .checked_add(Duration::from_millis(2))
+                        .ok_or("full barrier poll clock overflow")?
+                        .min(deadline);
+                    // Account for scan and observer work before waiting; an overrun adds no sleep.
+                    wait(next_poll.saturating_duration_since(after_observation));
                 }
                 Err(e) => return Err(e.into()),
             }

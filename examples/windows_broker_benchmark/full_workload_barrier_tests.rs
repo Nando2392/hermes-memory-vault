@@ -1,6 +1,117 @@
 use super::*;
 use crate::full_manifest::WorkloadSpec;
 
+// New controls exercise the real polling loop and filesystem checks with a logical
+// scheduler. Scan and observer delays are represented by elapsed clock observations,
+// without bypassing or installing hooks inside the actual future-path scan.
+fn absolute_poll_fixture(scan_us: u64, observer_us: u64, terminal_mode: u8) {
+    use std::cell::Cell;
+    let dir = root();
+    let m = FullManifest::new(WorkloadSpec::full20x256_v1(), 16).unwrap();
+    let mut c = FullBarrier::new(dir.path(), "absolute-poll", Role::Controller, &m).unwrap();
+    let mut peer = FullBarrier::new(dir.path(), "absolute-poll", Role::Peer, &m).unwrap();
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(1);
+    let logical = Cell::new(start);
+    let reads = Cell::new(0usize);
+    let cancelled = Cell::new(false);
+    let future_path = c.path(63, Phase::Done);
+    let mut observations = 0;
+    let mut waits = Vec::new();
+    let result = c.wait_with_clock_and_wait(
+        0,
+        Phase::Ready,
+        deadline,
+        || cancelled.get(),
+        || {
+            observations += 1;
+            logical.set(logical.get() + Duration::from_micros(observer_us));
+            Ok(())
+        },
+        (
+            || {
+                let call = reads.get();
+                reads.set(call + 1);
+                // Initial admission and iteration start precede the real scan.
+                if call == 2 {
+                    logical.set(start + Duration::from_micros(scan_us));
+                }
+                logical.get()
+            },
+            |duration| {
+                waits.push(duration);
+                logical.set(logical.get() + duration);
+                peer.publish(0, Phase::Ready).unwrap();
+                match terminal_mode {
+                    0 => {}
+                    1 => logical.set(deadline),
+                    2 => cancelled.set(true),
+                    3 => std::fs::write(&future_path, b"future").unwrap(),
+                    _ => panic!("unknown terminal fixture"),
+                }
+            },
+        ),
+    );
+    let expected = Duration::from_micros(2000u64.saturating_sub(scan_us + observer_us));
+    assert_eq!(waits, vec![expected]);
+    assert_eq!(observations, 1);
+    if terminal_mode == 0 {
+        result.unwrap();
+        assert_eq!(c.next, 1);
+    } else {
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains(if terminal_mode == 3 {
+            "future publication"
+        } else {
+            "cancelled or timed out"
+        }));
+        assert_eq!(c.next, 0);
+    }
+    assert!(!c.path(0, Phase::ValidatedAck).exists());
+}
+
+#[test]
+fn absolute_poll_wait_subtracts_real_loop_scan_and_observer_elapsed() {
+    absolute_poll_fixture(100, 200, 0);
+}
+
+#[test]
+fn absolute_poll_wait_does_not_add_sleep_after_scan_observer_overrun() {
+    absolute_poll_fixture(2500, 500, 0);
+}
+
+#[test]
+fn absolute_poll_wait_keeps_late_publication_cancel_and_future_fail_closed() {
+    for terminal in [1, 2, 3] {
+        absolute_poll_fixture(100, 200, terminal);
+    }
+}
+
+#[test]
+fn absolute_poll_observer_error_is_terminal_without_wait_or_retry() {
+    let dir = root();
+    let m = FullManifest::new(WorkloadSpec::full20x256_v1(), 16).unwrap();
+    let mut c = FullBarrier::new(dir.path(), "absolute-error", Role::Controller, &m).unwrap();
+    let mut calls = 0;
+    let start = Instant::now();
+    let error = c
+        .wait_with_clock_and_wait(
+            0,
+            Phase::Ready,
+            start + Duration::from_secs(1),
+            || false,
+            || {
+                calls += 1;
+                Err("new deterministic observer error".into())
+            },
+            (|| start, |_| panic!("observer error must not wait")),
+        )
+        .unwrap_err();
+    assert_eq!(error.to_string(), "new deterministic observer error");
+    assert_eq!(calls, 1);
+    assert_eq!(c.next, 0);
+}
+
 fn root() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     for name in ["scratch", "controller"] {

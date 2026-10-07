@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  linux-regression:
+  correctness-build:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -20,6 +20,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - name: Provision job-owned test scratch
         shell: bash
@@ -52,109 +53,156 @@ jobs:
             scratch="$(cygpath -m "$scratch")"
           fi
           printf 'TMPDIR=%s\nTEMP=%s\nTMP=%s\n' "$scratch" "$scratch" "$scratch" >> "$GITHUB_ENV"
-      - name: Direct POSIX retirement inventory
-        run: |
-          set -o pipefail
-          cargo test --locked --lib -- --list | tee direct-lib-tests.txt
-          grep -Fx 'posix_open_tests::direct_posix_open_is_unsupported_without_io: test' direct-lib-tests.txt
-          cargo test --locked --test cli -- --list | tee direct-cli-tests.txt
-          grep -Fx 'direct_posix_commands_are_unsupported_without_io: test' direct-cli-tests.txt
-      - name: Direct POSIX retirement is pre-I/O and fail-closed
-        run: |
-          cargo test --locked --lib posix_open_tests::direct_posix_open_is_unsupported_without_io -- --exact --nocapture
-          cargo test --locked --lib posix_open_tests::direct_posix_open_rejects_aliases_before_io -- --exact --nocapture
-          cargo test --locked --lib posix_open_tests::direct_posix_open_preserves_hardlinked_sentinels -- --exact --nocapture
-          cargo test --locked --test cli direct_posix_commands_are_unsupported_without_io -- --exact --nocapture
-      - name: Stock SQLite broker semantic inventory
-        run: |
-          set -o pipefail
-          cargo test --locked --features experimental-broker --test memory -- --list | tee broker-memory-tests.txt
-          grep -Fx 'concurrent_ingest_projects_complete_parseable_jsonl: test' broker-memory-tests.txt
-          grep -Fx 'broker_second_instance_rejected_without_mutation: test' broker-memory-tests.txt
-      - name: Stock SQLite broker semantics and bounded writers
-        run: |
-          timeout --kill-after=5s 30s cargo test --locked --features experimental-broker --test memory concurrent_ingest_projects_complete_parseable_jsonl -- --exact --nocapture
-          cargo test --locked --features experimental-broker --test memory broker_second_instance_rejected_without_mutation -- --exact --nocapture
-          cargo test --locked --features experimental-broker --lib broker_store_tests -- --nocapture
-          cargo test --locked --features experimental-broker --test broker_export -- --nocapture
-      - name: Full correctness inventory and positive execution (${{ matrix.configuration }})
+      - name: Compile once and seal exact test inventory
+        run: python scripts/ci_test_shards.py build --configuration ${{ matrix.configuration }} --output capsule
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-build-proof-Linux-${{ matrix.configuration }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: capsule-build-proof/
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-capsule-Linux-${{ matrix.configuration }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: capsule/
+          if-no-files-found: error
+          retention-days: 7
+
+  correctness-shards:
+    needs: correctness-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        configuration: [featureless, all-features]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Provision job-owned test scratch
         shell: bash
-        env:
-          CONFIGURATION: ${{ matrix.configuration }}
-          REVIEWED_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$REVIEWED_SHA"
-          printf 'Exact full-suite source: %s configuration: %s\n' "$REVIEWED_SHA" "$CONFIGURATION"
-          case "$CONFIGURATION" in
-            featureless) feature_args=(--no-default-features) ;;
-            all-features) feature_args=(--all-features) ;;
-            *) exit 1 ;;
+          : "${RUNNER_TEMP:?RUNNER_TEMP is required}" "${GITHUB_ENV:?GITHUB_ENV is required}"
+          case "$RUNNER_TEMP$GITHUB_ENV" in
+            *$'\n'*|*$'\r'*) printf 'Invalid runner path\n' >&2; exit 1 ;;
           esac
-          set +e
-          cargo test --locked --all-targets "${feature_args[@]}" -- --list 2>&1 | tee full-inventory.log
-          inventory_status=("${PIPESTATUS[@]}")
-          printf 'commit=%s\nconfiguration=%s\ninventory_cargo_exit=%s\ninventory_collection_exit=%s\n' "$REVIEWED_SHA" "$CONFIGURATION" "${inventory_status[0]}" "${inventory_status[1]}" | tee full-identity.txt
-          identity_status=("${PIPESTATUS[@]}")
-          set -e
-          if [ "${inventory_status[0]}" -ne 0 ]; then exit "${inventory_status[0]}"; fi
-          if [ "${inventory_status[1]}" -ne 0 ]; then exit "${inventory_status[1]}"; fi
-          if [ "${identity_status[0]}" -ne 0 ]; then exit "${identity_status[0]}"; fi
-          if [ "${identity_status[1]}" -ne 0 ]; then exit "${identity_status[1]}"; fi
-          set +e
-          cargo test --locked --all-targets "${feature_args[@]}" 2>&1 | tee full-execution.log
-          runtime_status=("${PIPESTATUS[@]}")
-          printf 'cargo_exit=%s\ncollection_exit=%s\n' "${runtime_status[0]}" "${runtime_status[1]}" | tee -a full-identity.txt
-          identity_status=("${PIPESTATUS[@]}")
-          set -e
-          if [ "${runtime_status[0]}" -ne 0 ]; then exit "${runtime_status[0]}"; fi
-          if [ "${runtime_status[1]}" -ne 0 ]; then exit "${runtime_status[1]}"; fi
-          if [ "${identity_status[0]}" -ne 0 ]; then exit "${identity_status[0]}"; fi
-          if [ "${identity_status[1]}" -ne 0 ]; then exit "${identity_status[1]}"; fi
-          python - <<'PY'
-          import pathlib
-          import re
-          def collect(path, runtime):
-              targets = {}
-              current = None
-              for line in pathlib.Path(path).read_text().splitlines():
-                  line = re.sub(r'\x1b\[[0-9;]*m', '', line)
-                  match = re.search(r'Running .* \(([^)]+)\)', line)
-                  if match:
-                      current = match[1]
-                      assert current not in targets, current
-                      targets[current] = set()
-                  match = re.fullmatch(r'test (.+) \.\.\. ok', line) if runtime else re.fullmatch(r'(.+): test', line)
-                  if match:
-                      assert current is not None
-                      assert match[1] not in targets[current], match[1]
-                      targets[current].add(match[1])
-                  if runtime and 'test result:' in line:
-                      assert '; 0 ignored;' in line, line
-              assert targets
-              return targets
-          inventory = collect('full-inventory.log', False)
-          executed = collect('full-execution.log', True)
-          if executed != inventory:
-              raise SystemExit('FAIL: actual per-target positive executions differ from compiled inventory')
-          names = set().union(*executed.values())
-          required = {
-              'data::tests::owned_store_seed_preserves_records_source_and_namespace_reservation',
-              'full_native::tests::shared_full64_orchestration_runs_real_store_and_retains_before_each_ack',
-              'full_native::tests::shared_controller_invalid_after_done_receipt_withholds_ack_and_next_release',
-              'full_native::tests::shared_peer_unknown_real_commit_has_no_done_or_retry',
-              'full_oracles::tests::stopped_streaming_oracles_bind_same_count_fields_order_state_and_notes',
-          }
-          assert required <= names, required - names
-          print('PASS: per-target inventory equals positive runtime execution; all five original names ran')
-          PY
-      - name: Retain exact configuration inventory and execution
-        if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+          case "$RUNNER_OS" in
+            Linux) root="$RUNNER_TEMP" ;;
+            Windows) root="$(cygpath -u "$RUNNER_TEMP")" ;;
+            *) printf 'Unsupported runner OS\n' >&2; exit 1 ;;
+          esac
+          case "$root" in
+            /) exit 1 ;;
+            /*) ;;
+            *) printf 'RUNNER_TEMP must be absolute\n' >&2; exit 1 ;;
+          esac
+          test -d "$root"
+          test ! -L "$root"
+          test -w "$root"
+          test -f "$GITHUB_ENV"
+          test -w "$GITHUB_ENV"
+          root="$(cd -- "$root" && pwd -P)"
+          scratch="$(mktemp -d "$root/hermes-tests.XXXXXXXX")"
+          mkdir -- "$scratch/tmp"
+          scratch="$scratch/tmp"
+          if [ "$RUNNER_OS" = Windows ]; then
+            scratch="$(cygpath -m "$scratch")"
+          fi
+          printf 'TMPDIR=%s\nTEMP=%s\nTMP=%s\n' "$scratch" "$scratch" "$scratch" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
         with:
-          name: full-correctness-${{ matrix.configuration }}-${{ github.sha }}
-          path: |
-            full-inventory.log
-            full-execution.log
-            full-identity.txt
+          name: test-capsule-Linux-${{ matrix.configuration }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: capsule
+      - name: Execute exact assigned tests without rebuilding
+        run: python scripts/ci_test_shards.py run --configuration ${{ matrix.configuration }} --shard ${{ matrix.shard }} --capsule capsule --output receipts
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-receipt-Linux-${{ matrix.configuration }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.shard }}
+          path: receipts/
           if-no-files-found: error
+          retention-days: 7
+
+  correctness-aggregate:
+    if: always()
+    needs: [correctness-build, correctness-shards]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        configuration: [featureless, all-features]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Provision job-owned test scratch
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${RUNNER_TEMP:?RUNNER_TEMP is required}" "${GITHUB_ENV:?GITHUB_ENV is required}"
+          case "$RUNNER_TEMP$GITHUB_ENV" in
+            *$'\n'*|*$'\r'*) printf 'Invalid runner path\n' >&2; exit 1 ;;
+          esac
+          case "$RUNNER_OS" in
+            Linux) root="$RUNNER_TEMP" ;;
+            Windows) root="$(cygpath -u "$RUNNER_TEMP")" ;;
+            *) printf 'Unsupported runner OS\n' >&2; exit 1 ;;
+          esac
+          case "$root" in
+            /) exit 1 ;;
+            /*) ;;
+            *) printf 'RUNNER_TEMP must be absolute\n' >&2; exit 1 ;;
+          esac
+          test -d "$root"
+          test ! -L "$root"
+          test -w "$root"
+          test -f "$GITHUB_ENV"
+          test -w "$GITHUB_ENV"
+          root="$(cd -- "$root" && pwd -P)"
+          scratch="$(mktemp -d "$root/hermes-tests.XXXXXXXX")"
+          mkdir -- "$scratch/tmp"
+          scratch="$scratch/tmp"
+          if [ "$RUNNER_OS" = Windows ]; then
+            scratch="$(cygpath -m "$scratch")"
+          fi
+          printf 'TMPDIR=%s\nTEMP=%s\nTMP=%s\n' "$scratch" "$scratch" "$scratch" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: test-capsule-Linux-${{ matrix.configuration }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: capsule
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: test-receipt-Linux-${{ matrix.configuration }}-${{ github.run_id }}-${{ github.run_attempt }}-*
+          path: receipts
+          merge-multiple: true
+      - name: Require exact positive union and semantic witnesses
+        run: python scripts/ci_test_shards.py aggregate --configuration ${{ matrix.configuration }} --capsule capsule --receipts receipts --output summary.json
+      - name: Require successful terminal producer jobs
+        env:
+          BUILD_RESULT: ${{ needs.correctness-build.result }}
+          SHARD_RESULT: ${{ needs.correctness-shards.result }}
+        run: test "$BUILD_RESULT" = success && test "$SHARD_RESULT" = success
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-summary-Linux-${{ matrix.configuration }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: summary.json
+          if-no-files-found: error
+          retention-days: 7
+
+  linux-regression:
+    needs: correctness-aggregate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: All original correctness and semantic gates completed
+        run: echo 'Both configurations have exact positive test coverage and required semantic witnesses.'
